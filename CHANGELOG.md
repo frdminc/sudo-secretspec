@@ -14,6 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Secret 'Secret 'NAME' is not defined in profile 'default' ...' not found`.
   The message now reads once, still naming the available secrets. The
   non-zero exit status this already returned is unchanged.
+- `install --adopt-existing` no longer refuses a vault that has already
+  migrated to the sqlite-only secret store. It required a legacy `.env` file
+  to exist even though `.env` has been vestigial since values moved into
+  `secrets.db`, so adopting (and therefore upgrading) a fully migrated vault
+  was refused with "adopted runtime file missing or symlinked: .../.env".
+  `.env` is now optional on adoption, matching how the broker itself already
+  treats it; a present `.env` still must be a real file, never a symlink.
 - Deleting or destroying a secret now erases its plaintext from the database
   file instead of leaving it readable on a freed page. SQLite's
   `secure_delete` is a per-connection setting that is off by default in the

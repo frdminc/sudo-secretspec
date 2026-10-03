@@ -603,6 +603,25 @@ fn prepare_install_dir(path: &Path) -> Result<(), InstallError> {
     Ok(())
 }
 
+/// An adopted vault's `.env` is optional: present or absent is both fine.
+///
+/// Matches `broker::require_boundary`'s own reasoning -- `.env` is vestigial
+/// since values moved into `secrets.db`, so a vault already migrated to the
+/// sqlite-only store legitimately has none. When it *is* present, though, it
+/// still must be a real file, never a symlink.
+fn validate_adopted_env_if_present(vault: &Path) -> Result<(), InstallError> {
+    let env_path = vault.join(".env");
+    if let Ok(meta) = fs::symlink_metadata(&env_path)
+        && (meta.file_type().is_symlink() || !meta.is_file())
+    {
+        return Err(InstallError::Denied(format!(
+            "adopted runtime file missing or symlinked: {}",
+            env_path.display()
+        )));
+    }
+    Ok(())
+}
+
 fn validate_protected_ancestors() -> Result<(), InstallError> {
     for dir in [
         "/usr",
@@ -935,22 +954,24 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
                     "adopted vault missing or symlinked".into(),
                 ));
             }
-            // Root-only metadata checks of vault contents (never open values).
-            for runtime in ["secretspec.toml", ".env"] {
-                let p = req.vault.join(runtime);
-                let meta = fs::symlink_metadata(&p).map_err(|_| {
-                    InstallError::Denied(format!(
-                        "adopted runtime file missing or unreadable: {}",
-                        p.display()
-                    ))
-                })?;
-                if meta.file_type().is_symlink() || !meta.is_file() {
-                    return Err(InstallError::Denied(format!(
-                        "adopted runtime file missing or symlinked: {}",
-                        p.display()
-                    )));
-                }
+            // Root-only metadata checks of vault contents (never open
+            // values). `secretspec.toml` is required; an adopted vault with
+            // no manifest has nothing to adopt. `.env` is optional -- see
+            // `validate_adopted_env_if_present`.
+            let manifest_path = req.vault.join("secretspec.toml");
+            let meta = fs::symlink_metadata(&manifest_path).map_err(|_| {
+                InstallError::Denied(format!(
+                    "adopted runtime file missing or unreadable: {}",
+                    manifest_path.display()
+                ))
+            })?;
+            if meta.file_type().is_symlink() || !meta.is_file() {
+                return Err(InstallError::Denied(format!(
+                    "adopted runtime file missing or symlinked: {}",
+                    manifest_path.display()
+                )));
             }
+            validate_adopted_env_if_present(&req.vault)?;
             let vault_real = resolve_path(&req.vault);
             if !vault_real.starts_with("/private/var/db/") {
                 return Err(InstallError::Denied(
@@ -1129,15 +1150,14 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
                 .status();
         }
     } else {
-        for runtime in ["secretspec.toml", ".env"] {
-            let p = req.vault.join(runtime);
-            if !p.is_file() || p.is_symlink() {
-                return Err(InstallError::Denied(format!(
-                    "adopted runtime file missing or symlinked: {}",
-                    p.display()
-                )));
-            }
+        let manifest_path = req.vault.join("secretspec.toml");
+        if !manifest_path.is_file() || manifest_path.is_symlink() {
+            return Err(InstallError::Denied(format!(
+                "adopted runtime file missing or symlinked: {}",
+                manifest_path.display()
+            )));
         }
+        validate_adopted_env_if_present(&req.vault)?;
     }
 
     // Hygiene, after the install itself has succeeded: every install captures
@@ -1423,6 +1443,49 @@ mod tests {
             "{err}"
         );
         assert!(!target.exists(), "nothing may be written through the link");
+    }
+
+    #[test]
+    fn adopting_a_vault_with_no_env_is_not_refused() {
+        // The regression: a vault already migrated to the sqlite-only
+        // `secrets.db` store has no `.env` at all, and `install
+        // --adopt-existing` must not treat that as a missing runtime file.
+        let tmp = tempfile::tempdir().unwrap();
+        let vault = tmp.path().join("vault");
+        fs::create_dir_all(&vault).unwrap();
+        fs::write(vault.join("secretspec.toml"), b"[project]\nname = \"v\"\n").unwrap();
+        assert!(!vault.join(".env").exists(), "precondition: no .env");
+
+        validate_adopted_env_if_present(&vault).expect(".env absence must not refuse the adoption");
+    }
+
+    #[test]
+    fn adopting_a_vault_with_a_real_env_is_not_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vault = tmp.path().join("vault");
+        fs::create_dir_all(&vault).unwrap();
+        fs::write(vault.join(".env"), b"API_KEY=sk-live\n").unwrap();
+
+        validate_adopted_env_if_present(&vault).expect("a real .env file is fine");
+    }
+
+    #[test]
+    fn adopting_a_vault_with_an_env_symlink_is_refused() {
+        // Present-but-a-symlink must still be refused, dangling or not --
+        // `.env` being optional must not weaken the symlink guard.
+        let tmp = tempfile::tempdir().unwrap();
+        let vault = tmp.path().join("vault");
+        fs::create_dir_all(&vault).unwrap();
+        let target = tmp.path().join("elsewhere/.env");
+        std::os::unix::fs::symlink(&target, vault.join(".env")).unwrap();
+        assert!(!vault.join(".env").exists(), "precondition: dangling");
+
+        let err = validate_adopted_env_if_present(&vault)
+            .expect_err("a symlinked .env must be refused even when dangling");
+        assert!(
+            err.to_string()
+                .contains("adopted runtime file missing or symlinked")
+        );
     }
 
     #[test]

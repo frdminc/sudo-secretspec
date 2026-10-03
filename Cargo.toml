@@ -11,7 +11,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.19.1-sudo.23"
+version = "0.19.1-sudo.24"
 edition = "2024"
 
 [workspace.dependencies]
@@ -63,8 +63,8 @@ azure_identity = "1.0.0"
 azure_security_keyvault_secrets = "1.0.0"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
-secretspec-derive = { version = "0.19.1-sudo.23", path = "./secretspec-derive" }
-secretspec = { version = "0.19.1-sudo.23", path = "./secretspec" }
+secretspec-derive = { version = "0.19.1-sudo.24", path = "./secretspec-derive" }
+secretspec = { version = "0.19.1-sudo.24", path = "./secretspec" }
 rand = "0.9"
 rsa = { version = "0.9", features = ["pem"] }
 uuid = { version = "1", features = ["serde", "v4"] }
