@@ -262,6 +262,15 @@ explicit `unknown` terminal state if restoration cannot be proven.
   A vault that has been truncated shows as `.env` at 0 bytes with `check`
   reporting most secrets missing; recovery is from backup, not from the
   rollback snapshot, which deliberately excludes the vault.
+- **Before 0.19.1-sudo.24, `install --adopt-existing` refused any vault
+  already migrated off `.env`.** The adoption check hard-required `.env` to
+  exist, but `.env` is vestigial once values move into `secrets.db` — the
+  same reasoning that already makes it optional in the broker's own
+  boundary check. The refusal read `adopted runtime file missing or
+  symlinked: .../.env`, which looks like a corrupted vault but is not: a
+  fully migrated vault legitimately has no `.env`. Fixed in .24; `.env` is
+  now optional on adoption and only validated (never symlinked, must be a
+  real file) if present at all.
 - **`doctor` reports a staged upgrade** as the `UPGRADE_AVAILABLE` advisory
   (0.19.1-sudo.13+), naming the path to run. Advisory means `doctor` still
   exits 0; it is not a stop condition.
