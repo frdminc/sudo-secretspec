@@ -273,6 +273,41 @@ else
 fi
 check_success "string ref errors with the table translation hint"
 
+# Regression: `set` on an undeclared name must fail loudly, not silently.
+# Exit status is the contract here, not the message text -- assert on that.
+cat > secretspec.toml << EOF
+[project]
+name = "test-app"
+revision = "1.0"
+
+[profiles.default]
+KNOWN_SECRET = { description = "Declared secret for the undeclared-set regression" }
+EOF
+rm -f .env
+
+if OUTPUT=$(echo "leaked_value" | secretspec set UNDECLARED_SECRET 2>&1); then
+    echo "✗ set on an undeclared name must exit non-zero"
+    exit 1
+else
+    echo "✓ set on an undeclared name exits non-zero"
+fi
+# Nothing was written: no .env was even created for the failed attempt.
+[ ! -f .env ] || ! grep -q "UNDECLARED_SECRET" .env
+check_success "set on an undeclared name writes nothing"
+# The error message must read once, not wrap itself in a second
+# "Secret '...' not found" (regression for the doubled-quote bug).
+case "$OUTPUT" in
+    *"Secret 'Secret '"*) echo "✗ error message is double-wrapped: $OUTPUT"; exit 1 ;;
+    *) echo "✓ error message is not double-wrapped" ;;
+esac
+
+# A declared secret is unaffected: set still exits 0 and round-trips via get.
+echo "known_value" | secretspec set KNOWN_SECRET
+check_success "set on a declared name still exits 0"
+VALUE=$(secretspec get KNOWN_SECRET)
+[ "$VALUE" = "known_value" ]
+check_success "set on a declared name round-trips through get"
+
 # Cleanup
 cd ..
 rm -rf "$TEST_DIR"

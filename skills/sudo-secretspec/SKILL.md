@@ -197,11 +197,22 @@ explicit `unknown` terminal state if restoration cannot be proven.
   gateway — was wrong in both directions. `get`/`check` tell you about
   *declared* names only; grep the consumer for `lookup('env'` or its equivalent
   to learn which those are.
-- **`set` on an undeclared name exits 0 and writes nothing.** It prints
-  `broker: Secret '<NAME>' is not defined in profile '<P>' ... not found` and
-  still returns **0**. Piping a value in therefore looks like it worked and did
-  not. Never trust `set`'s exit status: follow every `set` with a presence check
-  and assert on *that*. `add` the name first if it is genuinely new.
+- **`set`'s exit status on an undeclared name was already correct; this entry
+  used to claim otherwise.** Direct testing against the installed
+  0.19.1-sudo.22 boundary (2026-10-03) found it already returns a non-zero
+  exit and writes nothing — the opposite of what this note previously said.
+  What *was* real: the error message wrapped itself a second time, reading
+  `broker: Secret 'Secret '<NAME>' is not defined in profile '<P>' ...' not
+  found` — a fully-formed sentence re-wrapped by its own error type's
+  `Display` template. Fixed in 0.19.1-sudo.23: the message now reads once,
+  still naming the available secrets, and the exit status is unchanged. `get`
+  and `delete` on an undeclared name were audited at the same time and hit
+  the same double-wrap on their `SecretNotFound` path; `check` and
+  `undeclare` use a different error type and were already single-wrapped.
+  Still follow a `set` an unattended script depends on with a presence
+  check — a non-zero exit is the real signal, but confirming the value
+  actually changed catches a different class of failure, such as a provider
+  that silently no-ops.
 - **`run` needs no `sudo` and costs no Touch ID prompt.** The client is
   privilege-separated: the unprivileged side asks the boundary daemon for the
   declared environment. Only the lifecycle commands (`install`, `uninstall`,

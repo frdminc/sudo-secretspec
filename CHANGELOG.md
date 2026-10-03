@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `set`, `get`, and `delete` on a name that is not declared in the active
+  profile no longer print a garbled, doubly-quoted error such as
+  `Secret 'Secret 'NAME' is not defined in profile 'default' ...' not found`.
+  The message now reads once, still naming the available secrets. The
+  non-zero exit status this already returned is unchanged.
 - Deleting or destroying a secret now erases its plaintext from the database
   file instead of leaving it readable on a freed page. SQLite's
   `secure_delete` is a per-connection setting that is off by default in the

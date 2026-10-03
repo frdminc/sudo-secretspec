@@ -3452,9 +3452,9 @@ impl Secrets {
             }
             // Undeclared and missing are one error for the CLI: either way there
             // is nothing to print. Both are already audited by `resolve_named`.
-            NamedResolution::Missing { .. } | NamedResolution::Undeclared => {
-                Err(SecretSpecError::SecretNotFound(name.to_string()))
-            }
+            NamedResolution::Missing { .. } | NamedResolution::Undeclared => Err(
+                SecretSpecError::SecretNotFound(format!("Secret '{name}' not found")),
+            ),
         }
     }
 
@@ -4777,7 +4777,7 @@ impl Secrets {
             // An attempted read of a name this surface does not offer is still
             // an attempted read, and is audited as one (matching how `set`
             // records an undefined secret). No provider can be attributed.
-            let err = SecretSpecError::SecretNotFound(name.to_string());
+            let err = SecretSpecError::SecretNotFound(format!("Secret '{name}' not found"));
             self.record_key_error(AuditAction::Get, &profile_name, name, None, None, &err);
             return Ok(NamedResolution::Undeclared);
         }

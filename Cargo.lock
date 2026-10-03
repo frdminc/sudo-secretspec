@@ -5300,7 +5300,7 @@ dependencies = [
 
 [[package]]
 name = "secretspec"
-version = "0.19.1-sudo.22"
+version = "0.19.1-sudo.23"
 dependencies = [
  "age",
  "aws-config",
@@ -5351,7 +5351,7 @@ dependencies = [
 
 [[package]]
 name = "secretspec-derive"
-version = "0.19.1-sudo.22"
+version = "0.19.1-sudo.23"
 dependencies = [
  "http 1.4.0",
  "insta",
@@ -5369,7 +5369,7 @@ dependencies = [
 
 [[package]]
 name = "secretspec-ffi"
-version = "0.19.1-sudo.22"
+version = "0.19.1-sudo.23"
 dependencies = [
  "secretspec",
  "serde_json",
@@ -5378,7 +5378,7 @@ dependencies = [
 
 [[package]]
 name = "secretspec-node-native"
-version = "0.19.1-sudo.22"
+version = "0.19.1-sudo.23"
 dependencies = [
  "napi",
  "napi-build",
@@ -5388,7 +5388,7 @@ dependencies = [
 
 [[package]]
 name = "secretspec-php-native"
-version = "0.19.1-sudo.22"
+version = "0.19.1-sudo.23"
 dependencies = [
  "ext-php-rs",
  "secretspec",
@@ -5396,7 +5396,7 @@ dependencies = [
 
 [[package]]
 name = "secretspec-py-native"
-version = "0.19.1-sudo.22"
+version = "0.19.1-sudo.23"
 dependencies = [
  "pyo3",
  "secretspec",
@@ -5790,7 +5790,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "sudo-secretspec-cli"
-version = "0.19.1-sudo.22"
+version = "0.19.1-sudo.23"
 dependencies = [
  "clap",
  "dotenv-ng",

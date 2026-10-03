@@ -2769,6 +2769,71 @@ fn test_set_with_undefined_secret() {
     }
 }
 
+/// Regression for a `SecretSpecError::SecretNotFound` built from an
+/// already-complete sentence getting wrapped a second time by the variant's
+/// own `"Secret '{0}' not found"` `Display` template, rendering as
+/// `Secret 'Secret 'X' is not defined in profile 'Y' ...' not found`. Pinned
+/// on `Display`, not just the inner `msg` field like the test above, because
+/// that double-wrap is invisible when matching on the field directly.
+#[test]
+fn test_set_with_undefined_secret_error_display_is_not_double_wrapped() {
+    let project_config = Config {
+        project: Project {
+            name: "test_project".to_string(),
+            ..Default::default()
+        },
+        profiles: {
+            let mut profiles = HashMap::new();
+            let mut secrets = HashMap::new();
+            secrets.insert(
+                "DEFINED_SECRET".to_string(),
+                Secret {
+                    description: Some("A defined secret".to_string()),
+                    required: Some(true),
+                    default: None,
+                    providers: None,
+                    as_path: None,
+                    ..Default::default()
+                },
+            );
+            profiles.insert(
+                "default".to_string(),
+                Profile {
+                    defaults: None,
+                    secrets,
+                },
+            );
+            profiles
+        },
+        providers: None,
+        scopes: None,
+    };
+
+    let global_config = GlobalConfig {
+        defaults: GlobalDefaults {
+            provider: Some("env".to_string()),
+            profile: None,
+            providers: None,
+        },
+        audit: None,
+    };
+
+    let spec = Secrets::new(project_config, Some(global_config), None, None);
+    let result = spec.set("UNDEFINED_SECRET", Some("test_value".to_string()));
+
+    let rendered = result.unwrap_err().to_string();
+    assert!(
+        !rendered.contains("Secret 'Secret '"),
+        "error message must read once, not nest itself: {rendered}"
+    );
+    assert!(
+        !rendered.ends_with("not found"),
+        "a fully-formed sentence must not get a redundant 'not found' appended: {rendered}"
+    );
+    assert!(rendered.contains("UNDEFINED_SECRET"));
+    assert!(rendered.contains("not defined in profile"));
+}
+
 #[test]
 fn test_set_with_defined_secret() {
     use std::env;
@@ -6945,6 +7010,48 @@ fn test_import_source_literal_uri_still_works() {
         read_env_var(&target_env_path, "API_KEY").as_deref(),
         Some("from-source")
     );
+}
+
+/// Regression sibling of
+/// `test_set_with_undefined_secret_error_display_is_not_double_wrapped`:
+/// `delete` builds the exact same already-complete "is not defined in
+/// profile ... Available secrets: ..." sentence as `set` and must not have it
+/// wrapped a second time by `SecretNotFound`'s `Display` impl either.
+#[test]
+fn delete_on_an_undeclared_name_is_not_double_wrapped_and_writes_nothing() {
+    let _env = scrub_resolution_env();
+    let temp = TempDir::new().unwrap();
+    let store = temp.path().join("store.env");
+    fs::write(&store, "API_KEY=secret\n").unwrap();
+    let config: Config = toml::from_str(
+        r#"
+[project]
+name = "delete-test"
+revision = "1.0"
+
+[profiles.default]
+API_KEY = { description = "API key" }
+"#,
+    )
+    .unwrap();
+    let spec = Secrets::new(
+        config,
+        None,
+        Some(format!("dotenv://{}", store.display())),
+        None,
+    );
+
+    let err = spec.delete("UNDECLARED").unwrap_err();
+    assert!(matches!(err, SecretSpecError::SecretNotFound(_)));
+    let rendered = err.to_string();
+    assert!(
+        !rendered.contains("Secret 'Secret '"),
+        "error message must read once, not nest itself: {rendered}"
+    );
+    assert!(rendered.contains("UNDECLARED"));
+    assert!(rendered.contains("not defined in profile"));
+    // Nothing was touched: the declared secret is still exactly as it was.
+    assert_eq!(read_env_var(&store, "API_KEY").as_deref(), Some("secret"));
 }
 
 #[test]

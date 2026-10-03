@@ -60,7 +60,12 @@ pub enum SecretSpecError {
     NoProviderConfigured,
     #[error("Provider backend '{0}' not found")]
     ProviderNotFound(String),
-    #[error("Secret '{0}' not found")]
+    /// Callers build the full sentence themselves (e.g. "Secret 'X' is not
+    /// defined in profile 'Y'. Available secrets: ..."), so this must not add
+    /// its own "Secret '...' not found" wrapper around it -- that wrapping
+    /// used to double-quote and re-append "not found" to a message that
+    /// already said so, e.g. `set` on an undeclared name.
+    #[error("{0}")]
     SecretNotFound(String),
     #[error("Secret '{0}' is required but not set")]
     RequiredSecretMissing(String),

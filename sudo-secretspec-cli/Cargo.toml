@@ -24,7 +24,7 @@ serde_json.workspace = true
 # backend 'sqlite' not found" — after the vault has already been migrated onto
 # it. The rest stay off deliberately: a root-adjacent process has no business
 # linking cloud SDKs, `clap`, or `inquire`.
-secretspec = { path = "../secretspec", version = "0.19.1-sudo.22", default-features = false, features = ["manifest-edit", "codegen-schema", "sqlite"] }
+secretspec = { path = "../secretspec", version = "0.19.1-sudo.23", default-features = false, features = ["manifest-edit", "codegen-schema", "sqlite"] }
 sha2.workspace = true
 thiserror.workspace = true
 toml.workspace = true
