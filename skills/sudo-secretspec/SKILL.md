@@ -183,6 +183,33 @@ explicit `unknown` terminal state if restoration cannot be proven.
   "the running file is the exact bytes that were reviewed", and what makes
   `add` → `undeclare` a provable undo. Do not propose loosening it; see
   `docs/design/template-check-resync.md`.
+- **A consumer's output variable name is not the declared name.** Every
+  subcommand operates on names declared in the profile. A consumer frequently
+  re-exports a secret downstream under a *different* name, and probing that
+  downstream name returns `broker: <NAME> is not resolved`, which reads exactly
+  like a missing secret. It is not — it is the wrong question. Find the mapping
+  in the consumer before concluding anything is absent. Real example: the
+  `litellm` Ansible role reads `CLINE_API_KEY` and `OPENCODE_ZEN_API_KEY` from
+  the vault (`roles/litellm/defaults/main.yml`) and emits them into a launchd
+  plist as `CLINEPASS_API_KEY` and `OPENCODE_GO_API_KEY`. Probing the plist
+  names reported two secrets "missing" that were present and correct, and the
+  conclusion drawn from it — that applying the role would strip keys from a live
+  gateway — was wrong in both directions. `get`/`check` tell you about
+  *declared* names only; grep the consumer for `lookup('env'` or its equivalent
+  to learn which those are.
+- **`set` on an undeclared name exits 0 and writes nothing.** It prints
+  `broker: Secret '<NAME>' is not defined in profile '<P>' ... not found` and
+  still returns **0**. Piping a value in therefore looks like it worked and did
+  not. Never trust `set`'s exit status: follow every `set` with a presence check
+  and assert on *that*. `add` the name first if it is genuinely new.
+- **`run` needs no `sudo` and costs no Touch ID prompt.** The client is
+  privilege-separated: the unprivileged side asks the boundary daemon for the
+  declared environment. Only the lifecycle commands (`install`, `uninstall`,
+  `rollback`) re-exec through `sudo`. Do not conclude that a `run`-wrapped
+  command is un-runnable because `sudo -n true` fails — that belief propagated
+  between two agent sessions in one day and nearly left a live service running
+  an unpatched config indefinitely. Test `run` itself before reporting it
+  blocked.
 - **`install --declarations` does not prune.** It is not a cleanup route for a
   runtime declaration; `undeclare` is.
 - **Upgrade by running the newly installed copy, not the installed one.**
@@ -241,6 +268,25 @@ explicit `unknown` terminal state if restoration cannot be proven.
   pass `--purge-vault` or `--remove-service-user`.
 
 ## Verification
+
+**Checking presence without leaking values.** `get` and `export` stream values
+to stdout, so neither belongs in a transcript. To assert that a set of secrets
+resolves, run a child under `run` and report only derived facts — a length, or a
+short hash prefix — never the value:
+
+```bash
+sudo-secretspec run --reason "verify provider keys resolve" -- \
+  bash -c 'for v in CLINE_API_KEY GEMINI_API_KEY; do
+    val="${!v}"
+    [ -n "$val" ] && printf "%-24s PRESENT (len=%s)\n" "$v" "${#val}" \
+                  || printf "%-24s EMPTY\n" "$v"
+  done'
+```
+
+A length is usually enough to corroborate an identity claim too: a vault entry
+and a deployed copy of the same credential should agree on length, which
+distinguishes "the same secret under two names" from "two different secrets"
+without revealing either.
 
 ```bash
 sudo-secretspec doctor
