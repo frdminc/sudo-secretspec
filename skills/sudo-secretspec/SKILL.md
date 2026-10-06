@@ -107,6 +107,15 @@ sudo-secretspec undeclare NAME --reason "purpose"
 
 `--description` is required by `add` and may not be empty.
 
+**Names must match `^[A-Z][A-Z0-9_]*$`** — an environment-variable name in
+upper case, starting with a letter (`CLINE_PASS_KEY_2`, not `cline_pass_key_2`).
+The audit ledger enforces this for every subcommand that takes a name, and it
+checks before the command runs, so a bad name fails as
+`broker: audit attempt failed: audit denied: invalid secret name` and the
+client then prints a hint about `--reason-sha256` and re-running `install`.
+**Ignore that hint**: it is a generic fallback for any audit denial, not the
+cause here. Upper-case the name and retry.
+
 ### Requiredness (`0.19.1-sudo.12+`)
 
 `add` writes no `required` key by default, so the declaration inherits the
