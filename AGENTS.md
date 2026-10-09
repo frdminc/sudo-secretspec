@@ -1,1 +1,268 @@
-CLAUDE.md
+# CLAUDE.md
+
+When commiting changes related to Rust, make sure to update /CHANGELOG.md with one entry (can be multi-line). Don't create new release subsections; add the entry under the existing unreleased section. Keep entries user facing: leave out development and testing notes.
+
+The documentation site is published from `main`, which may be ahead of the
+latest SecretSpec release. Any unreleased provider, CLI command, configuration
+field, or syntax must be labeled with its target version at each point of use.
+Do not rely on an `Unreleased` changelog entry or a notice on one concept page:
+users often land directly on provider and reference pages.
+
+For an upcoming provider or feature:
+
+- Add what version the provider was added in (to be released version)
+- Mark entries in provider lists, tables, sidebars, selector examples, landing
+  pages, README files, and generated documentation summaries with the minimum
+  version, for example `(0.15+)`.
+
+## Downstream fork notes (`frdminc/sudo-secretspec`)
+
+This repository is a fork. In addition to upstream SecretSpec:
+
+- Companion crate: `sudo-secretspec-cli` (binary `sudo-secretspec`)
+- Downstream docs: `sudo-secretspec/README.md`, `README.downstream.md`
+- AI automation contract: `sudo-secretspec/AI-GUIDANCE.md`
+- Fork-only agent notes/tricks: `FORK-AI.md` (do not upstream)
+- All downstream work goes on `sudo-main`. Commit and push directly to it — no
+  feature branches, no PRs. If asked to work on "main" or "master", that means
+  `sudo-main`.
+- `main` exists only as the upstream mirror. Do not develop on it, and do not
+  merge it into `sudo-main` without being asked: it carries post-0.19.1
+  upstream work intended for a future release.
+- Version scheme: `0.19.1-sudo.N`, where `N` is the downstream serial. Releases
+  through `v0.19.1-djbclark.3` used the older `-djbclark.N` form; the tags
+  remain, but new work uses `-sudo.N`. The `djbclark` in those tag names is the
+  old *version* serial, unrelated to the org move below — do not rewrite them.
+- The fork moved from the `djbclark` user to the `frdminc` org on 2026-08-15.
+  GitHub redirects the old URLs, so stale references keep working and will not
+  announce themselves; prefer `frdminc/...` everywhere. Note that `djbclark`
+  also appears as the *operator's macOS username* (sudoers rules, audit test
+  fixtures, install paths) — those are not org references and must stay.
+
+When changing the companion, update `CHANGELOG.md` Unreleased with a user-facing
+entry and keep privileged install explicit (Homebrew must not silently edit
+sudoers/users/vaults).
+
+Prefer system SQLite (not `rusqlite` bundled) on macOS; see `FORK-AI.md`.
+
+## Build and Development Commands
+
+```bash
+# Enter development environment
+devenv shell
+
+# Run tests
+cargo test --all
+
+# Run a single test
+cargo test test_name
+
+# Run the CLI
+cargo run -- <command>
+cargo run -- init --from .env
+cargo run -- check
+cargo run -- set DATABASE_URL
+cargo run -- run -- npm start
+
+# Format code / Run linter
+pre-commit run -a
+```
+
+## Architecture
+
+The project is organized as a Rust workspace with two crates:
+
+1. **secretspec** (src/): Main CLI and library
+   - `bin/secretspec.rs`: CLI entry point that calls the main CLI module
+   - `cli/mod.rs`: CLI command definitions (init, config, set/get, check, run, import)
+   - `lib.rs`: Core library with `Secrets` struct, validation logic, and CRUD operations
+   - `config.rs`: Core configuration types (Config, Secret), TOML parsing, and inheritance logic
+   - `provider/`: Storage backend implementations with trait-based plugin architecture
+
+2. **secretspec-derive**: Proc macro for type-safe code generation
+   - Reads `secretspec.toml` at compile time
+   - Generates strongly-typed structs from configuration
+   - Supports both union types (safe for any profile) and profile-specific types
+   - Validates secret names produce valid Rust identifiers
+
+## Provider System
+
+The provider system uses a trait-based architecture defined in `src/provider/mod.rs`. When implementing new providers:
+
+1. Create module in `src/provider/your_provider.rs`
+2. Implement the `Provider` trait with methods: `get()`, `set()`, `check_writable()`, `name()`, `description()`
+3. Use the `#[provider]` macro for automatic registration
+4. Handle profile-aware storage paths (e.g., `secretspec/{project}/{profile}/{key}`)
+
+Providers support URI-based configuration (e.g., `keyring://`, `onepassword://vault`, `dotenv://.env.production`). The provider system handles URI parsing and provider instantiation directly within each provider module.
+
+### Adding Provider Documentation
+
+When adding a new provider, update **every** location below — provider names appear in several listings that drift out of sync if any are missed:
+
+1. `docs/src/content/docs/providers/<provider>.md` - Create the provider's doc page and add a version compatibility notice if it is unreleased. Use `.mdx` instead when the provider accepts provider credentials, import the shared `ProviderCredentials` component, and add its catalog entry as described below.
+2. `docs/astro.config.ts` - Add to sidebar navigation under "Providers" **and** to the providers sentence in the `starlightLlmsTxt` description block
+3. `docs/src/content/docs/concepts/providers.mdx` - Add a row to the "Available Providers" table
+4. `docs/src/content/docs/reference/providers.md` - Add a provider section **and** a row in the "Security Considerations" table
+5. `docs/src/pages/index.astro` - Add to the `providerMetadata` array (top of file) **and** to the `secretspec config init` mini-terminal in the hero
+6. `docs/src/content/docs/quick-start.mdx` - Update the `secretspec config init` example output to include the new provider
+7. `README.md` (symlink to `secretspec/README.md`) - Add to the "Providers" bullet list **and** to the `secretspec config init` example output
+
+Provider credential names, environment fallbacks, and minimum versions are
+maintained in `docs/src/data/provider-credentials.json`. For a provider with a
+non-empty Rust `credential_names` registration:
+
+1. Add or update its catalog entry, including every Rust implementation file
+   that contains its environment fallback definitions.
+2. Add exactly one `## Provider credentials` section to its `.mdx` page and
+   render `<ProviderCredentials provider="<provider>" />` there.
+3. The same catalog renders the complete
+   `docs/src/content/docs/reference/provider-credentials.mdx` reference. The
+   provider-specific component links readers back to that page.
+4. Run `npm --prefix docs run check:provider-credentials`. The check compares
+   the catalog with Rust registrations, validates environment-source backlinks,
+   and requires every credential-aware provider page to use the shared table.
+
+If the provider is unreleased, add its target version (for example `(0.15+)`)
+in every listing above. See
+`docs/src/content/docs/development/adding-providers.md` for the full release
+visibility checklist.
+
+## Configuration System
+
+### Profile Resolution
+1. CLI flag (`--profile`)
+2. Environment variable (`SECRETSPEC_PROFILE`)
+3. User config default
+4. Falls back to "default" profile
+
+### Provider Resolution
+1. **Per-secret providers** (with fallback chain): specified in `secretspec.toml` as `providers: [alias1, alias2, ...]`
+   - Aliases resolved against the project `[providers]` table in `secretspec.toml` first, then the `[defaults.providers]` table in `~/.config/secretspec/config.toml`
+   - Project-level aliases win on conflict
+   - Tries each provider in order until secret is found
+2. CLI flag (`--provider`)
+3. Environment variable (`SECRETSPEC_PROVIDER`)
+4. User config default provider
+5. Falls back to keyring provider
+
+### Per-Secret Provider Configuration
+Secrets can specify their own providers using the `providers` field to override global defaults:
+
+```toml
+[profiles.production]
+DATABASE_URL = { description = "Production DB", providers = ["prod_vault", "keyring"] }
+API_KEY = { description = "API Key", providers = ["shared"] }
+GITHUB_TOKEN = { description = "GitHub token from env", providers = ["env"] }
+```
+
+Provider aliases can be checked into the project in `secretspec.toml` so every team member and CI runner sees them automatically:
+```toml
+[providers]
+prod_vault = "onepassword://Production"
+shared = "onepassword://Shared"
+keyring = "keyring://"
+env = "env://"
+```
+
+They can also be defined per-user in `~/.config/secretspec/config.toml` (project entries win on conflict):
+```toml
+[defaults]
+provider = "keyring"
+
+[defaults.providers]
+prod_vault = "onepassword://Production"
+shared = "onepassword://Shared"
+keyring = "keyring://"
+env = "env://"
+```
+
+Manage the user-level map via CLI (project-level aliases are hand-edited in `secretspec.toml`):
+```bash
+# Add provider alias to user config
+secretspec config provider add prod_vault "onepassword://Production"
+
+# List user-level aliases
+secretspec config provider list
+
+# Remove a user-level alias
+secretspec config provider remove prod_vault
+```
+
+### Secret Resolution
+1. Check active profile for secret
+2. Fall back to "default" profile
+3. Apply defaults if configured
+4. Validate required secrets are present
+
+### Config Inheritance
+Projects can extend other configurations via `extends = ["../shared/common"]`. The system loads configs recursively and merges them with proper precedence.
+
+## Testing
+
+- Unit tests are located alongside the code
+- Integration tests in `secretspec-derive/tests/` and `tests/integration/`
+- UI tests using `trybuild` for macro error testing
+- Run specific test: `cargo test test_name`
+- Test CI runs on Ubuntu and macOS using devenv
+
+### Provider Integration Tests
+
+Provider tests are located in `secretspec/src/provider/tests.rs` and test all provider implementations generically.
+
+```bash
+# Run provider tests
+cargo test --package secretspec provider::tests
+
+# Test specific providers using SECRETSPEC_TEST_PROVIDERS env var
+SECRETSPEC_TEST_PROVIDERS=keyring,dotenv cargo test --package secretspec provider::tests::integration_tests
+
+# Run with output visible
+SECRETSPEC_TEST_PROVIDERS=dotenv cargo test --package secretspec provider::tests -- --nocapture
+```
+
+The integration tests cover:
+- Basic get/set operations
+- Multiple secrets handling
+- Special characters and Unicode
+- Profile-specific storage
+- Error handling for edge cases
+
+Note: Some providers (like `env`) are read-only and will skip write tests.
+
+## Documentation Site (`docs/`)
+
+The docs site is an Astro Starlight site deployed to https://secretspec.dev/.
+
+### Structure
+
+- `docs/astro.config.ts` - Sidebar navigation and site config
+- `docs/src/pages/index.astro` - Home page (custom landing layout, not in the content collection)
+- `docs/src/content/docs/` - All other content pages (markdown/mdx)
+  - `quick-start.mdx` - Getting started guide
+  - `concepts/` - Declarative config, profiles, providers overview
+  - `providers/` - Individual provider docs (one `.md` or `.mdx` per registered provider; see [Adding Provider Documentation](#adding-provider-documentation) when adding a new one)
+  - `sdk/` - Rust SDK docs
+  - `reference/` - Configuration, CLI, providers reference, adding providers guide
+
+### What to update
+
+- **New doc page**: Create the `.md` file and add it to the sidebar in `docs/astro.config.ts`
+- **New CLI command**: Update `docs/src/content/docs/reference/cli.md`
+- **New config option**: Update `docs/src/content/docs/reference/configuration.md`
+- **New provider**: See [Adding Provider Documentation](#adding-provider-documentation) above
+- **New concept**: Create `docs/src/content/docs/concepts/<name>.md` and add to sidebar
+
+For every unreleased item above, put the target-version notice on the specific
+page or section where the item is documented. A notice elsewhere is not
+sufficient.
+
+## Key Files
+
+- `secretspec.toml`: Project secrets configuration
+- `secretspec/src/provider/mod.rs`: Provider trait definition and documentation
+- `secretspec/src/cli/mod.rs`: CLI command definitions
+- `secretspec/src/bin/secretspec.rs`: CLI entry point
+- `secretspec/src/lib.rs`: Core SecretSpec implementation
+- `secretspec-derive/src/lib.rs`: Code generation macro implementation
+- `secretspec/src/provider/tests.rs`: Generic provider test suite
