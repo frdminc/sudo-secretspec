@@ -5,7 +5,7 @@ version: 0.7.0
 author: Dan Clark (djbclark), Hermes Agent
 license: Apache-2.0
 platforms: macos
-metadata: hermes=tags=secrets, privilege-separation, audit, macos; related_skills=
+tags: secrets, privilege-separation, audit, macos
 ---
 
 # sudo-secretspec Skill
