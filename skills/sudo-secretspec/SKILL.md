@@ -4,11 +4,8 @@ description: Use managed credentials through the privilege-separated sudo-secret
 version: 0.7.0
 author: Dan Clark (djbclark), Hermes Agent
 license: Apache-2.0
-platforms: [macos]
-metadata:
-  hermes:
-    tags: [secrets, privilege-separation, audit, macos]
-    related_skills: []
+platforms: macos
+metadata: hermes=tags=secrets, privilege-separation, audit, macos; related_skills=
 ---
 
 # sudo-secretspec Skill
