@@ -767,29 +767,25 @@ mod tests {
         assert_eq!(seqs, vec![0, 1, 2]);
     }
 
-    /// A log file that cannot be opened (here: an unwritable parent directory)
-    /// must make `JsonlSink::new` fail, so `from_config` warns and disables
-    /// auditing — rather than returning a sink whose writes silently no-op.
+    /// A log file that cannot be opened (here: the path already exists as a
+    /// directory) must make `JsonlSink::new` fail, so `from_config` warns and
+    /// disables auditing — rather than returning a sink whose writes silently
+    /// no-op. The path-is-a-directory construction is deliberately root-proof:
+    /// an unwritable-parent one is bypassed by root (CAP_DAC_OVERRIDE), and CI
+    /// containers such as the Forgejo Hyades runner execute as root.
     #[cfg(unix)]
     #[test]
     fn jsonlsink_errors_when_log_file_cannot_be_opened() {
-        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("ss_audit_dir_{}", std::process::id()));
+        // The "log file" is a directory, so opening it for append fails with
+        // EISDIR for every user, root included.
+        std::fs::create_dir_all(base.join("audit.log")).unwrap();
 
-        let base = std::env::temp_dir().join(format!("ss_audit_ro_{}", std::process::id()));
-        let ro_dir = base.join("ro");
-        std::fs::create_dir_all(&ro_dir).unwrap();
-        // Read+execute only: creating the log file inside must fail.
-        std::fs::set_permissions(&ro_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let result = JsonlSink::new(base.join("audit.log"), 1_048_576);
 
-        let result = JsonlSink::new(ro_dir.join("audit.log"), 1_048_576);
-        let is_err = result.is_err();
-
-        // Restore permissions so cleanup can remove the directory.
-        std::fs::set_permissions(&ro_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         let _ = std::fs::remove_dir_all(&base);
-
         assert!(
-            is_err,
+            result.is_err(),
             "JsonlSink::new must fail when the log file cannot be opened"
         );
     }

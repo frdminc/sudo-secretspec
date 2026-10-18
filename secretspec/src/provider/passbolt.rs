@@ -797,6 +797,37 @@ esac
             permissions.set_mode(0o755);
             std::fs::set_permissions(&binary, permissions).unwrap();
             drop(executable);
+            // Exec'ing a freshly written script can fail with ETXTBSY ("Text
+            // file busy") on some CI filesystems: on Forgejo Hyades' libkrun
+            // microVM the fake's write handle was already closed, yet the
+            // first exec still reported the file busy. Warm the script up
+            // with a no-arg exec (the fake answers those with exit 2 and one
+            // empty line in invocations.log, which every assertion below
+            // tolerates) until it is executable, so the tests never observe
+            // the race.
+            let mut busy = None;
+            for _ in 0..100 {
+                match Command::new(&binary)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                {
+                    Ok(_) => {
+                        busy = None;
+                        break;
+                    }
+                    Err(err) if err.raw_os_error() == Some(26) => {
+                        // 26 is ETXTBSY on Linux.
+                        busy = Some(err);
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    Err(err) => panic!("fake passbolt warmup exec failed: {err}"),
+                }
+            }
+            if let Some(err) = busy {
+                panic!("fake passbolt script stayed busy (ETXTBSY) for 5 s: {err}");
+            }
             std::fs::write(dir.path().join("list.json"), list.to_string()).unwrap();
             std::fs::write(dir.path().join("get.json"), get.to_string()).unwrap();
             Self {
