@@ -63,9 +63,18 @@ int bind(int fd, const struct sockaddr *addr, socklen_t len) {
     unsigned long long z = (unsigned long long)ts.tv_nsec ^ ((unsigned long long)ts.tv_sec << 30) ^ ((unsigned long long)getpid() << 17) ^ (++ctr * 0x9E3779B97F4A7C15ull);
     z ^= z >> 30; z *= 0xBF58476D1CE4E5B9ull; z ^= z >> 27; z *= 0x94D049BB133111EBull; z ^= z >> 31;
     unsigned seed = (unsigned)z;
-    /* 20000-32000: below the kernel ephemeral range, so no clash with auto-assigned ports */
+    /* 20000-32000 by default: below the kernel ephemeral range, so no clash with auto-assigned ports. The runner
+     * host has ONE loopback port space shared by all concurrent jobs, and TSI sockets always carry SO_REUSEPORT
+     * (libkrun#860), so a port already taken by another job never fails bind() here — it silently steals or splits
+     * that port's connections. PORTSHIM_PORT_BASE / PORTSHIM_PORT_SPAN narrow the range per job (set in
+     * .forgejo/workflows/ci.yml) so this repo's jobs cannot collide with each other. */
+    unsigned long long range_base = 20000, range_span = 12000;
+    { const char *eb = getenv("PORTSHIM_PORT_BASE"), *es = getenv("PORTSHIM_PORT_SPAN");
+      if (eb) { unsigned long long v = strtoull(eb, NULL, 10); if (v >= 1024 && v < 65500) range_base = v; }
+      if (es) { unsigned long long v = strtoull(es, NULL, 10); if (v >= 1024 && v <= 60000) range_span = v; }
+      if (range_base + range_span > 65500) range_span = 65500 - range_base; }
     for (int i = 0; i < 400; i++) {
-        unsigned short port = (unsigned short)(20000 + rand_r(&seed) % 12000);
+        unsigned short port = (unsigned short)(range_base + rand_r(&seed) % range_span);
         int seen = 0;
         pthread_mutex_lock(&pm);
         for (unsigned k = 0; k < RECENT && k < nrecent; k++) if (recent[k] == port) { seen = 1; break; }

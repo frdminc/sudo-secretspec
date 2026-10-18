@@ -12,6 +12,16 @@ on:
 permissions:
   contents: read
 
+env:
+  # Disjoint shim port range per repo: the runner host has one loopback port
+  # space shared by all concurrent jobs and TSI sockets always carry
+  # SO_REUSEPORT (libkrun#860), so overlapping ranges let one job's mock
+  # servers silently steal another's ports (run 591: one vault test's connect
+  # refused while this repo's job ran concurrently with secretspec-sqlite).
+  # This repo: 20000-25999; secretspec-sqlite: 26000-31999.
+  PORTSHIM_PORT_BASE: "20000"
+  PORTSHIM_PORT_SPAN: "6000"
+
 jobs:
   linux:
     name: linux (fmt, clippy, build, test, features, package)
