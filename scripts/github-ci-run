@@ -152,14 +152,14 @@ unset GIT_INDEX_FILE GIT_WORK_TREE
 echo "overlay $commit for $target_sha -> $remote $run_branch"
 timeout 600 git push --force "$remote" "$commit:refs/heads/$run_branch"
 
-echo "pushed https://github.com/$(git -C "$top" remote get-url "$remote" | gsed -E 's#.*github.com[:/]##; s#\\.git$##')/tree/$run_branch"
+echo "pushed https://github.com/$(git -C "$top" remote get-url "$remote" | gsed -E 's#.*github.com[:/]##; s#\.git$##')/tree/$run_branch"
 
 if [ "$wait" = 0 ]; then
   exit 0
 fi
 
 # Watch the newest run on that branch (up to ~40 min in 8-min chunks externally).
-repo=$(git -C "$top" remote get-url "$remote" | gsed -E 's#.*github.com[:/]##; s#\\.git$##')
+repo=$(git -C "$top" remote get-url "$remote" | gsed -E 's#.*github.com[:/]##; s#\.git$##')
 # Give Actions a moment to register the push.
 sleep 5
 run_id=$(timeout 60 gh run list -R "$repo" --branch "$run_branch" --limit 1 --json databaseId -q '.[0].databaseId')
