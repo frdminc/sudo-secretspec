@@ -16,7 +16,12 @@ jobs:
   linux:
     name: linux (fmt, clippy, build, test, features, package)
     runs-on: ubuntu
-    timeout-minutes: 40
+    # A cold-cache full run (build + fmt/clippy + tests + the 14-provider
+    # feature loop + package) measures ~41 min on the Hyades runner (run 585
+    # was killed by this timeout mid-feature-loop with every test green; the
+    # cargo registry cache only saves on a green run, so the first green run
+    # is always the slowest). 60 leaves headroom for that.
+    timeout-minutes: 60
     steps:
       - uses: https://github.com/actions/checkout@v4
       - name: Install gcc and Rust (pinned by rust-toolchain.toml)
