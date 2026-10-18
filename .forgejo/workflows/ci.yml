@@ -23,7 +23,7 @@ jobs:
         run: |
           set -euo pipefail
           apt-get update -qq
-          apt-get install -y -qq gcc libc6-dev >/dev/null
+          apt-get install -y -qq gcc libc6-dev libsqlite3-dev pkg-config >/dev/null
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh
           sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain none >/dev/null
           . "$HOME/.cargo/env"
