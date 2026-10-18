@@ -27,7 +27,8 @@ jobs:
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh
           sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain none >/dev/null
           . "$HOME/.cargo/env"
-          rustup toolchain install --profile minimal --component rustfmt --component clippy
+          rustup toolchain install --profile minimal
+          rustup component add rustfmt clippy
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Cache cargo registry
         uses: https://github.com/actions/cache@v4
