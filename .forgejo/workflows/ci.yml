@@ -43,6 +43,14 @@ jobs:
           set -euo pipefail
           curl -fsSL -o /usr/local/bin/sops https://github.com/getsops/sops/releases/download/v3.13.2/sops-v3.13.2.linux.amd64
           chmod 0755 /usr/local/bin/sops
+      # libkrun TSI: listeners bound to port 0 are unreachable on this
+      # runner, which the vault/openbao mock-server tests need; preload the
+      # loopback-port-shim (forgejo-ci skill section 3) for every process.
+      - name: Build and preload the loopback-port-shim
+        run: |
+          set -euo pipefail
+          gcc -shared -fPIC -O2 -pthread -o /usr/local/lib/portshim.so .forgejo/loopback-port-shim.c -ldl
+          echo /usr/local/lib/portshim.so >> /etc/ld.so.preload
       # Formatting and linting are platform-independent; run them once here.
       # sudo-secretspec-cli is excluded as in test.yml: it does not build on
       # Linux at all (macOS-only companion).
