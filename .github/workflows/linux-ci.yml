@@ -1,7 +1,9 @@
 name: Linux CI
 
 # Overlay-only on ci/base. Port of .forgejo/workflows/ci.yml; no loopback-port-shim
-# (GitHub runners are not libkrun). sudo-secretspec-cli stays macOS-only.
+# (GitHub runners are not libkrun). sudo-secretspec-cli is macOS-only, so the
+# macos job runs it plus packaging/release.py's own suite: together the two jobs
+# are the release gate (release.py ci_gate, 2026-10-18).
 
 on:
   push:
@@ -64,3 +66,33 @@ jobs:
           cmp schema/resolution-report.schema.json "$fixture"
           cargo package --package secretspec --list |
             grep -Fx 'src/fixtures/resolution-report.schema.json'
+
+  macos:
+    name: macos (companion crate, release helper, formula)
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      # Same steps as sudo-release.yml, which fires only on tags and PRs.
+      # Homebrew's SQLite, not rusqlite's `bundled`, which can hang in build scripts.
+      - name: Install focused test dependencies
+        run: |
+          python -m pip install pytest ruff
+          brew install sqlite
+      - name: Test downstream companion crate
+        env:
+          PKG_CONFIG_PATH: /opt/homebrew/opt/sqlite/lib/pkgconfig
+          LIBRARY_PATH: /opt/homebrew/opt/sqlite/lib
+        run: cargo test -p sudo-secretspec-cli --locked
+      - name: Test release helper
+        run: |
+          python -m ruff check packaging tests/sudo_packaging
+          python -m ruff format --check packaging tests/sudo_packaging
+          python -m pytest tests/sudo_packaging -q
+      - name: Check formula style and syntax
+        run: |
+          ruby -c packaging/homebrew/sudo-secretspec.rb
+          brew style packaging/homebrew/sudo-secretspec.rb

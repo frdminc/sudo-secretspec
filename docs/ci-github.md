@@ -1,7 +1,10 @@
 # GitHub Linux CI (ci/base)
 
-Linux cargo CI (excluding macOS-only `sudo-secretspec-cli`) runs on free
-GitHub-hosted runners via `ci/base` + `ci/run/**`.
+CI runs on free GitHub-hosted runners via `ci/base` + `ci/run/**`: a Linux job
+(the workspace minus macOS-only `sudo-secretspec-cli`) and a macOS job (that
+crate, `tests/sudo_packaging`, the formula). Both are the release gate:
+`packaging/release.py` pushes HEAD through the wrapper and watches the run
+(2026-10-18); `--local-tests` runs the suites on the Mac instead.
 
 1. Workflow: `.github/workflows/linux-ci.yml` on `ci/base`
 2. Wrapper: `scripts/github-ci-run [REF]`
