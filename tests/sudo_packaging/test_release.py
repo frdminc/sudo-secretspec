@@ -588,12 +588,16 @@ def test_the_archive_fetch_survives_a_tarball_that_is_not_ready_yet(
     monkeypatch.setattr(release.urllib.request, "urlopen", flaky)
     monkeypatch.setattr(release.time, "sleep", slept.append)
 
-    assert release.archive_sha256(cut, dry_run=False) == hashlib.sha256(
-        b"tarball"
-    ).hexdigest()
+    assert (
+        release.archive_sha256(cut, dry_run=False)
+        == hashlib.sha256(b"tarball").hexdigest()
+    )
     assert len(attempts) == 3
     # Backoff doubles rather than hammering a tag that is still being packed.
-    assert slept == [release.ARCHIVE_BACKOFF_SECONDS, release.ARCHIVE_BACKOFF_SECONDS * 2]
+    assert slept == [
+        release.ARCHIVE_BACKOFF_SECONDS,
+        release.ARCHIVE_BACKOFF_SECONDS * 2,
+    ]
 
 
 def test_a_tarball_that_never_appears_names_the_by_hand_resume_path(
@@ -636,9 +640,10 @@ def test_a_partial_download_does_not_poison_the_retry(monkeypatch, release, cut)
     )
     monkeypatch.setattr(release.time, "sleep", lambda _s: None)
 
-    assert release.archive_sha256(cut, dry_run=False) == hashlib.sha256(
-        b"tarball"
-    ).hexdigest()
+    assert (
+        release.archive_sha256(cut, dry_run=False)
+        == hashlib.sha256(b"tarball").hexdigest()
+    )
 
 
 def test_a_failed_command_reports_what_it_printed(release):
@@ -658,3 +663,129 @@ def test_a_failed_command_with_only_stdout_still_explains_itself(release):
         2, ["brew", "test", "x"], output="Error: no such keg\n", stderr=""
     )
     assert "no such keg" in release.describe(error)
+
+
+OVERLAY = "a" * 40
+TARGET = "b" * 40
+CI_BRANCH = "ci/run/HEAD-bbbbbbbb"
+PUSHED = (
+    f"overlay {OVERLAY} for {TARGET} -> origin {CI_BRANCH}\n"
+    f"pushed https://github.com/frdminc/sudo-secretspec/tree/{CI_BRANCH}\n"
+)
+
+
+def fake_ci(monkeypatch, release, *, runs, watch_rc=0, refs=None):
+    """Script `github-ci-run`, `gh run list` (one reply per lookup) and `gh run watch`.
+
+    `refs` maps a ref to what `git rev-parse` prints; a local ci/base is absent
+    unless given.
+    """
+    calls = []
+    replies = list(runs)
+    refs = refs or {}
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        if argv[:2] == ["git", "rev-parse"]:
+            ref = argv[-1]
+            return completed(argv, refs.get(ref, ""), 0 if ref in refs else 1)
+        if argv[0] == str(release.CI_WRAPPER):
+            return completed(argv, PUSHED)
+        if argv[:3] == ["gh", "run", "list"]:
+            return completed(argv, json.dumps(replies.pop(0)))
+        if argv[:3] == ["gh", "run", "watch"]:
+            return completed(argv, returncode=watch_rc)
+        return completed(argv)
+
+    monkeypatch.setattr(release, "run", fake_run)
+    monkeypatch.setattr(release.time, "sleep", lambda _s: None)
+    return calls
+
+
+def test_ci_gate_watches_the_run_for_its_own_overlay_commit(
+    monkeypatch, release, capsys
+):
+    # The first lookup sees only an older run on the branch (a force-push reuses
+    # the name); the gate must wait for the run of the overlay it just pushed.
+    calls = fake_ci(
+        monkeypatch,
+        release,
+        runs=[
+            [{"databaseId": 1, "headSha": "c" * 40}],
+            [{"databaseId": 7, "headSha": OVERLAY}],
+        ],
+    )
+    release.ci_gate(dry_run=False)
+    assert calls[0] == ["git", "fetch", "origin", "ci/base"]
+    assert calls[2] == [str(release.CI_WRAPPER), "--no-wait", "HEAD"]
+    assert ["gh", "run", "list", "-R", release.FORK_REPO, "--branch", CI_BRANCH] == (
+        calls[3][:7]
+    )
+    assert calls[-1][:4] == ["gh", "run", "watch", "7"]
+    assert "--exit-status" in calls[-1]
+    assert "https://github.com/frdminc/sudo-secretspec/actions/runs/7" in (
+        capsys.readouterr().out
+    )
+
+
+def test_ci_gate_refuses_a_red_run_and_names_it(monkeypatch, release):
+    fake_ci(
+        monkeypatch, release, runs=[[{"databaseId": 9, "headSha": OVERLAY}]], watch_rc=1
+    )
+    with pytest.raises(release.ReleaseError, match="actions/runs/9"):
+        release.ci_gate(dry_run=False)
+
+
+def test_ci_gate_refuses_a_stale_local_ci_base(monkeypatch, release):
+    # github-ci-run overlays a local ci/base before origin's, and fetch leaves
+    # it where it was, so an old workflow would gate the release.
+    calls = fake_ci(
+        monkeypatch,
+        release,
+        runs=[],
+        refs={"refs/heads/ci/base": "1" * 40, "origin/ci/base": "2" * 40},
+    )
+    with pytest.raises(release.ReleaseError, match="local ci/base differs"):
+        release.ci_gate(dry_run=False)
+    assert [str(release.CI_WRAPPER), "--no-wait", "HEAD"] not in calls
+
+
+def test_ci_gate_accepts_a_local_ci_base_matching_origin(monkeypatch, release):
+    same = {"refs/heads/ci/base": "1" * 40, "origin/ci/base": "1" * 40}
+    fake_ci(
+        monkeypatch,
+        release,
+        runs=[[{"databaseId": 3, "headSha": OVERLAY}]],
+        refs=same,
+    )
+    release.ci_gate(dry_run=False)
+
+
+def test_ci_gate_gives_up_when_no_run_appears(monkeypatch, release):
+    fake_ci(monkeypatch, release, runs=[[]] * release.CI_RUN_LOOKUPS)
+    with pytest.raises(release.ReleaseError, match="no GitHub Actions run"):
+        release.ci_gate(dry_run=False)
+
+
+def test_ci_gate_dry_run_only_prints_the_push(monkeypatch, release, capsys):
+    release.ci_gate(dry_run=True)
+    out = capsys.readouterr().out
+    assert "[dry-run] git fetch origin ci/base" in out
+    assert f"[dry-run] {release.CI_WRAPPER} --no-wait HEAD" in out
+    assert "gh run" not in out
+
+
+@pytest.mark.parametrize(
+    ("flags", "expected"),
+    [([], "ci"), (["--local-tests"], "local"), (["--skip-tests"], None)],
+)
+def test_main_gates_on_ci_unless_told_otherwise(
+    monkeypatch, release, cut, flags, expected
+):
+    seen = []
+    monkeypatch.setattr(release, "preflight", lambda _release, **kwargs: None)
+    monkeypatch.setattr(release, "ci_gate", lambda **kwargs: seen.append("ci"))
+    monkeypatch.setattr(release, "run_tests", lambda **kwargs: seen.append("local"))
+    monkeypatch.setattr(release, "run", lambda argv, **kwargs: completed(argv))
+    assert release.main(["--version", cut.version, "--dry-run", *flags]) == 0
+    assert seen == ([expected] if expected else [])

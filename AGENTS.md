@@ -272,3 +272,5 @@ sufficient.
 Linux CI runs on free GitHub runners, not Forgejo: `scripts/github-ci-run --no-wait origin/sudo-main` overlays the
 `ci/base` branch (workflow + wrapper + `docs/ci-github.md`) onto the commit and pushes `ci/run/<slug>`.
 Needs `origin/ci/base` fetched. `.forgejo/` is the retired Hyades flow; `load-watch ci` knows this repo.
+The run has a macOS job too (the companion crate, `tests/sudo_packaging`, the formula), and
+`packaging/release.py` gates a release on that run for HEAD (`--local-tests` to run it here).

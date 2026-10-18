@@ -77,6 +77,12 @@ FORMULA_VERSION_SITES = 4
 # instead. Delays double from the first: 3s, 6s, 12s, 24s.
 ARCHIVE_ATTEMPTS = 5
 ARCHIVE_BACKOFF_SECONDS = 3
+# The release gate is GitHub CI (2026-10-18): free runners, not a cold cargo
+# build on the maintainer's Mac. Actions can take a few seconds to register a
+# push, so look for the run a few times before giving up.
+CI_WRAPPER = ROOT / "scripts" / "github-ci-run"
+CI_RUN_LOOKUPS = 12
+CI_RUN_LOOKUP_SECONDS = 5
 
 
 class ReleaseError(RuntimeError):
@@ -256,6 +262,74 @@ def preflight(release: Release, *, allow_dirty: bool) -> None:
     _require(
         parent == UPSTREAM_REPO, f"fork parent must be {UPSTREAM_REPO}, got {parent!r}"
     )
+
+
+def ci_gate(*, dry_run: bool) -> None:
+    """Gate the release on GitHub CI for HEAD rather than building it here.
+
+    ``scripts/github-ci-run`` overlays ``ci/base`` onto HEAD and pushes
+    ``ci/run/<slug>``; that workflow runs the Linux engine job and the macOS
+    job carrying ``run_tests``'s suites (companion crate, this helper, the
+    formula). Its own watch gives up after 8 minutes and a run takes about 15,
+    so the run is found and watched here, until the jobs' 60-minute limit.
+    """
+    run(["git", "fetch", "origin", "ci/base"], dry_run=dry_run)
+    # The wrapper prefers a local ci/base over origin's, and a fetch does not
+    # move it: a stale one would gate the release on an old workflow.
+    local = run(
+        ["git", "rev-parse", "--verify", "--quiet", "refs/heads/ci/base"],
+        check=False,
+        dry_run=dry_run,
+    )
+    if local.returncode == 0 and local.stdout.strip():
+        _require(
+            local.stdout.strip() == output(["git", "rev-parse", "origin/ci/base"]),
+            "local ci/base differs from origin/ci/base; update or delete it first",
+        )
+    pushed = output([str(CI_WRAPPER), "--no-wait", "HEAD"], dry_run=dry_run)
+    if dry_run:
+        return
+    match = re.search(
+        r"^overlay ([0-9a-f]{40}) for [0-9a-f]{40} -> \S+ (ci/run/\S+)$",
+        pushed,
+        re.MULTILINE,
+    )
+    if match is None:
+        raise ReleaseError(f"github-ci-run printed no overlay line:\n{pushed}")
+    overlay, branch = match.groups()
+    run_id = None
+    for attempt in range(CI_RUN_LOOKUPS):
+        if attempt:
+            time.sleep(CI_RUN_LOOKUP_SECONDS)
+        runs = json.loads(
+            output(
+                [
+                    "gh",
+                    "run",
+                    "list",
+                    "-R",
+                    FORK_REPO,
+                    "--branch",
+                    branch,
+                    "--json",
+                    "databaseId,headSha",
+                ]
+            )
+            or "[]"
+        )
+        ids = [r["databaseId"] for r in runs if r.get("headSha") == overlay]
+        if ids:
+            run_id = ids[0]
+            break
+    _require(run_id is not None, f"no GitHub Actions run appeared for {branch}")
+    url = f"https://github.com/{FORK_REPO}/actions/runs/{run_id}"
+    log(f"CI: {url}")
+    watched = run(
+        ["gh", "run", "watch", str(run_id), "-R", FORK_REPO, "--exit-status"],
+        capture=False,
+        check=False,
+    )
+    _require(watched.returncode == 0, f"CI did not pass: {url}")
 
 
 def run_tests(*, dry_run: bool) -> None:
@@ -543,6 +617,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--allow-dirty", action="store_true")
     parser.add_argument("--skip-tests", action="store_true")
+    parser.add_argument(
+        "--local-tests",
+        action="store_true",
+        help="run the gating suites on this machine instead of GitHub CI",
+    )
     parser.add_argument("--skip-homebrew", action="store_true")
     parser.add_argument("--notes-file", type=Path)
     parser.add_argument("--tap-path", type=Path, default=DEFAULT_TAP)
@@ -555,8 +634,12 @@ def main(argv: list[str] | None = None) -> int:
     # Preflight is read-only, so it runs on the dry-run path too: a rehearsal
     # that skips validation hides exactly the failures it exists to surface.
     preflight(release, allow_dirty=args.allow_dirty)
-    if not args.skip_tests:
+    if args.skip_tests:
+        pass
+    elif args.local_tests:
         run_tests(dry_run=args.dry_run)
+    else:
+        ci_gate(dry_run=args.dry_run)
     notes = (
         args.notes_file.read_text(encoding="utf-8")
         if args.notes_file

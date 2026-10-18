@@ -37,7 +37,9 @@ python3 packaging/release.py --version 0.19.1-sudo.10 \
   --tap-path ~/src/homebrew-sudo-secretspec
 ```
 
-The live flow runs focused Python and Rust tests, creates and pushes an
+The live flow gates on GitHub CI for HEAD (`scripts/github-ci-run`: the Linux
+engine job plus a macOS job for the companion crate, this helper and the
+formula; `--local-tests` runs those suites here instead), creates and pushes an
 annotated tag, creates the titled GitHub Release with `gh`, downloads the tag
 tarball over HTTPS, rewrites the formula SHA-256, commits/pushes that formula,
 syncs the configured tap clone, force-refreshes Homebrew and the tap checkout,
