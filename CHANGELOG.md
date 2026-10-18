@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Concurrent opens of a history-enabled sqlite vault no longer fail with
+  `trigger … already exists` while finishing the schema. The open path used to
+  drop and recreate the append-only / write-once triggers without a write
+  transaction, so two connections could interleave and the second create
+  would lose the race. That batch now runs inside a single `BEGIN IMMEDIATE`
+  transaction so a concurrent opener waits on the busy timeout and sees the
+  finished triggers, and a failed finish rolls back rather than leaving a
+  partial trigger set.
 - `set`, `get`, and `delete` on a name that is not declared in the active
   profile no longer print a garbled, doubly-quoted error such as
   `Secret 'Secret 'NAME' is not defined in profile 'default' ...' not found`.
