@@ -266,3 +266,9 @@ sufficient.
 - `secretspec/src/lib.rs`: Core SecretSpec implementation
 - `secretspec-derive/src/lib.rs`: Code generation macro implementation
 - `secretspec/src/provider/tests.rs`: Generic provider test suite
+
+## CI (2026-10-18)
+
+Linux CI runs on free GitHub runners, not Forgejo: `scripts/github-ci-run --no-wait origin/sudo-main` overlays the
+`ci/base` branch (workflow + wrapper + `docs/ci-github.md`) onto the commit and pushes `ci/run/<slug>`.
+Needs `origin/ci/base` fetched. `.forgejo/` is the retired Hyades flow; `load-watch ci` knows this repo.
