@@ -22,6 +22,14 @@ on:
       - "v0.19.1-sudo.*"
       - "v0.19.1-djbclark.*"
   workflow_dispatch:
+    inputs:
+      tag:
+        description: >-
+          Existing release tag to build a bottle for, to prove the bottle job
+          without publishing. Empty means the tag the checked-out formula names.
+          Nothing is attached to a GitHub release outside a tag push.
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -70,3 +78,108 @@ jobs:
           test -n "$version" || { echo "could not read workspace version"; exit 1; }
           echo "tag=$GITHUB_REF_NAME workspace=$version"
           test "$GITHUB_REF_NAME" = "v$version"
+
+  # The macOS bottle `packaging/release.py` pours instead of compiling on the
+  # maintainer's Mac (2026-10-18). On a tag push it attaches the bottle and its
+  # JSON to that tag's GitHub release; on workflow_dispatch it only uploads a
+  # workflow artifact, so it can be proven without publishing. release.py finds
+  # this run by headSha, downloads the artifact and merges the `bottle do` block
+  # into the tap formula.
+  bottle:
+    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
+    runs-on: macos-latest
+    timeout-minutes: 90
+    permissions:
+      # Only to attach the bottle to the tag's release.
+      contents: write
+    env:
+      TAP: frdminc/sudo-secretspec
+      GH_TOKEN: ${{ github.token }}
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_ANALYTICS: "1"
+      HOMEBREW_NO_INSTALL_FROM_API: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # `brew install` refuses a formula that is not in a tap, so build from a
+      # throwaway tap of the same name as the real one: the bottle JSON names the
+      # formula `frdminc/sudo-secretspec/sudo-secretspec`, and `brew bottle
+      # --merge` on the maintainer's Mac looks it up by that name.
+      - name: Stage the release formula in a local tap
+        id: formula
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            tag="$GITHUB_REF_NAME"
+          elif [ -n "$INPUT_TAG" ]; then
+            tag="$INPUT_TAG"
+          else
+            tag="v$(sed -n 's/^  version "\(.*\)"/\1/p' packaging/homebrew/sudo-secretspec.rb)"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          url="https://github.com/$GITHUB_REPOSITORY/archive/refs/tags/$tag.tar.gz"
+          curl -fsSL --retry 5 --retry-all-errors -o "$RUNNER_TEMP/src.tar.gz" "$url"
+          sha="$(shasum -a 256 "$RUNNER_TEMP/src.tar.gz" | cut -d' ' -f1)"
+          brew tap-new "$TAP"
+          formula="$(brew --repository "$TAP")/Formula/sudo-secretspec.rb"
+          cp packaging/homebrew/sudo-secretspec.rb "$formula"
+          # The tag's own formula still names the previous release (release.py
+          # restamps it after the tag exists), so restamp it with the same code.
+          python3 - "$formula" "${tag#v}" "$sha" <<'PY'
+          import sys
+          from pathlib import Path
+
+          sys.path.insert(0, "packaging")
+          import release
+
+          path, version, sha = sys.argv[1:]
+          release.rewrite_formula(Path(path), release.parse_release(version), sha)
+          PY
+          grep -n 'url "\|version "\|sha256 "' "$formula"
+      - name: Build the bottle
+        run: |
+          set -euo pipefail
+          brew install --build-bottle --verbose "$TAP/sudo-secretspec"
+          brew test "$TAP/sudo-secretspec"
+          mkdir "$RUNNER_TEMP/bottle"
+          cd "$RUNNER_TEMP/bottle"
+          brew bottle --json \
+            --root-url="https://github.com/$GITHUB_REPOSITORY/releases/download/${{ steps.formula.outputs.tag }}" \
+            "$TAP/sudo-secretspec"
+          # brew writes `name--version.tag.bottle.tar.gz` locally and expects the
+          # upload to use the single-dash name its JSON records.
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          for path in Path(".").glob("*.json"):
+              (entry,) = json.loads(path.read_text()).values()
+              for spec in entry["bottle"]["tags"].values():
+                  local = Path(spec["local_filename"])
+                  assert local.is_file(), local
+                  local.rename(spec["filename"])
+                  print(f"{local} -> {spec['filename']}")
+          PY
+          ls -l
+          echo "BOTTLE_DIR=$PWD" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sudo-secretspec-bottle
+          path: ${{ env.BOTTLE_DIR }}/*
+          if-no-files-found: error
+      # release.py creates the release right after pushing the tag, and this
+      # job takes far longer than that, but wait rather than assume.
+      - name: Attach the bottle to the tag's release
+        if: github.ref_type == 'tag'
+        run: |
+          set -euo pipefail
+          cd "$BOTTLE_DIR"
+          for _ in $(seq 1 60); do
+            gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 && break
+            sleep 10
+          done
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null
+          gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber ./*
