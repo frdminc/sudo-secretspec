@@ -22,6 +22,8 @@ on:
   push:
     tags:
       - v**
+      # Not this fork's -sudo.N tags (see sudo-release.yml).
+      - '!v*-sudo.*'
   pull_request:
     paths:
       - "secretspec-dotnet/**"

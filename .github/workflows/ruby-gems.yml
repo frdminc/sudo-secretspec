@@ -26,6 +26,8 @@ on:
   push:
     tags:
       - v**
+      # Not this fork's -sudo.N tags (see sudo-release.yml).
+      - '!v*-sudo.*'
   # PR runs are scoped to changes in the Ruby SDK or this workflow. Core
   # resolver and FFI changes are verified on PRs by the devenv-based test.yml,
   # sdks.yml, and ffi-build.yml; the full matrix here still runs on tags and
