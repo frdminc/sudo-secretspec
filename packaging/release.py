@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import shutil
 import signal
@@ -83,6 +84,21 @@ ARCHIVE_BACKOFF_SECONDS = 3
 CI_WRAPPER = ROOT / "scripts" / "github-ci-run"
 CI_RUN_LOOKUPS = 12
 CI_RUN_LOOKUP_SECONDS = 5
+# The macOS bottle is built by `sudo-release.yml` on the tag push (2026-10-18),
+# so `brew reinstall` pours it instead of compiling the crate graph on this Mac.
+# The workflow uploads the bottle and its JSON as this artifact on every run.
+BOTTLE_WORKFLOW = "sudo-release.yml"
+BOTTLE_ARTIFACT = "sudo-secretspec-bottle"
+TAP_FORMULA_REL = Path("Formula/sudo-secretspec.rb")
+# Install the tap formula, never Homebrew's API copy of a formula.
+BREW_ENV = {"HOMEBREW_NO_INSTALL_FROM_API": "1"}
+# The one place that names the escape hatch; every bottle failure repeats it.
+BOTTLE_FALLBACK_HINT = (
+    "The tag and Release are already published, so re-running release.py is "
+    "refused. To install on this Mac anyway, run `brew reinstall "
+    f"--build-from-source {FORMULA_NAME}` (what `release.py --build-from-source` "
+    "runs); that compiles the whole crate graph locally."
+)
 
 
 class ReleaseError(RuntimeError):
@@ -131,12 +147,20 @@ def run(
     capture: bool = True,
     check: bool = True,
     dry_run: bool = False,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     if dry_run:
         log("[dry-run] " + " ".join(str(value) for value in argv))
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
     log("+ " + " ".join(str(value) for value in argv))
-    return subprocess.run(argv, cwd=cwd, text=True, capture_output=capture, check=check)
+    return subprocess.run(
+        argv,
+        cwd=cwd,
+        text=True,
+        capture_output=capture,
+        check=check,
+        env={**os.environ, **env} if env else None,
+    )
 
 
 def output(argv: list[str], **kwargs: object) -> str:
@@ -264,6 +288,39 @@ def preflight(release: Release, *, allow_dirty: bool) -> None:
     )
 
 
+def find_run(branch: str, sha: str, *, workflow: str | None = None) -> int:
+    """Return the id of the run on `branch` whose head is exactly `sha`.
+
+    Matching the head matters: a force-pushed ``ci/run`` branch keeps its name,
+    so the newest run on it may belong to the previous push.
+    """
+    argv = ["gh", "run", "list", "-R", FORK_REPO, "--branch", branch]
+    if workflow:
+        argv += ["--workflow", workflow]
+    argv += ["--json", "databaseId,headSha"]
+    for attempt in range(CI_RUN_LOOKUPS):
+        if attempt:
+            time.sleep(CI_RUN_LOOKUP_SECONDS)
+        runs = json.loads(output(argv) or "[]")
+        ids = [r["databaseId"] for r in runs if r.get("headSha") == sha]
+        if ids:
+            return ids[0]
+    raise ReleaseError(f"no GitHub Actions run appeared for {branch}")
+
+
+def watch_run(run_id: int, failure: str) -> str:
+    """Block until the run finishes; raise `failure` plus its URL unless green."""
+    url = f"https://github.com/{FORK_REPO}/actions/runs/{run_id}"
+    log(f"CI: {url}")
+    watched = run(
+        ["gh", "run", "watch", str(run_id), "-R", FORK_REPO, "--exit-status"],
+        capture=False,
+        check=False,
+    )
+    _require(watched.returncode == 0, f"{failure}: {url}")
+    return url
+
+
 def ci_gate(*, dry_run: bool) -> None:
     """Gate the release on GitHub CI for HEAD rather than building it here.
 
@@ -297,39 +354,8 @@ def ci_gate(*, dry_run: bool) -> None:
     if match is None:
         raise ReleaseError(f"github-ci-run printed no overlay line:\n{pushed}")
     overlay, branch = match.groups()
-    run_id = None
-    for attempt in range(CI_RUN_LOOKUPS):
-        if attempt:
-            time.sleep(CI_RUN_LOOKUP_SECONDS)
-        runs = json.loads(
-            output(
-                [
-                    "gh",
-                    "run",
-                    "list",
-                    "-R",
-                    FORK_REPO,
-                    "--branch",
-                    branch,
-                    "--json",
-                    "databaseId,headSha",
-                ]
-            )
-            or "[]"
-        )
-        ids = [r["databaseId"] for r in runs if r.get("headSha") == overlay]
-        if ids:
-            run_id = ids[0]
-            break
-    _require(run_id is not None, f"no GitHub Actions run appeared for {branch}")
-    url = f"https://github.com/{FORK_REPO}/actions/runs/{run_id}"
-    log(f"CI: {url}")
-    watched = run(
-        ["gh", "run", "watch", str(run_id), "-R", FORK_REPO, "--exit-status"],
-        capture=False,
-        check=False,
-    )
-    _require(watched.returncode == 0, f"CI did not pass: {url}")
+    run_id = find_run(branch, overlay)
+    watch_run(run_id, "CI did not pass")
 
 
 def run_tests(*, dry_run: bool) -> None:
@@ -507,25 +533,170 @@ def sync_tap(release: Release, tap_path: Path, *, dry_run: bool) -> None:
         run(["git", "push", "origin", "HEAD"], cwd=tap_path)
 
 
-def brew_refresh_and_test(release: Release, *, dry_run: bool) -> str:
+def tap_checkout(*, dry_run: bool) -> Path:
+    """Homebrew's own checkout of the tap, which is not the maintainer's clone."""
+    repo = output(["brew", "--repository", TAP_NAME], dry_run=dry_run)
+    return Path(repo) if repo else Path("<brew-tap-checkout>")
+
+
+def brew_refresh(release: Release, *, dry_run: bool) -> Path:
+    """Force-refresh Homebrew and fast-forward its tap checkout to origin."""
     run(["brew", "update", "--force"], dry_run=dry_run, capture=False)
-    tap_repo = output(["brew", "--repository", TAP_NAME], dry_run=dry_run)
+    tap = tap_checkout(dry_run=dry_run)
     if not dry_run:
-        tap = Path(tap_repo)
         _require(tap.is_dir(), "Homebrew did not return the tap checkout")
         run(["git", "fetch", "origin", "main"], cwd=tap, capture=False)
         run(["git", "merge", "--ff-only", "origin/main"], cwd=tap, capture=False)
         _require(
-            release.tag
-            in (tap / "Formula/sudo-secretspec.rb").read_text(encoding="utf-8"),
+            release.tag in (tap / TAP_FORMULA_REL).read_text(encoding="utf-8"),
             "live tap formula is stale",
         )
-    run(["brew", "reinstall", FORMULA_NAME], dry_run=dry_run, capture=False)
+    return tap
+
+
+def fetch_bottle(release: Release, dest: Path, *, dry_run: bool) -> list[Path]:
+    """Wait for the tag's bottle job and download its JSON into `dest`.
+
+    The run is the ``sudo-release.yml`` run for the tag commit itself, found by
+    head SHA like ``ci_gate`` finds its own. Anything missing or red is an error
+    that names ``--build-from-source``; the caller never compiles on its own.
+    """
+    if dry_run:
+        log(f"[dry-run] wait for {BOTTLE_WORKFLOW} on {release.tag}")
+        run(
+            ["gh", "run", "download", "<run-id>", "-n", BOTTLE_ARTIFACT],
+            dry_run=True,
+        )
+        return []
+    sha = output(["git", "rev-parse", f"{release.tag}^{{commit}}"])
+    try:
+        run_id = find_run(release.tag, sha, workflow=BOTTLE_WORKFLOW)
+        watch_run(run_id, "the bottle run did not pass")
+        run(
+            ["gh", "run", "download", str(run_id), "-R", FORK_REPO]
+            + ["-n", BOTTLE_ARTIFACT, "-D", str(dest)]
+        )
+        jsons = sorted(dest.glob("*.bottle.json"))
+        _require(bool(jsons), f"artifact {BOTTLE_ARTIFACT} holds no bottle JSON")
+        root_url = f"https://github.com/{FORK_REPO}/releases/download/{release.tag}"
+        for path in jsons:
+            for entry in json.loads(path.read_text(encoding="utf-8")).values():
+                bottle = entry["bottle"]
+                _require(bottle["root_url"] == root_url, f"{path.name}: wrong root_url")
+                _require(bool(bottle["tags"]), f"{path.name}: lists no bottle tags")
+                for spec in bottle["tags"].values():
+                    _require(
+                        (dest / spec["filename"]).is_file(),
+                        f"{path.name}: {spec['filename']} missing from the artifact",
+                    )
+    except (ReleaseError, subprocess.CalledProcessError, KeyError, ValueError) as error:
+        detail = (
+            describe(error)
+            if isinstance(error, subprocess.CalledProcessError)
+            else error
+        )
+        raise ReleaseError(
+            f"no usable macOS bottle for {release.tag}: {detail}\n{BOTTLE_FALLBACK_HINT}"
+        ) from error
+    return jsons
+
+
+def merge_bottle(
+    release: Release, tap_path: Path, jsons: list[Path], *, dry_run: bool
+) -> None:
+    """Write the `bottle do` block into the tap formula and push the tap.
+
+    ``brew bottle --merge --write`` edits Homebrew's tap checkout, where the
+    JSON's formula path points, not the maintainer's clone. Run it without a
+    commit, carry the edited file into the clone (the repository that is
+    pushed), put the checkout back, and let the next refresh fast-forward it.
+    """
+    tap = brew_refresh(release, dry_run=dry_run)
+    checkout_formula = tap / TAP_FORMULA_REL
+    run(
+        ["brew", "bottle", "--merge", "--write", "--no-commit", *map(str, jsons)],
+        env=BREW_ENV,
+        capture=False,
+        dry_run=dry_run,
+    )
+    if dry_run:
+        log(f"[dry-run] copy {checkout_formula} -> {tap_path / TAP_FORMULA_REL}")
+        run(["git", "add", str(TAP_FORMULA_REL)], cwd=tap_path, dry_run=True)
+        run(
+            ["git", "commit", "-m", f"sudo-secretspec {release.version} bottle"],
+            cwd=tap_path,
+            dry_run=True,
+        )
+        run(["git", "push", "origin", "HEAD"], cwd=tap_path, dry_run=True)
+        return
+    merged = checkout_formula.read_text(encoding="utf-8")
+    _require(
+        "bottle do" in merged
+        and f"releases/download/{release.tag}" in merged
+        and release.tag in merged,
+        f"brew bottle --merge wrote no bottle block for {release.tag}\n"
+        + BOTTLE_FALLBACK_HINT,
+    )
+    shutil.copy2(checkout_formula, tap_path / TAP_FORMULA_REL)
+    run(["git", "checkout", "--", str(TAP_FORMULA_REL)], cwd=tap)
+    run(["git", "add", str(TAP_FORMULA_REL)], cwd=tap_path)
+    run(
+        ["git", "commit", "-m", f"sudo-secretspec {release.version} bottle"],
+        cwd=tap_path,
+    )
+    run(["git", "push", "origin", "HEAD"], cwd=tap_path)
+
+
+def install_from_source(*, dry_run: bool) -> None:
+    """The explicit fallback: compile the formula here, one job at a time.
+
+    Run through ``bg``, which gates on machine load. ``just release`` is
+    normally started under ``bg`` itself, so this is bg inside bg. That cannot
+    wait on the parent's slot: ``bg`` takes machine-wide slots only for gradle
+    and test runners (pytest, swift, xcodebuild), and neither ``just``,
+    ``release.py`` nor ``brew`` is one, so the inner call only re-reads the load
+    gate the outer one already passed. It runs from ``$HOME`` because ``bg``
+    refuses any build whose cwd is a CI-first repo such as this one, and the
+    brew build never touches the checkout.
+    """
+    bg = Path.home() / "ops" / "site-private" / "bin" / "bg"
+    argv = ["brew", "reinstall", "--build-from-source", FORMULA_NAME]
+    if bg.is_file() or dry_run:
+        argv = [str(bg), *argv]
+    else:
+        log(f"{bg} not found; compiling without the load gate")
+    run(
+        argv,
+        cwd=Path.home(),
+        env={**BREW_ENV, "HOMEBREW_MAKE_JOBS": "1"},
+        capture=False,
+        dry_run=dry_run,
+    )
+
+
+def brew_install_and_test(*, build_from_source: bool, dry_run: bool) -> str:
+    if build_from_source:
+        install_from_source(dry_run=dry_run)
+    else:
+        # --force-bottle makes brew refuse rather than quietly compile when it
+        # finds no bottle it can pour; the cause is named, not hidden.
+        result = run(
+            ["brew", "reinstall", "--force-bottle", FORMULA_NAME],
+            env=BREW_ENV,
+            capture=False,
+            check=False,
+            dry_run=dry_run,
+        )
+        _require(
+            result.returncode == 0,
+            f"brew could not pour a bottle for {FORMULA_NAME}.\n"
+            + BOTTLE_FALLBACK_HINT,
+        )
     prefix = (
         output(["brew", "--prefix", FORMULA_NAME], dry_run=dry_run)
         or "/opt/homebrew/opt/sudo-secretspec"
     )
-    run(["brew", "test", FORMULA_NAME], dry_run=dry_run, capture=False)
+    run(["brew", "test", FORMULA_NAME], env=BREW_ENV, dry_run=dry_run, capture=False)
     return prefix
 
 
@@ -623,6 +794,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="run the gating suites on this machine instead of GitHub CI",
     )
     parser.add_argument("--skip-homebrew", action="store_true")
+    parser.add_argument(
+        "--build-from-source",
+        action="store_true",
+        help="compile the formula on this Mac instead of pouring the CI-built "
+        "bottle (slow; the explicit fallback when the bottle job fails)",
+    )
     parser.add_argument("--notes-file", type=Path)
     parser.add_argument("--tap-path", type=Path, default=DEFAULT_TAP)
     return parser.parse_args(argv)
@@ -649,9 +826,22 @@ def main(argv: list[str] | None = None) -> int:
     with interrupt_cleanup(release, state):
         create_tag_and_release(release, notes, state, dry_run=args.dry_run)
         if not args.skip_homebrew:
-            update_formula_commit(release, dry_run=args.dry_run, state=state)
-            sync_tap(release, args.tap_path, dry_run=args.dry_run)
-            prefix = brew_refresh_and_test(release, dry_run=args.dry_run)
+            with tempfile.TemporaryDirectory(prefix="sudo-secretspec-bottle-") as work:
+                # Wait for the bottle before the tap moves: a failed bottle then
+                # leaves the tap on the previous release instead of half-updated.
+                jsons = (
+                    []
+                    if args.build_from_source
+                    else fetch_bottle(release, Path(work), dry_run=args.dry_run)
+                )
+                update_formula_commit(release, dry_run=args.dry_run, state=state)
+                sync_tap(release, args.tap_path, dry_run=args.dry_run)
+                if not args.build_from_source:
+                    merge_bottle(release, args.tap_path, jsons, dry_run=args.dry_run)
+                brew_refresh(release, dry_run=args.dry_run)
+                prefix = brew_install_and_test(
+                    build_from_source=args.build_from_source, dry_run=args.dry_run
+                )
             if not args.dry_run:
                 verify_readback(release, prefix)
     log(f"done: {release.title} ({release.tag})")

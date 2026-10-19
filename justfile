@@ -41,8 +41,10 @@ release-dry version: preflight-disk
     packaging/stamp.py --version {{version}}
     packaging/release.py --version {{version}} --dry-run --allow-dirty --skip-tests
 
-# Cut the release end to end.
-release version: preflight-disk
+# Cut the release end to end. Extra flags reach release.py, e.g.
+# `just release 0.19.1-sudo.N --build-from-source` to compile on this Mac
+# instead of pouring the CI-built bottle.
+release version *flags: preflight-disk
     #!/usr/bin/env bash
     set -euo pipefail
     packaging/stamp.py --version {{version}}
@@ -51,7 +53,7 @@ release version: preflight-disk
         git commit -m "chore: stamp workspace {{version}}"
     fi
     git push origin sudo-main
-    packaging/release.py --version {{version}}
+    packaging/release.py --version {{version}} {{flags}}
     echo
     echo "Published. The INSTALLED boundary is still the previous version until:"
     echo "  sudo \"$(brew --prefix sudo-secretspec)/libexec/sudo-secretspec\" install"

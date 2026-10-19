@@ -789,3 +789,247 @@ def test_main_gates_on_ci_unless_told_otherwise(
     monkeypatch.setattr(release, "run", lambda argv, **kwargs: completed(argv))
     assert release.main(["--version", cut.version, "--dry-run", *flags]) == 0
     assert seen == ([expected] if expected else [])
+
+
+# The macOS bottle, built by sudo-release.yml on the tag push and poured here.
+TAG_SHA = "d" * 40
+
+
+def bottle_json(release, cut, *, root_url=None):
+    """What `brew bottle --json` records, trimmed to the keys release.py reads."""
+    filename = f"sudo-secretspec-{cut.version}.arm64_tahoe.bottle.tar.gz"
+    return {
+        "frdminc/sudo-secretspec/sudo-secretspec": {
+            "bottle": {
+                "root_url": root_url
+                or f"https://github.com/{release.FORK_REPO}/releases/download/{cut.tag}",
+                "tags": {"arm64_tahoe": {"filename": filename, "sha256": "e" * 64}},
+            }
+        }
+    }
+
+
+def fake_bottle_run(monkeypatch, release, cut, *, runs, watch_rc=0, doc=None):
+    """Script the tag lookup, `gh run list/watch/download` for the bottle job."""
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        if argv[:2] == ["git", "rev-parse"]:
+            return completed(argv, TAG_SHA + "\n")
+        if argv[:3] == ["gh", "run", "list"]:
+            return completed(argv, json.dumps(runs))
+        if argv[:3] == ["gh", "run", "watch"]:
+            return completed(argv, returncode=watch_rc)
+        if argv[:3] == ["gh", "run", "download"]:
+            dest = Path(argv[argv.index("-D") + 1])
+            document = doc or bottle_json(release, cut)
+            name = f"sudo-secretspec--{cut.version}.bottle.json"
+            (dest / name).write_text(json.dumps(document), encoding="utf-8")
+            for entry in document.values():
+                for spec in entry["bottle"]["tags"].values():
+                    (dest / spec["filename"]).write_bytes(b"bottle")
+        return completed(argv)
+
+    monkeypatch.setattr(release, "run", fake_run)
+    monkeypatch.setattr(release.time, "sleep", lambda _s: None)
+    return calls
+
+
+def test_fetch_bottle_finds_the_tag_run_by_head_sha_and_downloads_its_json(
+    monkeypatch, release, cut, tmp_path
+):
+    calls = fake_bottle_run(
+        monkeypatch,
+        release,
+        cut,
+        runs=[
+            {"databaseId": 4, "headSha": "c" * 40},
+            {"databaseId": 8, "headSha": TAG_SHA},
+        ],
+    )
+    jsons = release.fetch_bottle(cut, tmp_path, dry_run=False)
+    assert [path.name for path in jsons] == [
+        f"sudo-secretspec--{cut.version}.bottle.json"
+    ]
+    assert calls[0] == ["git", "rev-parse", f"{cut.tag}^{{commit}}"]
+    lookup = next(argv for argv in calls if argv[:3] == ["gh", "run", "list"])
+    assert lookup[3:9] == [
+        "-R",
+        release.FORK_REPO,
+        "--branch",
+        cut.tag,
+        "--workflow",
+    ] + ["sudo-release.yml"]
+    watch = next(argv for argv in calls if argv[:3] == ["gh", "run", "watch"])
+    assert watch[3] == "8"
+    assert "--exit-status" in watch
+    download = calls[-1]
+    assert download[:4] == ["gh", "run", "download", "8"]
+    assert download[download.index("-n") + 1] == "sudo-secretspec-bottle"
+
+
+def test_fetch_bottle_names_the_fallback_when_the_run_is_red(
+    monkeypatch, release, cut, tmp_path
+):
+    fake_bottle_run(
+        monkeypatch,
+        release,
+        cut,
+        runs=[{"databaseId": 8, "headSha": TAG_SHA}],
+        watch_rc=1,
+    )
+    with pytest.raises(release.ReleaseError, match="--build-from-source") as raised:
+        release.fetch_bottle(cut, tmp_path, dry_run=False)
+    assert "actions/runs/8" in str(raised.value)
+
+
+def test_fetch_bottle_names_the_fallback_when_no_run_appears(
+    monkeypatch, release, cut, tmp_path
+):
+    fake_bottle_run(monkeypatch, release, cut, runs=[])
+    with pytest.raises(release.ReleaseError, match="--build-from-source"):
+        release.fetch_bottle(cut, tmp_path, dry_run=False)
+
+
+def test_fetch_bottle_refuses_a_bottle_that_points_at_another_release(
+    monkeypatch, release, cut, tmp_path
+):
+    other = bottle_json(release, cut, root_url="https://example.com/elsewhere")
+    fake_bottle_run(
+        monkeypatch,
+        release,
+        cut,
+        runs=[{"databaseId": 8, "headSha": TAG_SHA}],
+        doc=other,
+    )
+    with pytest.raises(release.ReleaseError, match="wrong root_url"):
+        release.fetch_bottle(cut, tmp_path, dry_run=False)
+
+
+def test_merge_bottle_writes_the_block_and_pushes_the_tap_clone(
+    monkeypatch, release, cut, tmp_path
+):
+    checkout = tmp_path / "brew-tap"
+    clone = tmp_path / "clone"
+    for tap in (checkout, clone):
+        (tap / "Formula").mkdir(parents=True)
+        (tap / "Formula/sudo-secretspec.rb").write_text(f'url "{cut.tag}"\n')
+    jsons = [tmp_path / "x.bottle.json"]
+    calls = []
+
+    def fake_run(argv, *, cwd=None, env=None, **kwargs):
+        calls.append((argv, cwd))
+        if argv[:2] == ["brew", "--repository"]:
+            return completed(argv, f"{checkout}\n")
+        if argv[:3] == ["brew", "bottle", "--merge"]:
+            assert env == release.BREW_ENV
+            (checkout / "Formula/sudo-secretspec.rb").write_text(
+                f'url "{cut.tag}"\nbottle do\n  root_url '
+                f'"https://github.com/x/releases/download/{cut.tag}"\nend\n'
+            )
+        return completed(argv)
+
+    monkeypatch.setattr(release, "run", fake_run)
+    release.merge_bottle(cut, clone, jsons, dry_run=False)
+    argvs = [argv for argv, _cwd in calls]
+    merge = ["brew", "bottle", "--merge", "--write", "--no-commit", str(jsons[0])]
+    assert merge in argvs
+    assert "bottle do" in (clone / "Formula/sudo-secretspec.rb").read_text()
+    # Homebrew's checkout is put back so the next refresh fast-forwards it.
+    assert (["git", "checkout", "--", "Formula/sudo-secretspec.rb"], checkout) in calls
+    assert (["git", "push", "origin", "HEAD"], clone) in calls
+    assert argvs.index(merge) < argvs.index(["git", "push", "origin", "HEAD"])
+
+
+def test_merge_bottle_refuses_a_formula_that_gained_no_bottle_block(
+    monkeypatch, release, cut, tmp_path
+):
+    checkout = tmp_path / "brew-tap"
+    (checkout / "Formula").mkdir(parents=True)
+    (checkout / "Formula/sudo-secretspec.rb").write_text(f'url "{cut.tag}"\n')
+
+    def fake_run(argv, **kwargs):
+        return completed(
+            argv, f"{checkout}\n" if argv[:2] == ["brew", "--repository"] else ""
+        )
+
+    monkeypatch.setattr(release, "run", fake_run)
+    with pytest.raises(release.ReleaseError, match="--build-from-source"):
+        release.merge_bottle(cut, tmp_path / "clone", [], dry_run=False)
+
+
+def test_install_pours_the_bottle_and_never_builds_from_source(
+    monkeypatch, release, cut
+):
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return completed(argv, "/opt/homebrew/opt/sudo-secretspec\n")
+
+    monkeypatch.setattr(release, "run", fake_run)
+    release.brew_install_and_test(build_from_source=False, dry_run=False)
+    install = next(a for a, _k in calls if a[:2] == ["brew", "reinstall"])
+    assert install == ["brew", "reinstall", "--force-bottle", release.FORMULA_NAME]
+    assert "--build-from-source" not in " ".join(" ".join(a) for a, _k in calls)
+    assert calls[0][1]["env"]["HOMEBREW_NO_INSTALL_FROM_API"] == "1"
+    assert any(a[:2] == ["brew", "test"] for a, _k in calls)
+
+
+def test_install_with_no_pourable_bottle_is_an_error_not_a_compile(
+    monkeypatch, release
+):
+    def fake_run(argv, **kwargs):
+        return completed(argv, returncode=1 if argv[:2] == ["brew", "reinstall"] else 0)
+
+    monkeypatch.setattr(release, "run", fake_run)
+    with pytest.raises(release.ReleaseError, match="--build-from-source"):
+        release.brew_install_and_test(build_from_source=False, dry_run=False)
+
+
+def test_build_from_source_compiles_through_bg_from_home(monkeypatch, release):
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return completed(argv, "/opt/homebrew/opt/sudo-secretspec\n")
+
+    monkeypatch.setattr(release, "run", fake_run)
+    release.brew_install_and_test(build_from_source=True, dry_run=True)
+    argv, kwargs = calls[0]
+    assert argv[0].endswith("ops/site-private/bin/bg")
+    assert argv[1:] == [
+        "brew",
+        "reinstall",
+        "--build-from-source",
+        release.FORMULA_NAME,
+    ]
+    # bg refuses a build whose cwd is a CI-first repo; brew never reads this one.
+    assert kwargs["cwd"] == Path.home()
+    assert kwargs["env"]["HOMEBREW_MAKE_JOBS"] == "1"
+
+
+@pytest.mark.parametrize("flags", [[], ["--build-from-source"]])
+def test_main_pours_the_bottle_unless_told_to_build_from_source(
+    monkeypatch, release, cut, flags
+):
+    seen = []
+    monkeypatch.setattr(release, "preflight", lambda _release, **kwargs: None)
+    monkeypatch.setattr(release, "run", lambda argv, **kwargs: completed(argv))
+    monkeypatch.setattr(
+        release, "fetch_bottle", lambda *a, **k: seen.append("fetch") or []
+    )
+    monkeypatch.setattr(release, "merge_bottle", lambda *a, **k: seen.append("merge"))
+    monkeypatch.setattr(release, "sync_tap", lambda *a, **k: seen.append("sync"))
+    monkeypatch.setattr(
+        release,
+        "brew_install_and_test",
+        lambda **k: seen.append(f"install source={k['build_from_source']}") or "p",
+    )
+    release.main(["--version", cut.version, "--dry-run", "--skip-tests", *flags])
+    if flags:
+        assert seen == ["sync", "install source=True"]
+    else:
+        # The bottle is awaited before the tap moves, merged after it.
+        assert seen == ["fetch", "sync", "merge", "install source=False"]
