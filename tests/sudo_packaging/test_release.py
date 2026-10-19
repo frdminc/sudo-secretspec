@@ -830,6 +830,7 @@ def fake_bottle_run(
     tarball=BOTTLE_BYTES,
     source=SOURCE_SHA,
     asset=BOTTLE_BYTES,
+    attest_rc=0,
 ):
     """Script the tag lookup, `gh run list/watch/download` for the bottle job."""
     calls = []
@@ -860,6 +861,10 @@ def fake_bottle_run(
         if argv[:3] == ["gh", "release", "download"]:
             dest = Path(argv[argv.index("-D") + 1])
             (dest / argv[argv.index("--pattern") + 1]).write_bytes(asset)
+        if argv[:3] == ["gh", "attestation", "verify"] and attest_rc:
+            raise subprocess.CalledProcessError(
+                attest_rc, argv, output="", stderr="no attestations found"
+            )
         return completed(argv)
 
     monkeypatch.setattr(release, "run", fake_run)
@@ -898,9 +903,77 @@ def test_fetch_bottle_finds_the_tag_run_by_head_sha_and_downloads_its_json(
     watch = next(argv for argv in calls if argv[:3] == ["gh", "run", "watch"])
     assert watch[3] == "8"
     assert "--exit-status" in watch
-    download = calls[-1]
+    download = next(argv for argv in calls if argv[:3] == ["gh", "run", "download"])
     assert download[:4] == ["gh", "run", "download", "8"]
     assert download[download.index("-n") + 1] == "sudo-secretspec-bottle"
+
+
+def test_fetch_bottle_verifies_the_tarball_attestation_against_the_tag(
+    monkeypatch, release, cut, tmp_path
+):
+    calls = fake_bottle_run(
+        monkeypatch, release, cut, runs=[{"databaseId": 8, "headSha": TAG_SHA}]
+    )
+    release.fetch_bottle(cut, tmp_path, dry_run=False)
+    verifies = [argv for argv in calls if argv[:3] == ["gh", "attestation", "verify"]]
+    tarball = tmp_path / f"sudo-secretspec-{cut.version}.arm64_tahoe.bottle.tar.gz"
+    assert verifies == [
+        [
+            "gh",
+            "attestation",
+            "verify",
+            str(tarball),
+            "--repo",
+            "frdminc/sudo-secretspec",
+            "--signer-workflow",
+            "frdminc/sudo-secretspec/.github/workflows/sudo-release.yml",
+            "--source-ref",
+            f"refs/tags/{cut.tag}",
+            "--source-digest",
+            TAG_SHA,
+            "--deny-self-hosted-runners",
+        ]
+    ]
+    # Verified after the cheap sha check, before the source-archive comparison.
+    names = [argv[:3] for argv in calls]
+    assert names.index(["gh", "run", "download"]) < names.index(
+        ["gh", "attestation", "verify"]
+    )
+
+
+def test_fetch_bottle_refuses_a_tarball_without_a_valid_attestation(
+    monkeypatch, release, cut, tmp_path
+):
+    fake_bottle_run(
+        monkeypatch,
+        release,
+        cut,
+        runs=[{"databaseId": 8, "headSha": TAG_SHA}],
+        attest_rc=1,
+    )
+    with pytest.raises(release.ReleaseError) as refusal:
+        release.fetch_bottle(cut, tmp_path, dry_run=False)
+    message = str(refusal.value)
+    assert "build provenance check failed" in message
+    assert f"refs/tags/{cut.tag}" in message
+    assert TAG_SHA in message
+    assert "no attestations found" in message
+    assert "--build-from-source" in message
+
+
+def test_fetch_bottle_does_not_attest_a_tarball_that_failed_its_sha_check(
+    monkeypatch, release, cut, tmp_path
+):
+    calls = fake_bottle_run(
+        monkeypatch,
+        release,
+        cut,
+        runs=[{"databaseId": 8, "headSha": TAG_SHA}],
+        tarball=b"tampered",
+    )
+    with pytest.raises(release.ReleaseError):
+        release.fetch_bottle(cut, tmp_path, dry_run=False)
+    assert not [argv for argv in calls if argv[:3] == ["gh", "attestation", "verify"]]
 
 
 def test_fetch_bottle_names_the_fallback_when_the_run_is_red(

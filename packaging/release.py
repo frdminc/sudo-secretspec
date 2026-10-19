@@ -605,12 +605,36 @@ def bottle_specs(release: Release, path: Path) -> list[dict[str, str]]:
     return specs
 
 
+def verify_attestation(tarball: Path, *, source_ref: str, source_digest: str) -> None:
+    """Check the signed build provenance of a bottle tarball.
+
+    ``gh attestation verify`` exits non-zero unless the Sigstore bundle GitHub
+    holds for the tarball's digest was signed by ``sudo-release.yml`` of this
+    repository, on a GitHub-hosted runner, at the given ref and commit. The
+    exit status decides; the output is only quoted in the refusal.
+    """
+    try:
+        run(
+            ["gh", "attestation", "verify", str(tarball), "--repo", FORK_REPO]
+            + ["--signer-workflow", f"{FORK_REPO}/.github/workflows/{BOTTLE_WORKFLOW}"]
+            + ["--source-ref", source_ref, "--source-digest", source_digest]
+            + ["--deny-self-hosted-runners"]
+        )
+    except subprocess.CalledProcessError as error:
+        raise ReleaseError(
+            f"build provenance check failed for {tarball.name}: it is not "
+            f"attested as built by {BOTTLE_WORKFLOW} at {source_ref} "
+            f"({source_digest})\n{describe(error)}"
+        ) from error
+
+
 def fetch_bottle(release: Release, dest: Path, *, dry_run: bool) -> list[Path]:
     """Wait for the tag's bottle job and download its JSON into `dest`.
 
     The run is the ``sudo-release.yml`` push run for the tag commit itself,
     found by head SHA like ``ci_gate`` finds its own. Every tarball must hash to
-    the sha256 its JSON records (the tap block is written from that JSON), and
+    the sha256 its JSON records (the tap block is written from that JSON) and
+    carry a signed build provenance from this workflow at the tag commit, and
     the source archive the runner compiled must be the one hashed here. Anything
     missing, mismatched or red is an error that names ``--build-from-source``;
     the caller never compiles on its own.
@@ -643,6 +667,9 @@ def fetch_bottle(release: Release, dest: Path, *, dry_run: bool) -> list[Path]:
                     file_sha256(tarball) == spec["sha256"],
                     f"{path.name}: {spec['filename']} does not hash to the sha256 "
                     "its JSON records",
+                )
+                verify_attestation(
+                    tarball, source_ref=f"refs/tags/{release.tag}", source_digest=sha
                 )
         source = dest / SOURCE_SHA_FILE
         _require(

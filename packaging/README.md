@@ -61,8 +61,11 @@ scripts:
    (and, on a tag push, against the commit the run was triggered for), stamps
    the release formula into a throwaway tap, runs `brew install --build-bottle`
    and `brew bottle --json --root-url=<the tag's release download URL>`, and
-   uploads the tarball, its JSON and the source archive's sha256 as the
-   `sudo-secretspec-bottle` artifact. It publishes nothing.
+   signs a build-provenance attestation for the tarball
+   (`actions/attest-build-provenance`; the job's only extra permissions are
+   `id-token: write` and `attestations: write`, neither of which writes to the
+   repository), and uploads the tarball, its JSON and the source archive's
+   sha256 as the `sudo-secretspec-bottle` artifact. It publishes nothing.
 2. `publish-bottle` (`contents: write`, no cargo, no brew) runs only for the
    push of a release tag, after `packaging` and `bottle` are green. It downloads
    that artifact and attaches the tarball and JSON to the tag's GitHub Release.
@@ -73,7 +76,9 @@ artifact; the release is touched only by the push of a release tag.
 
 After the tag push `release.py` finds the push run by head SHA (exactly one must
 match), watches it, downloads the artifact and checks it: every tarball must hash
-to the sha256 in its JSON, the JSON must hold one entry named
+to the sha256 in its JSON and pass `gh attestation verify` (`--repo`,
+`--signer-workflow` `sudo-release.yml`, `--source-ref refs/tags/<tag>`,
+`--source-digest` the tag's commit, `--deny-self-hosted-runners`), the JSON must hold one entry named
 `frdminc/sudo-secretspec/sudo-secretspec` at the release version with a bare
 file name, and the CI source sha256 must equal the archive `release.py` hashes
 for the formula. Before the tap is pushed it downloads each asset from the
