@@ -134,18 +134,18 @@ jobs:
           # tag name or dispatch input is an attacker-shaped string.
           [[ "$tag" =~ ^v0\.19\.1-sudo\.[1-9][0-9]*$ ]] || { echo "refusing tag: $tag" >&2; exit 1; }
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          if [ "$GITHUB_REF_TYPE" = tag ]; then
-            # The source is fetched by tag name below, so pin the tag to the
-            # commit this run was triggered for. An annotated tag lists its
-            # commit on the peeled `^{}` line.
-            remote="$(git ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/tags/$tag" "refs/tags/$tag^{}")"
-            commit="$(printf '%s\n' "$remote" | awk '/\^\{\}$/ {print $1; exit}')"
-            [ -n "$commit" ] || commit="$(printf '%s\n' "$remote" | awk 'NR==1 {print $1}')"
-            echo "tag $tag -> $commit; run commit $GITHUB_SHA"
-            test "$commit" = "$GITHUB_SHA"
-          fi
           url="https://github.com/$GITHUB_REPOSITORY/archive/refs/tags/$tag.tar.gz"
           curl -fsSL --retry 5 --retry-all-errors -o "$RUNNER_TEMP/src.tar.gz" "$url"
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            # The archive is fetched by tag name, so bind its bytes to the commit
+            # this run was triggered for: GitHub embeds the commit id in every
+            # archive it generates. A temp file, not a pipe: with pipefail the
+            # early exit of get-tar-commit-id would fail a pipe on SIGPIPE.
+            gzip -dc "$RUNNER_TEMP/src.tar.gz" > "$RUNNER_TEMP/src.tar"
+            commit="$(git get-tar-commit-id < "$RUNNER_TEMP/src.tar")"
+            echo "archive of $tag is commit $commit; run commit $GITHUB_SHA"
+            test "$commit" = "$GITHUB_SHA"
+          fi
           sha="$(shasum -a 256 "$RUNNER_TEMP/src.tar.gz" | cut -d' ' -f1)"
           # release.py hashes the same archive itself and compares.
           echo "$sha" > "$RUNNER_TEMP/source.sha256"
@@ -195,11 +195,14 @@ jobs:
           ls -l
           echo "BOTTLE_DIR=$PWD" >> "$GITHUB_ENV"
       # A signed statement that this workflow, at this ref and commit, built
-      # these bytes. release.py checks it with `gh attestation verify` before it
-      # writes the tarball's sha256 into the tap.
+      # these bytes. release.py checks it with `gh attestation verify` for the
+      # tarball and for the JSON (Homebrew writes the JSON's strings into the
+      # tap formula's Ruby) before it writes anything into the tap.
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: ${{ env.BOTTLE_DIR }}/*.bottle.tar.gz
+          subject-path: |
+            ${{ env.BOTTLE_DIR }}/*.bottle.tar.gz
+            ${{ env.BOTTLE_DIR }}/*.bottle.json
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sudo-secretspec-bottle

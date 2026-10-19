@@ -36,6 +36,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -52,7 +53,8 @@ DEFAULT_TAP = Path.home() / "src" / "homebrew-sudo-secretspec"
 # FORK_REPO. Moving the fork to another org then means editing one constant --
 # the 2026-08-15 djbclark -> frdminc move had to touch three.
 TAP_NAME = FORK_REPO
-FORMULA_NAME = f"{TAP_NAME}/sudo-secretspec"
+BOTTLE_FORMULA_BASENAME = "sudo-secretspec"
+FORMULA_NAME = f"{TAP_NAME}/{BOTTLE_FORMULA_BASENAME}"
 # The downstream serial's prefix. Releases through 0.19.1-djbclark.3 used
 # "djbclark"; everything from 0.19.1-sudo.4 on uses "sudo".
 DOWNSTREAM_SUFFIX = "sudo"
@@ -93,6 +95,27 @@ BOTTLE_ARTIFACT = "sudo-secretspec-bottle"
 # so it can be compared with the archive hashed here for the formula.
 SOURCE_SHA_FILE = "source.sha256"
 TAP_FORMULA_REL = Path("Formula/sudo-secretspec.rb")
+# What `brew bottle --json` writes for this tap's formula (the throwaway tap
+# `brew tap-new` makes in the bottle job has the same name as the real one).
+# `brew bottle --merge --write` opens that path under Homebrew's repository, so
+# anything else in the JSON is refused.
+_TAP_OWNER, _TAP_REPO = TAP_NAME.split("/")
+BOTTLE_FORMULA_PATH = (
+    f"Library/Taps/{_TAP_OWNER}/homebrew-{_TAP_REPO}/{TAP_FORMULA_REL}"
+)
+# The JSON's strings reach Ruby source in the tap formula (Homebrew writes the
+# cellar and the tag between quotes without escaping), so each is held to the
+# few values a real bottle has.
+BOTTLE_TAG_RE = re.compile(r"(arm64_|x86_64_)?[a-z0-9_]+")
+BOTTLE_CELLARS = (
+    "any",
+    "any_skip_relocation",
+    "/opt/homebrew/Cellar",
+    "/usr/local/Cellar",
+)
+# Homebrew omits `cellar:` for these two, and writes the relocatable ones as symbols.
+BOTTLE_DEFAULT_CELLARS = ("/opt/homebrew/Cellar", "/usr/local/Cellar")
+SHA256_RE = re.compile(r"[0-9a-f]{64}")
 # Install the tap formula, never Homebrew's API copy of a formula.
 BREW_ENV = {"HOMEBREW_NO_INSTALL_FROM_API": "1"}
 # The one place that names the escape hatch; every bottle failure repeats it.
@@ -573,20 +596,32 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def bottle_specs(release: Release, path: Path) -> list[dict[str, str]]:
-    """The bottle entries of one ``brew bottle --json`` file, checked.
+def bottle_entry(release: Release, path: Path) -> dict[str, Any]:
+    """The one formula entry of a ``brew bottle --json`` file, checked.
 
-    The file must hold exactly one formula, ours, at this release's version,
-    pointing at this release's download URL, and name every tarball by a bare
-    file name (``dest / "../x"`` would otherwise pass an ``is_file`` check).
+    The file must hold exactly one formula, ours, at this release's version and
+    at the path ``brew bottle --merge`` opens, pointing at this release's
+    download URL, with a tag, cellar, rebuild and sha256 of the shapes a real
+    bottle has, and name every tarball by a bare file name (``dest / "../x"``
+    would otherwise pass an ``is_file`` check). Homebrew pastes several of these
+    strings into the tap's Ruby source unescaped.
     """
     document = json.loads(path.read_text(encoding="utf-8"))
     _require(
-        list(document) == [FORMULA_NAME],
+        isinstance(document, dict) and list(document) == [FORMULA_NAME],
         f"{path.name}: must hold exactly one entry, named {FORMULA_NAME}",
     )
     entry = document[FORMULA_NAME]
-    pkg_version = entry["formula"]["pkg_version"]
+    formula = entry["formula"]
+    _require(
+        formula["name"] == BOTTLE_FORMULA_BASENAME,
+        f"{path.name}: formula is {formula['name']!r}, not {BOTTLE_FORMULA_BASENAME}",
+    )
+    _require(
+        formula["path"] == BOTTLE_FORMULA_PATH,
+        f"{path.name}: formula path {formula['path']!r} is not {BOTTLE_FORMULA_PATH}",
+    )
+    pkg_version = formula["pkg_version"]
     _require(
         pkg_version == release.version,
         f"{path.name}: bottle is for {pkg_version}, not {release.version}",
@@ -594,35 +629,114 @@ def bottle_specs(release: Release, path: Path) -> list[dict[str, str]]:
     bottle = entry["bottle"]
     root_url = f"https://github.com/{FORK_REPO}/releases/download/{release.tag}"
     _require(bottle["root_url"] == root_url, f"{path.name}: wrong root_url")
-    _require(bool(bottle["tags"]), f"{path.name}: lists no bottle tags")
-    specs = list(bottle["tags"].values())
-    for spec in specs:
+    _require(
+        bottle["cellar"] in BOTTLE_CELLARS,
+        f"{path.name}: unexpected cellar {bottle['cellar']!r}",
+    )
+    rebuild = bottle["rebuild"]
+    _require(
+        type(rebuild) is int and rebuild >= 0,
+        f"{path.name}: rebuild {rebuild!r} is not a non-negative integer",
+    )
+    tags = bottle["tags"]
+    _require(
+        isinstance(tags, dict) and bool(tags), f"{path.name}: lists no bottle tags"
+    )
+    for tag, spec in tags.items():
+        _require(
+            isinstance(tag, str) and BOTTLE_TAG_RE.fullmatch(tag) is not None,
+            f"{path.name}: unexpected bottle tag {tag!r}",
+        )
+        sha = spec["sha256"]
+        _require(
+            isinstance(sha, str) and SHA256_RE.fullmatch(sha) is not None,
+            f"{path.name}: {tag} sha256 {sha!r} is not 64 lowercase hex digits",
+        )
         name = spec["filename"]
         _require(
-            bool(name) and name not in (".", "..") and not {"/", "\\"} & set(name),
+            isinstance(name, str)
+            and bool(name)
+            and name not in (".", "..")
+            and not {"/", "\\"} & set(name),
             f"{path.name}: unsafe bottle file name {name!r}",
         )
-    return specs
+    return entry
 
 
-def verify_attestation(tarball: Path, *, source_ref: str, source_digest: str) -> None:
-    """Check the signed build provenance of a bottle tarball.
+def bottle_specs(release: Release, path: Path) -> list[dict[str, Any]]:
+    """The checked bottle entries (one per tag) of one ``brew bottle --json`` file."""
+    return list(bottle_entry(release, path)["bottle"]["tags"].values())
+
+
+def bottle_block_lines(release: Release, jsons: list[Path]) -> list[str]:
+    """The ``bottle do`` block Homebrew writes for these JSON files, from the
+    validated fields only, one whitespace-normalised line each (sha256 lines
+    sorted, since the order and column padding are Homebrew's business).
+    """
+    rows: dict[str, str] = {}
+    rebuilds: set[int] = set()
+    for path in jsons:
+        bottle = bottle_entry(release, path)["bottle"]
+        rebuilds.add(bottle["rebuild"])
+        cellar = bottle["cellar"]
+        if cellar in BOTTLE_DEFAULT_CELLARS:
+            prefix = ""
+        elif cellar.startswith("/"):
+            prefix = f'cellar: "{cellar}", '
+        else:
+            prefix = f"cellar: :{cellar}, "
+        for tag, spec in bottle["tags"].items():
+            _require(tag not in rows, f"bottle tag {tag} appears in two JSON files")
+            rows[tag] = f'sha256 {prefix}{tag}: "{spec["sha256"]}"'
+    _require(
+        len(rebuilds) == 1, f"the bottle JSON files disagree on rebuild: {rebuilds}"
+    )
+    (rebuild,) = rebuilds
+    lines = [
+        "bottle do",
+        f'root_url "https://github.com/{FORK_REPO}/releases/download/{release.tag}"',
+    ]
+    if rebuild:
+        lines.append(f"rebuild {rebuild}")
+    return [*lines, *sorted(rows.values()), "end"]
+
+
+def written_bottle_block(formula: str) -> list[str]:
+    """The formula's single ``bottle do`` block, normalised like the expected one."""
+    blocks = re.findall(
+        r"^  bottle do\n(.*?)^  end$", formula, re.MULTILINE | re.DOTALL
+    )
+    _require(len(blocks) == 1, f"the merged formula has {len(blocks)} bottle blocks")
+    body = [" ".join(line.split()) for line in blocks[0].splitlines() if line.strip()]
+    shas = sorted(line for line in body if line.startswith("sha256 "))
+    return ["bottle do", *(line for line in body if line not in shas), *shas, "end"]
+
+
+def verify_attestation(artifact: Path, *, source_ref: str, source_digest: str) -> None:
+    """Check the signed build provenance of a bottle tarball or its JSON.
 
     ``gh attestation verify`` exits non-zero unless the Sigstore bundle GitHub
-    holds for the tarball's digest was signed by ``sudo-release.yml`` of this
-    repository, on a GitHub-hosted runner, at the given ref and commit. The
-    exit status decides; the output is only quoted in the refusal.
+    holds for the file's digest was signed by exactly ``sudo-release.yml`` of
+    this repository at the given ref (``--cert-identity`` is an exact match of
+    the certificate's workflow identity on every gh version, unlike
+    ``--signer-workflow``'s prefix match before gh 2.102), on a GitHub-hosted
+    runner, at the given commit. The exit status decides; the output is only
+    quoted in the refusal.
     """
+    identity = (
+        f"https://github.com/{FORK_REPO}/.github/workflows/{BOTTLE_WORKFLOW}"
+        f"@{source_ref}"
+    )
     try:
         run(
-            ["gh", "attestation", "verify", str(tarball), "--repo", FORK_REPO]
-            + ["--signer-workflow", f"{FORK_REPO}/.github/workflows/{BOTTLE_WORKFLOW}"]
+            ["gh", "attestation", "verify", str(artifact), "--repo", FORK_REPO]
+            + ["--cert-identity", identity]
             + ["--source-ref", source_ref, "--source-digest", source_digest]
             + ["--deny-self-hosted-runners"]
         )
     except subprocess.CalledProcessError as error:
         raise ReleaseError(
-            f"build provenance check failed for {tarball.name}: it is not "
+            f"build provenance check failed for {artifact.name}: it is not "
             f"attested as built by {BOTTLE_WORKFLOW} at {source_ref} "
             f"({source_digest})\n{describe(error)}"
         ) from error
@@ -632,9 +746,10 @@ def fetch_bottle(release: Release, dest: Path, *, dry_run: bool) -> list[Path]:
     """Wait for the tag's bottle job and download its JSON into `dest`.
 
     The run is the ``sudo-release.yml`` push run for the tag commit itself,
-    found by head SHA like ``ci_gate`` finds its own. Every tarball must hash to
-    the sha256 its JSON records (the tap block is written from that JSON) and
-    carry a signed build provenance from this workflow at the tag commit, and
+    found by head SHA like ``ci_gate`` finds its own. Every JSON and every
+    tarball must carry a signed build provenance from this workflow at the tag
+    commit, and every tarball must hash to the sha256 its JSON records (the tap
+    block is written from that JSON), and
     the source archive the runner compiled must be the one hashed here. Anything
     missing, mismatched or red is an error that names ``--build-from-source``;
     the caller never compiles on its own.
@@ -656,7 +771,11 @@ def fetch_bottle(release: Release, dest: Path, *, dry_run: bool) -> list[Path]:
         )
         jsons = sorted(dest.glob("*.bottle.json"))
         _require(bool(jsons), f"artifact {BOTTLE_ARTIFACT} holds no bottle JSON")
+        ref = f"refs/tags/{release.tag}"
         for path in jsons:
+            # The JSON is parsed by Homebrew into the tap formula's Ruby, so it
+            # needs the provenance the tarball has, and before it is trusted.
+            verify_attestation(path, source_ref=ref, source_digest=sha)
             for spec in bottle_specs(release, path):
                 tarball = dest / spec["filename"]
                 _require(
@@ -668,9 +787,7 @@ def fetch_bottle(release: Release, dest: Path, *, dry_run: bool) -> list[Path]:
                     f"{path.name}: {spec['filename']} does not hash to the sha256 "
                     "its JSON records",
                 )
-                verify_attestation(
-                    tarball, source_ref=f"refs/tags/{release.tag}", source_digest=sha
-                )
+                verify_attestation(tarball, source_ref=ref, source_digest=sha)
         source = dest / SOURCE_SHA_FILE
         _require(
             source.is_file(), f"artifact {BOTTLE_ARTIFACT} lacks {SOURCE_SHA_FILE}"
@@ -766,13 +883,25 @@ def merge_bottle(
         run(["git", "push", "origin", "HEAD"], cwd=tap_path, dry_run=True)
         return
     merged = checkout_formula.read_text(encoding="utf-8")
-    _require(
-        "bottle do" in merged
-        and f"releases/download/{release.tag}" in merged
-        and release.tag in merged,
-        f"brew bottle --merge wrote no bottle block for {release.tag}\n"
-        + BOTTLE_FALLBACK_HINT,
-    )
+    try:
+        _require(
+            "bottle do" in merged
+            and f"releases/download/{release.tag}" in merged
+            and release.tag in merged,
+            f"brew bottle --merge wrote no bottle block for {release.tag}\n"
+            + BOTTLE_FALLBACK_HINT,
+        )
+        # Homebrew pastes the JSON's strings into Ruby source; nothing but the
+        # block the validated fields make may reach a commit.
+        _require(
+            written_bottle_block(merged) == bottle_block_lines(release, jsons),
+            "the bottle block brew bottle --merge wrote differs from the one the "
+            "validated JSON fields make; nothing was committed or pushed\n"
+            + BOTTLE_FALLBACK_HINT,
+        )
+    except ReleaseError:
+        run(["git", "checkout", "--", str(TAP_FORMULA_REL)], cwd=tap)
+        raise
     shutil.copy2(checkout_formula, tap_path / TAP_FORMULA_REL)
     run(["git", "checkout", "--", str(TAP_FORMULA_REL)], cwd=tap)
     run(["git", "add", str(TAP_FORMULA_REL)], cwd=tap_path)

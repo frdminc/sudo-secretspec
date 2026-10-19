@@ -58,10 +58,11 @@ scripts:
 
 1. `bottle` (read-only token, no `GH_TOKEN`) runs for a release tag push or a
    `workflow_dispatch`. It checks the tag against `^v0\.19\.1-sudo\.[1-9][0-9]*$`
-   (and, on a tag push, against the commit the run was triggered for), stamps
+   (and, on a tag push, against the commit embedded in the source archive it
+   downloads, `git get-tar-commit-id`), stamps
    the release formula into a throwaway tap, runs `brew install --build-bottle`
    and `brew bottle --json --root-url=<the tag's release download URL>`, and
-   signs a build-provenance attestation for the tarball
+   signs a build-provenance attestation for the tarball and the JSON
    (`actions/attest-build-provenance`; the job's only extra permissions are
    `id-token: write` and `attestations: write`, neither of which writes to the
    repository), and uploads the tarball, its JSON and the source archive's
@@ -75,15 +76,20 @@ scripts:
 artifact; the release is touched only by the push of a release tag.
 
 After the tag push `release.py` finds the push run by head SHA (exactly one must
-match), watches it, downloads the artifact and checks it: every tarball must hash
-to the sha256 in its JSON and pass `gh attestation verify` (`--repo`,
-`--signer-workflow` `sudo-release.yml`, `--source-ref refs/tags/<tag>`,
-`--source-digest` the tag's commit, `--deny-self-hosted-runners`), the JSON must hold one entry named
-`frdminc/sudo-secretspec/sudo-secretspec` at the release version with a bare
-file name, and the CI source sha256 must equal the archive `release.py` hashes
+match), watches it, downloads the artifact and checks it: every JSON and every
+tarball must pass `gh attestation verify` (`--repo`, `--cert-identity`
+`https://github.com/frdminc/sudo-secretspec/.github/workflows/sudo-release.yml@refs/tags/<tag>`,
+`--source-ref refs/tags/<tag>`, `--source-digest` the tag's commit,
+`--deny-self-hosted-runners`) before the JSON is read; every tarball must hash
+to the sha256 in its JSON; the JSON must hold one entry named
+`frdminc/sudo-secretspec/sudo-secretspec` at the release version with the tap's
+formula path, a known tag, cellar and rebuild, a 64-digit sha256 and a bare file
+name; and the CI source sha256 must equal the archive `release.py` hashes
 for the formula. Before the tap is pushed it downloads each asset from the
 GitHub Release and compares its sha256 too. Then it runs
-`brew bottle --merge --write` into the tap formula, pushes the tap and reinstalls
+`brew bottle --merge --write` into the tap formula, refuses to commit unless
+the `bottle do` block it wrote equals the one the validated fields make,
+pushes the tap and reinstalls
 with `--force-bottle`. A missing, red or mismatched bottle is an error, never a
 quiet local compile: `--build-from-source`
 (`just release VERSION --build-from-source`) is the explicit fallback and runs

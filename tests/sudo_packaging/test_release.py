@@ -807,12 +807,22 @@ def bottle_json(release, cut, *, root_url=None, sha=BOTTLE_SHA, **overrides):
         "filename", f"sudo-secretspec-{cut.version}.arm64_tahoe.bottle.tar.gz"
     )
     name = overrides.pop("name", release.FORMULA_NAME)
+    tag = overrides.pop("tag", "arm64_tahoe")
     entry = {
-        "formula": {"pkg_version": overrides.pop("pkg_version", cut.version)},
+        "formula": {
+            "name": overrides.pop("formula_name", "sudo-secretspec"),
+            "path": overrides.pop(
+                "path",
+                "Library/Taps/frdminc/homebrew-sudo-secretspec/Formula/sudo-secretspec.rb",
+            ),
+            "pkg_version": overrides.pop("pkg_version", cut.version),
+        },
         "bottle": {
             "root_url": root_url
             or f"https://github.com/{release.FORK_REPO}/releases/download/{cut.tag}",
-            "tags": {"arm64_tahoe": {"filename": filename, "sha256": sha}},
+            "cellar": overrides.pop("cellar", "any"),
+            "rebuild": overrides.pop("rebuild", 0),
+            "tags": {tag: {"filename": filename, "sha256": sha}},
         },
     }
     assert not overrides, overrides
@@ -831,6 +841,7 @@ def fake_bottle_run(
     source=SOURCE_SHA,
     asset=BOTTLE_BYTES,
     attest_rc=0,
+    attest_fail_suffix="",
 ):
     """Script the tag lookup, `gh run list/watch/download` for the bottle job."""
     calls = []
@@ -861,7 +872,11 @@ def fake_bottle_run(
         if argv[:3] == ["gh", "release", "download"]:
             dest = Path(argv[argv.index("-D") + 1])
             (dest / argv[argv.index("--pattern") + 1]).write_bytes(asset)
-        if argv[:3] == ["gh", "attestation", "verify"] and attest_rc:
+        if (
+            argv[:3] == ["gh", "attestation", "verify"]
+            and attest_rc
+            and argv[3].endswith(attest_fail_suffix)
+        ):
             raise subprocess.CalledProcessError(
                 attest_rc, argv, output="", stderr="no attestations found"
             )
@@ -908,7 +923,7 @@ def test_fetch_bottle_finds_the_tag_run_by_head_sha_and_downloads_its_json(
     assert download[download.index("-n") + 1] == "sudo-secretspec-bottle"
 
 
-def test_fetch_bottle_verifies_the_tarball_attestation_against_the_tag(
+def test_fetch_bottle_verifies_the_json_and_tarball_attestations_against_the_tag(
     monkeypatch, release, cut, tmp_path
 ):
     calls = fake_bottle_run(
@@ -917,28 +932,74 @@ def test_fetch_bottle_verifies_the_tarball_attestation_against_the_tag(
     release.fetch_bottle(cut, tmp_path, dry_run=False)
     verifies = [argv for argv in calls if argv[:3] == ["gh", "attestation", "verify"]]
     tarball = tmp_path / f"sudo-secretspec-{cut.version}.arm64_tahoe.bottle.tar.gz"
-    assert verifies == [
-        [
+    json_file = tmp_path / f"sudo-secretspec--{cut.version}.bottle.json"
+
+    def expected(path):
+        return [
             "gh",
             "attestation",
             "verify",
-            str(tarball),
+            str(path),
             "--repo",
             "frdminc/sudo-secretspec",
-            "--signer-workflow",
-            "frdminc/sudo-secretspec/.github/workflows/sudo-release.yml",
+            "--cert-identity",
+            (
+                "https://github.com/frdminc/sudo-secretspec/.github/workflows/"
+                f"sudo-release.yml@refs/tags/{cut.tag}"
+            ),
             "--source-ref",
             f"refs/tags/{cut.tag}",
             "--source-digest",
             TAG_SHA,
             "--deny-self-hosted-runners",
         ]
-    ]
-    # Verified after the cheap sha check, before the source-archive comparison.
+
+    # The JSON first: it is verified before it is parsed.
+    assert verifies == [expected(json_file), expected(tarball)]
+    assert not any("--signer-workflow" in argv for argv in verifies)
+    # Verified after the download, before the source-archive comparison.
     names = [argv[:3] for argv in calls]
     assert names.index(["gh", "run", "download"]) < names.index(
         ["gh", "attestation", "verify"]
     )
+
+
+@pytest.mark.parametrize("suffix", [".bottle.json", ".bottle.tar.gz"])
+def test_fetch_bottle_refuses_a_file_without_a_valid_attestation(
+    monkeypatch, release, cut, tmp_path, suffix
+):
+    fake_bottle_run(
+        monkeypatch,
+        release,
+        cut,
+        runs=[{"databaseId": 8, "headSha": TAG_SHA}],
+        attest_rc=1,
+        attest_fail_suffix=suffix,
+    )
+    with pytest.raises(
+        release.ReleaseError, match="build provenance check failed"
+    ) as r:
+        release.fetch_bottle(cut, tmp_path, dry_run=False)
+    assert suffix in str(r.value)
+
+
+def test_fetch_bottle_does_not_parse_a_json_that_failed_its_attestation(
+    monkeypatch, release, cut, tmp_path
+):
+    # An unattested JSON that is also malformed must fail on the attestation, not
+    # on parsing: nothing reads its content before the signature is checked.
+    calls = fake_bottle_run(
+        monkeypatch,
+        release,
+        cut,
+        runs=[{"databaseId": 8, "headSha": TAG_SHA}],
+        doc=bottle_json(release, cut, cellar='x", system("id"), "'),
+        attest_rc=1,
+        attest_fail_suffix=".bottle.json",
+    )
+    with pytest.raises(release.ReleaseError, match="build provenance check failed"):
+        release.fetch_bottle(cut, tmp_path, dry_run=False)
+    assert len([a for a in calls if a[:3] == ["gh", "attestation", "verify"]]) == 1
 
 
 def test_fetch_bottle_refuses_a_tarball_without_a_valid_attestation(
@@ -973,7 +1034,8 @@ def test_fetch_bottle_does_not_attest_a_tarball_that_failed_its_sha_check(
     )
     with pytest.raises(release.ReleaseError):
         release.fetch_bottle(cut, tmp_path, dry_run=False)
-    assert not [argv for argv in calls if argv[:3] == ["gh", "attestation", "verify"]]
+    verified = [a[3] for a in calls if a[:3] == ["gh", "attestation", "verify"]]
+    assert [Path(path).suffix for path in verified] == [".json"]
 
 
 def test_fetch_bottle_names_the_fallback_when_the_run_is_red(
@@ -1072,6 +1134,22 @@ def test_fetch_bottle_refuses_a_tarball_that_does_not_match_its_json(
         ({"filename": "sub/dir.bottle.tar.gz"}, "unsafe bottle file name"),
         ({"filename": "back\\slash.bottle.tar.gz"}, "unsafe bottle file name"),
         ({"filename": ".."}, "unsafe bottle file name"),
+        ({"formula_name": "other"}, "formula is 'other'"),
+        ({"path": "Library/Taps/x/y/Formula/z.rb"}, "formula path"),
+        ({"path": "../../etc/passwd"}, "formula path"),
+        ({"cellar": 'x", system("id"), "'}, "unexpected cellar"),
+        ({"cellar": "/tmp/Cellar"}, "unexpected cellar"),
+        ({"cellar": None}, "unexpected cellar"),
+        ({"rebuild": -1}, "rebuild -1"),
+        ({"rebuild": True}, "rebuild True"),
+        ({"rebuild": "1"}, "rebuild '1'"),
+        ({"rebuild": 1.0}, "rebuild 1.0"),
+        ({"tag": 'arm64_tahoe": "x", system("id"), "y'}, "unexpected bottle tag"),
+        ({"tag": "ARM64"}, "unexpected bottle tag"),
+        ({"tag": "arm64_tahoe\n"}, "unexpected bottle tag"),
+        ({"sha": "A" * 64}, "64 lowercase hex"),
+        ({"sha": "a" * 63}, "64 lowercase hex"),
+        ({"sha": "a" * 64 + "\n"}, "64 lowercase hex"),
     ],
 )
 def test_fetch_bottle_refuses_a_json_describing_something_else(
@@ -1178,6 +1256,118 @@ def test_merge_bottle_pushes_nothing_when_the_release_asset_differs(
     assert not any(a[:2] in (["git", "push"], ["brew", "bottle"]) for a in calls)
 
 
+def merged_block(release, cut, *, cellar="cellar: :any, ", extra="", sha=BOTTLE_SHA):
+    """The `bottle do` block `brew bottle --merge --write` writes for bottle_json."""
+    return (
+        "  bottle do\n"
+        f'    root_url "https://github.com/{release.FORK_REPO}/releases/download/{cut.tag}"\n'
+        f'{extra}    sha256 {cellar}arm64_tahoe: "{sha}"\n'
+        "  end\n"
+    )
+
+
+def merge_with_written_block(monkeypatch, release, cut, tmp_path, written):
+    """Run merge_bottle with `brew bottle --merge` writing `written`; return calls."""
+    checkout = tmp_path / "brew-tap"
+    clone = tmp_path / "clone"
+    for tap in (checkout, clone):
+        (tap / "Formula").mkdir(parents=True)
+        (tap / "Formula/sudo-secretspec.rb").write_text(f'url "{cut.tag}"\n')
+    jsons = [write_bottle_json(release, cut, tmp_path)]
+    calls = []
+
+    def fake_run(argv, *, cwd=None, env=None, **kwargs):
+        calls.append((argv, cwd))
+        if argv[:3] == ["gh", "release", "download"]:
+            asset = Path(argv[argv.index("-D") + 1]) / argv[argv.index("--pattern") + 1]
+            asset.write_bytes(BOTTLE_BYTES)
+        if argv[:2] == ["brew", "--repository"]:
+            return completed(argv, f"{checkout}\n")
+        if argv[:3] == ["brew", "bottle", "--merge"]:
+            (checkout / "Formula/sudo-secretspec.rb").write_text(
+                f'url "{cut.tag}"\n' + written
+            )
+        return completed(argv)
+
+    monkeypatch.setattr(release, "run", fake_run)
+    try:
+        release.merge_bottle(cut, clone, jsons, dry_run=False)
+    except release.ReleaseError as error:
+        return calls, error, checkout
+    return calls, None, checkout
+
+
+def test_merge_bottle_accepts_homebrews_column_padding_and_default_cellars(
+    monkeypatch, release, cut, tmp_path
+):
+    # Homebrew omits `cellar:` for its default cellars and pads the columns.
+    path = tmp_path / "x"
+    path.mkdir()
+    doc = bottle_json(release, cut, cellar="/opt/homebrew/Cellar", rebuild=2)
+    (path / "j.json").write_text(json.dumps(doc), encoding="utf-8")
+    lines = release.bottle_block_lines(cut, [path / "j.json"])
+    assert lines[2:4] == ["rebuild 2", f'sha256 arm64_tahoe: "{BOTTLE_SHA}"']
+    written = (
+        f'  bottle do\n    root_url "https://github.com/frdminc/sudo-secretspec/'
+        f'releases/download/{cut.tag}"\n    rebuild 2\n'
+        f'    sha256 arm64_tahoe:   "{BOTTLE_SHA}"\n  end\n'
+    )
+    assert release.written_bottle_block(written) == lines
+
+
+@pytest.mark.parametrize(
+    "written",
+    [
+        # The N1 payload: Ruby smuggled through the cellar string.
+        'cellar: "x\\", system(\\"id\\"), \\"", ',
+        # A different cellar than the validated JSON names.
+        "cellar: :any_skip_relocation, ",
+        "",
+    ],
+)
+def test_merge_bottle_commits_nothing_when_the_written_block_differs(
+    monkeypatch, release, cut, tmp_path, written
+):
+    calls, error, checkout = merge_with_written_block(
+        monkeypatch, release, cut, tmp_path, merged_block(release, cut, cellar=written)
+    )
+    assert error is not None and "differs from the one the validated" in str(error)
+    argvs = [argv for argv, _cwd in calls]
+    assert not any(
+        a[:2] in (["git", "add"], ["git", "commit"], ["git", "push"]) for a in argvs
+    )
+    assert not any(a[:3] == ["git", "push", "origin"] for a in argvs)
+    # Homebrew's checkout is put back even though the merge was refused.
+    assert (["git", "checkout", "--", "Formula/sudo-secretspec.rb"], checkout) in calls
+    assert (
+        not (tmp_path / "clone" / "Formula/sudo-secretspec.rb")
+        .read_text()
+        .count("bottle do")
+    )
+
+
+@pytest.mark.parametrize(
+    "block",
+    [
+        # An extra statement inside the block.
+        lambda r, c: merged_block(r, c, extra='    system "id"\n'),
+        # A second bottle block.
+        lambda r, c: merged_block(r, c) + merged_block(r, c),
+        # A different digest than the one the JSON, and so the tarball, has.
+        lambda r, c: merged_block(r, c, sha="b" * 64),
+    ],
+)
+def test_merge_bottle_refuses_an_altered_block_shape(
+    monkeypatch, release, cut, tmp_path, block
+):
+    calls, error, _checkout = merge_with_written_block(
+        monkeypatch, release, cut, tmp_path, block(release, cut)
+    )
+    assert error is not None
+    assert not any(argv[:2] == ["git", "push"] for argv, _cwd in calls)
+    assert not any(argv[:2] == ["git", "commit"] for argv, _cwd in calls)
+
+
 def test_merge_bottle_writes_the_block_and_pushes_the_tap_clone(
     monkeypatch, release, cut, tmp_path
 ):
@@ -1199,8 +1389,7 @@ def test_merge_bottle_writes_the_block_and_pushes_the_tap_clone(
         if argv[:3] == ["brew", "bottle", "--merge"]:
             assert env == release.BREW_ENV
             (checkout / "Formula/sudo-secretspec.rb").write_text(
-                f'url "{cut.tag}"\nbottle do\n  root_url '
-                f'"https://github.com/x/releases/download/{cut.tag}"\nend\n'
+                f'url "{cut.tag}"\n' + merged_block(release, cut)
             )
         return completed(argv)
 
