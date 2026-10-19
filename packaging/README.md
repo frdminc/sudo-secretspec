@@ -51,17 +51,36 @@ never deletes a pushed tag.
 ## macOS bottle
 
 `brew reinstall` pours a bottle built on GitHub's macOS runner rather than
-compiling the crate graph on the maintainer's Mac. The `bottle` job in
-`.github/workflows/sudo-release.yml` runs on every release tag push: it stamps
-the release formula into a throwaway tap, runs `brew install --build-bottle` and
-`brew bottle --json --root-url=<the tag's release download URL>`, attaches the
-tarball and JSON to that tag's GitHub Release, and also uploads them as the
-`sudo-secretspec-bottle` artifact. `workflow_dispatch` (optional `tag` input)
-runs the same job and uploads only the artifact, so it can be proven without
-publishing. After the tag push `release.py` finds that run by head SHA, watches
-it, downloads the artifact, runs `brew bottle --merge --write` into the tap
-formula, pushes the tap and reinstalls with `--force-bottle`. A missing or red
-bottle run is an error, never a quiet local compile: `--build-from-source`
+compiling the crate graph on the maintainer's Mac. Two jobs in
+`.github/workflows/sudo-release.yml` do it, split so that the token that can
+write to the repository never shares a runner with the crate graph's build
+scripts:
+
+1. `bottle` (read-only token, no `GH_TOKEN`) runs for a release tag push or a
+   `workflow_dispatch`. It checks the tag against `^v0\.19\.1-sudo\.[1-9][0-9]*$`
+   (and, on a tag push, against the commit the run was triggered for), stamps
+   the release formula into a throwaway tap, runs `brew install --build-bottle`
+   and `brew bottle --json --root-url=<the tag's release download URL>`, and
+   uploads the tarball, its JSON and the source archive's sha256 as the
+   `sudo-secretspec-bottle` artifact. It publishes nothing.
+2. `publish-bottle` (`contents: write`, no cargo, no brew) runs only for the
+   push of a release tag, after `packaging` and `bottle` are green. It downloads
+   that artifact and attaches the tarball and JSON to the tag's GitHub Release.
+   An asset that already exists is a hard failure (no `--clobber`).
+
+`workflow_dispatch` (optional `tag` input), even on a tag ref, only uploads the
+artifact; the release is touched only by the push of a release tag.
+
+After the tag push `release.py` finds the push run by head SHA (exactly one must
+match), watches it, downloads the artifact and checks it: every tarball must hash
+to the sha256 in its JSON, the JSON must hold one entry named
+`frdminc/sudo-secretspec/sudo-secretspec` at the release version with a bare
+file name, and the CI source sha256 must equal the archive `release.py` hashes
+for the formula. Before the tap is pushed it downloads each asset from the
+GitHub Release and compares its sha256 too. Then it runs
+`brew bottle --merge --write` into the tap formula, pushes the tap and reinstalls
+with `--force-bottle`. A missing, red or mismatched bottle is an error, never a
+quiet local compile: `--build-from-source`
 (`just release VERSION --build-from-source`) is the explicit fallback and runs
 `brew reinstall --build-from-source` through `bg`. Homebrew pours a bottle built
 on an older macOS of the same architecture, so the runner's bottle installs on

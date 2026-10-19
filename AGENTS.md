@@ -275,8 +275,9 @@ Needs `origin/ci/base` fetched. `.forgejo/` is the retired Hyades flow; `load-wa
 The run has a macOS job too (the companion crate, `tests/sudo_packaging`, the formula), and
 `packaging/release.py` gates a release on that run for HEAD (`--local-tests` to run it here).
 
-macOS bottle (2026-10-18): `sudo-release.yml`'s `bottle` job builds the Homebrew bottle on a GitHub macOS runner on every
-release tag (or `gh workflow run sudo-release.yml --ref BRANCH` to prove it without publishing: it then only uploads
-an artifact). `packaging/release.py` waits for that run, merges the `bottle do` block into the tap and pours it; it
-never compiles here unless asked: `--build-from-source` (through `bg`, from `$HOME`; bg inside bg cannot wait on its
-parent's slot, see `install_from_source`). See `packaging/README.md`.
+macOS bottle (2026-10-18): `sudo-release.yml`'s `bottle` job (read-only token) builds the Homebrew bottle on a GitHub
+macOS runner on every release tag and uploads an artifact; `publish-bottle` (write token, no cargo) attaches it to the
+tag's release, only on a tag push (`gh workflow run sudo-release.yml --ref BRANCH` proves the build without publishing).
+`packaging/release.py` waits for that push run, verifies the hashes, merges the `bottle do` block into the tap and pours
+it; it never compiles here unless asked: `--build-from-source` (through `bg`, from `$HOME`; bg inside bg cannot wait on
+its parent's slot, see `install_from_source`). See `packaging/README.md`.

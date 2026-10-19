@@ -27,7 +27,9 @@ on:
         description: >-
           Existing release tag to build a bottle for, to prove the bottle job
           without publishing. Empty means the tag the checked-out formula names.
-          Nothing is attached to a GitHub release outside a tag push.
+          A dispatch, even on a tag ref, only uploads a workflow artifact: the
+          bottle is attached to a GitHub release only by the push of a release
+          tag.
         required: false
         default: ""
 
@@ -80,21 +82,27 @@ jobs:
           test "$GITHUB_REF_NAME" = "v$version"
 
   # The macOS bottle `packaging/release.py` pours instead of compiling on the
-  # maintainer's Mac (2026-10-18). On a tag push it attaches the bottle and its
-  # JSON to that tag's GitHub release; on workflow_dispatch it only uploads a
-  # workflow artifact, so it can be proven without publishing. release.py finds
-  # this run by headSha, downloads the artifact and merges the `bottle do` block
+  # maintainer's Mac (2026-10-18). Two jobs, split on purpose: `bottle` compiles
+  # the whole crate graph (every build.rs and proc-macro in Cargo.lock runs
+  # there), so it holds a read-only token and never sees GH_TOKEN; it only
+  # uploads a workflow artifact. `publish-bottle` holds the write token but runs
+  # no cargo or brew: it downloads that artifact and attaches it to the tag's
+  # release, and only on the push of a release tag. release.py finds the tag's
+  # run by head SHA, downloads the artifact and merges the `bottle do` block
   # into the tap formula.
   bottle:
     if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
     runs-on: macos-latest
     timeout-minutes: 90
     permissions:
-      # Only to attach the bottle to the tag's release.
-      contents: write
+      contents: read
+    # Two runs for one ref (a re-run, or a dispatch on a tag) queue rather than
+    # race; a newer pending run still replaces an older pending one.
+    concurrency:
+      group: bottle-${{ github.ref }}
+      cancel-in-progress: false
     env:
       TAP: frdminc/sudo-secretspec
-      GH_TOKEN: ${{ github.token }}
       HOMEBREW_NO_AUTO_UPDATE: "1"
       HOMEBREW_NO_ANALYTICS: "1"
     steps:
@@ -118,10 +126,25 @@ jobs:
           else
             tag="v$(sed -n 's/^  version "\(.*\)"/\1/p' packaging/homebrew/sudo-secretspec.rb)"
           fi
+          # Validate before the tag reaches $GITHUB_OUTPUT, a URL or a shell: a
+          # tag name or dispatch input is an attacker-shaped string.
+          [[ "$tag" =~ ^v0\.19\.1-sudo\.[1-9][0-9]*$ ]] || { echo "refusing tag: $tag" >&2; exit 1; }
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            # The source is fetched by tag name below, so pin the tag to the
+            # commit this run was triggered for. An annotated tag lists its
+            # commit on the peeled `^{}` line.
+            remote="$(git ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/tags/$tag" "refs/tags/$tag^{}")"
+            commit="$(printf '%s\n' "$remote" | awk '/\^\{\}$/ {print $1; exit}')"
+            [ -n "$commit" ] || commit="$(printf '%s\n' "$remote" | awk 'NR==1 {print $1}')"
+            echo "tag $tag -> $commit; run commit $GITHUB_SHA"
+            test "$commit" = "$GITHUB_SHA"
+          fi
           url="https://github.com/$GITHUB_REPOSITORY/archive/refs/tags/$tag.tar.gz"
           curl -fsSL --retry 5 --retry-all-errors -o "$RUNNER_TEMP/src.tar.gz" "$url"
           sha="$(shasum -a 256 "$RUNNER_TEMP/src.tar.gz" | cut -d' ' -f1)"
+          # release.py hashes the same archive itself and compares.
+          echo "$sha" > "$RUNNER_TEMP/source.sha256"
           brew tap-new "$TAP"
           formula="$(brew --repository "$TAP")/Formula/sudo-secretspec.rb"
           cp packaging/homebrew/sudo-secretspec.rb "$formula"
@@ -139,6 +162,8 @@ jobs:
           PY
           grep -n 'url "\|version "\|sha256 "' "$formula"
       - name: Build the bottle
+        env:
+          TAG: ${{ steps.formula.outputs.tag }}
         run: |
           set -euo pipefail
           brew install --build-bottle --verbose "$TAP/sudo-secretspec"
@@ -146,7 +171,7 @@ jobs:
           mkdir "$RUNNER_TEMP/bottle"
           cd "$RUNNER_TEMP/bottle"
           brew bottle --json \
-            --root-url="https://github.com/$GITHUB_REPOSITORY/releases/download/${{ steps.formula.outputs.tag }}" \
+            --root-url="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG" \
             "$TAP/sudo-secretspec"
           # brew writes `name--version.tag.bottle.tar.gz` locally and expects the
           # upload to use the single-dash name its JSON records.
@@ -162,6 +187,7 @@ jobs:
                   local.rename(spec["filename"])
                   print(f"{local} -> {spec['filename']}")
           PY
+          cp "$RUNNER_TEMP/source.sha256" .
           ls -l
           echo "BOTTLE_DIR=$PWD" >> "$GITHUB_ENV"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -169,16 +195,41 @@ jobs:
           name: sudo-secretspec-bottle
           path: ${{ env.BOTTLE_DIR }}/*
           if-no-files-found: error
-      # release.py creates the release right after pushing the tag, and this
-      # job takes far longer than that, but wait rather than assume.
+
+  # Write access lives only here, and only for the push of a release tag. This
+  # job runs no cargo and no brew, so nothing from the crate graph shares a
+  # process, a filesystem or an environment with the token. `needs: packaging`
+  # keeps a bottle off a release whose tag/workspace check failed. An existing
+  # asset of the same name is a hard failure (no --clobber): replacing the
+  # bottle after release.py recorded its sha256 in the tap would break every
+  # install of that release.
+  publish-bottle:
+    needs: [packaging, bottle]
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    concurrency:
+      group: publish-bottle-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sudo-secretspec-bottle
+          path: ${{ runner.temp }}/bottle
+      # release.py creates the release right after pushing the tag, and the
+      # bottle job takes far longer than that, but wait rather than assume.
       - name: Attach the bottle to the tag's release
-        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          cd "$BOTTLE_DIR"
+          cd "$RUNNER_TEMP/bottle"
+          ls -l
           for _ in $(seq 1 60); do
             gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 && break
             sleep 10
           done
           gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null
-          gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber ./*
+          gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" ./*.bottle.tar.gz ./*.bottle.json

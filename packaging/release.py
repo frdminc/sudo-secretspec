@@ -89,6 +89,9 @@ CI_RUN_LOOKUP_SECONDS = 5
 # The workflow uploads the bottle and its JSON as this artifact on every run.
 BOTTLE_WORKFLOW = "sudo-release.yml"
 BOTTLE_ARTIFACT = "sudo-secretspec-bottle"
+# The sha256 of the source archive the CI build compiled, shipped in the artifact
+# so it can be compared with the archive hashed here for the formula.
+SOURCE_SHA_FILE = "source.sha256"
 TAP_FORMULA_REL = Path("Formula/sudo-secretspec.rb")
 # Install the tap formula, never Homebrew's API copy of a formula.
 BREW_ENV = {"HOMEBREW_NO_INSTALL_FROM_API": "1"}
@@ -292,17 +295,25 @@ def find_run(branch: str, sha: str, *, workflow: str | None = None) -> int:
     """Return the id of the run on `branch` whose head is exactly `sha`.
 
     Matching the head matters: a force-pushed ``ci/run`` branch keeps its name,
-    so the newest run on it may belong to the previous push.
+    so the newest run on it may belong to the previous push. With a `workflow`
+    the run must also be a push, and exactly one run may match: a
+    ``workflow_dispatch`` on the same tag ref or a second run for the same commit
+    is ambiguous, and picking the newest would watch (and trust) the wrong one.
     """
     argv = ["gh", "run", "list", "-R", FORK_REPO, "--branch", branch]
     if workflow:
-        argv += ["--workflow", workflow]
+        argv += ["--workflow", workflow, "--event", "push"]
     argv += ["--json", "databaseId,headSha"]
     for attempt in range(CI_RUN_LOOKUPS):
         if attempt:
             time.sleep(CI_RUN_LOOKUP_SECONDS)
         runs = json.loads(output(argv) or "[]")
         ids = [r["databaseId"] for r in runs if r.get("headSha") == sha]
+        if workflow and len(ids) > 1:
+            raise ReleaseError(
+                f"{len(ids)} {workflow} push runs match {branch} at {sha[:12]} "
+                f"({', '.join(map(str, ids))}); refusing to guess which one built it"
+            )
         if ids:
             return ids[0]
     raise ReleaseError(f"no GitHub Actions run appeared for {branch}")
@@ -554,12 +565,55 @@ def brew_refresh(release: Release, *, dry_run: bool) -> Path:
     return tap
 
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def bottle_specs(release: Release, path: Path) -> list[dict[str, str]]:
+    """The bottle entries of one ``brew bottle --json`` file, checked.
+
+    The file must hold exactly one formula, ours, at this release's version,
+    pointing at this release's download URL, and name every tarball by a bare
+    file name (``dest / "../x"`` would otherwise pass an ``is_file`` check).
+    """
+    document = json.loads(path.read_text(encoding="utf-8"))
+    _require(
+        list(document) == [FORMULA_NAME],
+        f"{path.name}: must hold exactly one entry, named {FORMULA_NAME}",
+    )
+    entry = document[FORMULA_NAME]
+    pkg_version = entry["formula"]["pkg_version"]
+    _require(
+        pkg_version == release.version,
+        f"{path.name}: bottle is for {pkg_version}, not {release.version}",
+    )
+    bottle = entry["bottle"]
+    root_url = f"https://github.com/{FORK_REPO}/releases/download/{release.tag}"
+    _require(bottle["root_url"] == root_url, f"{path.name}: wrong root_url")
+    _require(bool(bottle["tags"]), f"{path.name}: lists no bottle tags")
+    specs = list(bottle["tags"].values())
+    for spec in specs:
+        name = spec["filename"]
+        _require(
+            bool(name) and name not in (".", "..") and not {"/", "\\"} & set(name),
+            f"{path.name}: unsafe bottle file name {name!r}",
+        )
+    return specs
+
+
 def fetch_bottle(release: Release, dest: Path, *, dry_run: bool) -> list[Path]:
     """Wait for the tag's bottle job and download its JSON into `dest`.
 
-    The run is the ``sudo-release.yml`` run for the tag commit itself, found by
-    head SHA like ``ci_gate`` finds its own. Anything missing or red is an error
-    that names ``--build-from-source``; the caller never compiles on its own.
+    The run is the ``sudo-release.yml`` push run for the tag commit itself,
+    found by head SHA like ``ci_gate`` finds its own. Every tarball must hash to
+    the sha256 its JSON records (the tap block is written from that JSON), and
+    the source archive the runner compiled must be the one hashed here. Anything
+    missing, mismatched or red is an error that names ``--build-from-source``;
+    the caller never compiles on its own.
     """
     if dry_run:
         log(f"[dry-run] wait for {BOTTLE_WORKFLOW} on {release.tag}")
@@ -578,18 +632,36 @@ def fetch_bottle(release: Release, dest: Path, *, dry_run: bool) -> list[Path]:
         )
         jsons = sorted(dest.glob("*.bottle.json"))
         _require(bool(jsons), f"artifact {BOTTLE_ARTIFACT} holds no bottle JSON")
-        root_url = f"https://github.com/{FORK_REPO}/releases/download/{release.tag}"
         for path in jsons:
-            for entry in json.loads(path.read_text(encoding="utf-8")).values():
-                bottle = entry["bottle"]
-                _require(bottle["root_url"] == root_url, f"{path.name}: wrong root_url")
-                _require(bool(bottle["tags"]), f"{path.name}: lists no bottle tags")
-                for spec in bottle["tags"].values():
-                    _require(
-                        (dest / spec["filename"]).is_file(),
-                        f"{path.name}: {spec['filename']} missing from the artifact",
-                    )
-    except (ReleaseError, subprocess.CalledProcessError, KeyError, ValueError) as error:
+            for spec in bottle_specs(release, path):
+                tarball = dest / spec["filename"]
+                _require(
+                    tarball.is_file(),
+                    f"{path.name}: {spec['filename']} missing from the artifact",
+                )
+                _require(
+                    file_sha256(tarball) == spec["sha256"],
+                    f"{path.name}: {spec['filename']} does not hash to the sha256 "
+                    "its JSON records",
+                )
+        source = dest / SOURCE_SHA_FILE
+        _require(
+            source.is_file(), f"artifact {BOTTLE_ARTIFACT} lacks {SOURCE_SHA_FILE}"
+        )
+        _require(
+            source.read_text(encoding="utf-8").strip()
+            == archive_sha256(release, dry_run=False),
+            "the CI build compiled a different source archive than the one the "
+            "formula will pin",
+        )
+    except (
+        ReleaseError,
+        subprocess.CalledProcessError,
+        KeyError,
+        TypeError,
+        ValueError,
+        OSError,
+    ) as error:
         detail = (
             describe(error)
             if isinstance(error, subprocess.CalledProcessError)
@@ -599,6 +671,42 @@ def fetch_bottle(release: Release, dest: Path, *, dry_run: bool) -> list[Path]:
             f"no usable macOS bottle for {release.tag}: {detail}\n{BOTTLE_FALLBACK_HINT}"
         ) from error
     return jsons
+
+
+def verify_release_assets(
+    release: Release, jsons: list[Path], *, dry_run: bool
+) -> None:
+    """Check the bottles published on the GitHub Release against the JSON.
+
+    The tap's ``bottle do`` block records the artifact's sha256, so an asset that
+    differs (replaced, or attached by another run) would fail every install of
+    the release. Catch it before the tap is pushed.
+    """
+    if dry_run:
+        log(f"[dry-run] compare the {release.tag} release assets with the artifact")
+        run(["gh", "release", "download", release.tag, "-R", FORK_REPO], dry_run=True)
+        return
+    with tempfile.TemporaryDirectory(prefix="sudo-secretspec-assets-") as work:
+        for path in jsons:
+            for spec in bottle_specs(release, path):
+                name = spec["filename"]
+                try:
+                    run(
+                        ["gh", "release", "download", release.tag, "-R", FORK_REPO]
+                        + ["--pattern", name, "-D", work]
+                    )
+                except subprocess.CalledProcessError as error:
+                    raise ReleaseError(
+                        f"cannot download release asset {name}: {describe(error)}\n"
+                        + BOTTLE_FALLBACK_HINT
+                    ) from error
+                actual = file_sha256(Path(work) / name)
+                _require(
+                    actual == spec["sha256"],
+                    f"release asset {name} hashes to {actual}, but the CI artifact "
+                    f"recorded {spec['sha256']}; the tap was not touched\n"
+                    + BOTTLE_FALLBACK_HINT,
+                )
 
 
 def merge_bottle(
@@ -611,6 +719,7 @@ def merge_bottle(
     commit, carry the edited file into the clone (the repository that is
     pushed), put the checkout back, and let the next refresh fast-forward it.
     """
+    verify_release_assets(release, jsons, dry_run=dry_run)
     tap = brew_refresh(release, dry_run=dry_run)
     checkout_formula = tap / TAP_FORMULA_REL
     run(

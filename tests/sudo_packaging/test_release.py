@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import re
@@ -795,23 +796,44 @@ def test_main_gates_on_ci_unless_told_otherwise(
 TAG_SHA = "d" * 40
 
 
-def bottle_json(release, cut, *, root_url=None):
+BOTTLE_BYTES = b"bottle"
+BOTTLE_SHA = hashlib.sha256(BOTTLE_BYTES).hexdigest()
+SOURCE_SHA = "5" * 64
+
+
+def bottle_json(release, cut, *, root_url=None, sha=BOTTLE_SHA, **overrides):
     """What `brew bottle --json` records, trimmed to the keys release.py reads."""
-    filename = f"sudo-secretspec-{cut.version}.arm64_tahoe.bottle.tar.gz"
-    return {
-        "frdminc/sudo-secretspec/sudo-secretspec": {
-            "bottle": {
-                "root_url": root_url
-                or f"https://github.com/{release.FORK_REPO}/releases/download/{cut.tag}",
-                "tags": {"arm64_tahoe": {"filename": filename, "sha256": "e" * 64}},
-            }
-        }
+    filename = overrides.pop(
+        "filename", f"sudo-secretspec-{cut.version}.arm64_tahoe.bottle.tar.gz"
+    )
+    name = overrides.pop("name", release.FORMULA_NAME)
+    entry = {
+        "formula": {"pkg_version": overrides.pop("pkg_version", cut.version)},
+        "bottle": {
+            "root_url": root_url
+            or f"https://github.com/{release.FORK_REPO}/releases/download/{cut.tag}",
+            "tags": {"arm64_tahoe": {"filename": filename, "sha256": sha}},
+        },
     }
+    assert not overrides, overrides
+    return {name: entry}
 
 
-def fake_bottle_run(monkeypatch, release, cut, *, runs, watch_rc=0, doc=None):
+def fake_bottle_run(
+    monkeypatch,
+    release,
+    cut,
+    *,
+    runs,
+    watch_rc=0,
+    doc=None,
+    tarball=BOTTLE_BYTES,
+    source=SOURCE_SHA,
+    asset=BOTTLE_BYTES,
+):
     """Script the tag lookup, `gh run list/watch/download` for the bottle job."""
     calls = []
+    monkeypatch.setattr(release, "archive_sha256", lambda _r, **_k: SOURCE_SHA)
 
     def fake_run(argv, **kwargs):
         calls.append(argv)
@@ -826,9 +848,18 @@ def fake_bottle_run(monkeypatch, release, cut, *, runs, watch_rc=0, doc=None):
             document = doc or bottle_json(release, cut)
             name = f"sudo-secretspec--{cut.version}.bottle.json"
             (dest / name).write_text(json.dumps(document), encoding="utf-8")
+            if source is not None:
+                (dest / "source.sha256").write_text(source + "\n", encoding="utf-8")
             for entry in document.values():
                 for spec in entry["bottle"]["tags"].values():
-                    (dest / spec["filename"]).write_bytes(b"bottle")
+                    if (
+                        spec["filename"] not in ("", ".", "..")
+                        and "/" not in (spec["filename"])
+                    ):
+                        (dest / spec["filename"]).write_bytes(tarball)
+        if argv[:3] == ["gh", "release", "download"]:
+            dest = Path(argv[argv.index("-D") + 1])
+            (dest / argv[argv.index("--pattern") + 1]).write_bytes(asset)
         return completed(argv)
 
     monkeypatch.setattr(release, "run", fake_run)
@@ -854,13 +885,16 @@ def test_fetch_bottle_finds_the_tag_run_by_head_sha_and_downloads_its_json(
     ]
     assert calls[0] == ["git", "rev-parse", f"{cut.tag}^{{commit}}"]
     lookup = next(argv for argv in calls if argv[:3] == ["gh", "run", "list"])
-    assert lookup[3:9] == [
+    assert lookup[3:11] == [
         "-R",
         release.FORK_REPO,
         "--branch",
         cut.tag,
         "--workflow",
-    ] + ["sudo-release.yml"]
+        "sudo-release.yml",
+        "--event",
+        "push",
+    ]
     watch = next(argv for argv in calls if argv[:3] == ["gh", "run", "watch"])
     assert watch[3] == "8"
     assert "--exit-status" in watch
@@ -907,6 +941,170 @@ def test_fetch_bottle_refuses_a_bottle_that_points_at_another_release(
         release.fetch_bottle(cut, tmp_path, dry_run=False)
 
 
+def test_find_run_refuses_when_more_than_one_push_run_matches(
+    monkeypatch, release, cut, tmp_path
+):
+    # A re-pushed tag or a second run for one commit: guessing "the newest" could
+    # watch and trust a run that did not build the bottle.
+    fake_bottle_run(
+        monkeypatch,
+        release,
+        cut,
+        runs=[
+            {"databaseId": 9, "headSha": TAG_SHA},
+            {"databaseId": 8, "headSha": TAG_SHA},
+        ],
+    )
+    with pytest.raises(release.ReleaseError, match="refusing to guess") as raised:
+        release.fetch_bottle(cut, tmp_path, dry_run=False)
+    assert "--build-from-source" in str(raised.value)
+    with pytest.raises(release.ReleaseError, match="9, 8"):
+        release.find_run(cut.tag, TAG_SHA, workflow="sudo-release.yml")
+
+
+def test_find_run_without_a_workflow_keeps_the_newest_match(monkeypatch, release, cut):
+    # ci_gate's ci/run branch can legitimately hold two runs for one overlay.
+    fake_bottle_run(
+        monkeypatch,
+        release,
+        cut,
+        runs=[
+            {"databaseId": 9, "headSha": TAG_SHA},
+            {"databaseId": 8, "headSha": TAG_SHA},
+        ],
+    )
+    assert release.find_run("ci/run/x", TAG_SHA) == 9
+
+
+def test_fetch_bottle_refuses_a_tarball_that_does_not_match_its_json(
+    monkeypatch, release, cut, tmp_path
+):
+    fake_bottle_run(
+        monkeypatch,
+        release,
+        cut,
+        runs=[{"databaseId": 8, "headSha": TAG_SHA}],
+        tarball=b"swapped",
+    )
+    with pytest.raises(release.ReleaseError, match="does not hash to the sha256"):
+        release.fetch_bottle(cut, tmp_path, dry_run=False)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"name": "someone/else/sudo-secretspec"}, "exactly one entry"),
+        ({"pkg_version": "0.19.1-sudo.1"}, "not 0.19.1-sudo"),
+        ({"filename": "../escape.bottle.tar.gz"}, "unsafe bottle file name"),
+        ({"filename": "sub/dir.bottle.tar.gz"}, "unsafe bottle file name"),
+        ({"filename": "back\\slash.bottle.tar.gz"}, "unsafe bottle file name"),
+        ({"filename": ".."}, "unsafe bottle file name"),
+    ],
+)
+def test_fetch_bottle_refuses_a_json_describing_something_else(
+    monkeypatch, release, cut, tmp_path, overrides, message
+):
+    fake_bottle_run(
+        monkeypatch,
+        release,
+        cut,
+        runs=[{"databaseId": 8, "headSha": TAG_SHA}],
+        doc=bottle_json(release, cut, **overrides),
+    )
+    with pytest.raises(release.ReleaseError, match=message):
+        release.fetch_bottle(cut, tmp_path, dry_run=False)
+
+
+def test_fetch_bottle_refuses_a_second_entry_in_the_json(
+    monkeypatch, release, cut, tmp_path
+):
+    doc = bottle_json(release, cut)
+    doc.update(bottle_json(release, cut, name="x/y/other"))
+    fake_bottle_run(
+        monkeypatch, release, cut, runs=[{"databaseId": 8, "headSha": TAG_SHA}], doc=doc
+    )
+    with pytest.raises(release.ReleaseError, match="exactly one entry"):
+        release.fetch_bottle(cut, tmp_path, dry_run=False)
+
+
+def test_fetch_bottle_refuses_a_ci_build_of_another_source_archive(
+    monkeypatch, release, cut, tmp_path
+):
+    fake_bottle_run(
+        monkeypatch,
+        release,
+        cut,
+        runs=[{"databaseId": 8, "headSha": TAG_SHA}],
+        source="6" * 64,
+    )
+    with pytest.raises(release.ReleaseError, match="different source archive"):
+        release.fetch_bottle(cut, tmp_path, dry_run=False)
+
+
+def test_fetch_bottle_refuses_an_artifact_without_the_source_hash(
+    monkeypatch, release, cut, tmp_path
+):
+    fake_bottle_run(
+        monkeypatch,
+        release,
+        cut,
+        runs=[{"databaseId": 8, "headSha": TAG_SHA}],
+        source=None,
+    )
+    with pytest.raises(release.ReleaseError, match="lacks source.sha256"):
+        release.fetch_bottle(cut, tmp_path, dry_run=False)
+
+
+def write_bottle_json(release, cut, tmp_path) -> Path:
+    path = tmp_path / f"sudo-secretspec--{cut.version}.bottle.json"
+    path.write_text(json.dumps(bottle_json(release, cut)), encoding="utf-8")
+    return path
+
+
+def test_verify_release_assets_accepts_an_asset_matching_the_json(
+    monkeypatch, release, cut, tmp_path
+):
+    calls = fake_bottle_run(monkeypatch, release, cut, runs=[])
+    path = write_bottle_json(release, cut, tmp_path)
+    release.verify_release_assets(cut, [path], dry_run=False)
+    download = next(a for a in calls if a[:3] == ["gh", "release", "download"])
+    assert download[3:6] == [cut.tag, "-R", release.FORK_REPO]
+    assert download[download.index("--pattern") + 1] == (
+        f"sudo-secretspec-{cut.version}.arm64_tahoe.bottle.tar.gz"
+    )
+
+
+def test_verify_release_assets_refuses_a_replaced_asset(
+    monkeypatch, release, cut, tmp_path
+):
+    fake_bottle_run(monkeypatch, release, cut, runs=[], asset=b"replaced")
+    path = write_bottle_json(release, cut, tmp_path)
+    with pytest.raises(release.ReleaseError, match="the tap was not touched"):
+        release.verify_release_assets(cut, [path], dry_run=False)
+
+
+def test_verify_release_assets_names_a_missing_asset(
+    monkeypatch, release, cut, tmp_path
+):
+    def fake_run(argv, **kwargs):
+        raise subprocess.CalledProcessError(1, argv, "", "no assets match")
+
+    monkeypatch.setattr(release, "run", fake_run)
+    path = write_bottle_json(release, cut, tmp_path)
+    with pytest.raises(release.ReleaseError, match="cannot download release asset"):
+        release.verify_release_assets(cut, [path], dry_run=False)
+
+
+def test_merge_bottle_pushes_nothing_when_the_release_asset_differs(
+    monkeypatch, release, cut, tmp_path
+):
+    calls = fake_bottle_run(monkeypatch, release, cut, runs=[], asset=b"replaced")
+    path = write_bottle_json(release, cut, tmp_path)
+    with pytest.raises(release.ReleaseError):
+        release.merge_bottle(cut, tmp_path / "clone", [path], dry_run=False)
+    assert not any(a[:2] in (["git", "push"], ["brew", "bottle"]) for a in calls)
+
+
 def test_merge_bottle_writes_the_block_and_pushes_the_tap_clone(
     monkeypatch, release, cut, tmp_path
 ):
@@ -915,11 +1113,14 @@ def test_merge_bottle_writes_the_block_and_pushes_the_tap_clone(
     for tap in (checkout, clone):
         (tap / "Formula").mkdir(parents=True)
         (tap / "Formula/sudo-secretspec.rb").write_text(f'url "{cut.tag}"\n')
-    jsons = [tmp_path / "x.bottle.json"]
+    jsons = [write_bottle_json(release, cut, tmp_path)]
     calls = []
 
     def fake_run(argv, *, cwd=None, env=None, **kwargs):
         calls.append((argv, cwd))
+        if argv[:3] == ["gh", "release", "download"]:
+            asset = Path(argv[argv.index("-D") + 1]) / argv[argv.index("--pattern") + 1]
+            asset.write_bytes(BOTTLE_BYTES)
         if argv[:2] == ["brew", "--repository"]:
             return completed(argv, f"{checkout}\n")
         if argv[:3] == ["brew", "bottle", "--merge"]:
@@ -940,6 +1141,9 @@ def test_merge_bottle_writes_the_block_and_pushes_the_tap_clone(
     assert (["git", "checkout", "--", "Formula/sudo-secretspec.rb"], checkout) in calls
     assert (["git", "push", "origin", "HEAD"], clone) in calls
     assert argvs.index(merge) < argvs.index(["git", "push", "origin", "HEAD"])
+    # The published asset is compared before the tap is touched.
+    download = next(a for a in argvs if a[:3] == ["gh", "release", "download"])
+    assert argvs.index(download) < argvs.index(merge)
 
 
 def test_merge_bottle_refuses_a_formula_that_gained_no_bottle_block(

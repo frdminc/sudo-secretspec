@@ -16,6 +16,10 @@
 #   frdminc/sudo-secretspec/sudo-secretspec && brew test ...`. This is exactly
 #   how the v0.19.1-sudo.15 release died (disk hit 100% mid-brew).
 
+# Recipe arguments also arrive as $1, $2, ...; `release` hands its flags to
+# release.py as "${@:2}" rather than splicing `{{flags}}` into the script text.
+set positional-arguments
+
 # The .15 release ran out of disk AFTER publishing; refuse to start low.
 min_free_gi := "25"
 
@@ -53,7 +57,7 @@ release version *flags: preflight-disk
         git commit -m "chore: stamp workspace {{version}}"
     fi
     git push origin sudo-main
-    packaging/release.py --version {{version}} {{flags}}
+    packaging/release.py --version "$1" "${@:2}"
     echo
     echo "Published. The INSTALLED boundary is still the previous version until:"
     echo "  sudo \"$(brew --prefix sudo-secretspec)/libexec/sudo-secretspec\" install"
