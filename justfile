@@ -42,8 +42,14 @@ preflight-disk:
 # mutating command, publishes nothing). Leaves the stamp in the working tree
 # for the real run; tests are skipped here because the live run gates on them.
 release-dry version: preflight-disk
-    packaging/stamp.py --version {{version}}
-    packaging/release.py --version {{version}} --dry-run --allow-dirty --skip-tests
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # "$1", never `{{version}}`: just splices a recipe parameter into the script
+    # text before bash parses it, so a spliced value is shell source, not a word
+    # (adversary I1, 2026-10-20). The version is validated downstream by
+    # VERSION_RE, which is too late to stop a splice.
+    packaging/stamp.py --version "$1"
+    packaging/release.py --version "$1" --dry-run --allow-dirty --skip-tests
 
 # Cut the release end to end. Extra flags reach release.py, e.g.
 # `just release 0.19.1-sudo.N --build-from-source` to compile on this Mac
@@ -51,10 +57,10 @@ release-dry version: preflight-disk
 release version *flags: preflight-disk
     #!/usr/bin/env bash
     set -euo pipefail
-    packaging/stamp.py --version {{version}}
+    packaging/stamp.py --version "$1"
     git add Cargo.toml Cargo.lock secretspec-derive/Cargo.toml sudo-secretspec-cli/Cargo.toml
     if ! git diff --cached --quiet; then
-        git commit -m "chore: stamp workspace {{version}}"
+        git commit -m "chore: stamp workspace $1"
     fi
     git push origin sudo-main
     packaging/release.py --version "$1" "${@:2}"

@@ -28,6 +28,7 @@ import re
 import shutil
 import signal
 import subprocess
+import tarfile
 import tempfile
 import time
 import urllib.error
@@ -123,6 +124,18 @@ BOTTLE_CELLARS = (
 # Homebrew omits `cellar:` for these two, and writes the relocatable ones as symbols.
 BOTTLE_DEFAULT_CELLARS = ("/opt/homebrew/Cellar", "/usr/local/Cellar")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
+COMMIT_RE = re.compile(r"[0-9a-f]{40}")
+# A bottle file name reaches `gh release download --pattern`, which is a glob,
+# and argv. Allow only what Homebrew actually writes, so a name carrying glob
+# metacharacters or shaped like an option is refused before it is used at all
+# (adversary N7, 2026-10-20).
+BOTTLE_FILENAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]*")
+# The single workflow `ci/base` carries. Naming it makes `find_run` apply its
+# `--event push` filter and its one-match refusal to the gate too: the
+# wrapper's overlay_paths already lists agent-ci.yml, so the day ci/base
+# grows it two runs would share the overlay SHA and the release would be
+# gated on whichever gh listed first (adversary F3.3, 2026-10-20).
+CI_GATE_WORKFLOW = "linux-ci.yml"
 # Install the tap formula, never Homebrew's API copy of a formula.
 BREW_ENV = {"HOMEBREW_NO_INSTALL_FROM_API": "1"}
 # The one place that names the escape hatch; every bottle failure repeats it.
@@ -425,7 +438,7 @@ def ci_gate(*, dry_run: bool) -> None:
     if match is None:
         raise ReleaseError(f"github-ci-run printed no overlay line:\n{pushed}")
     overlay, branch = match.groups()
-    run_id = find_run(branch, overlay)
+    run_id = find_run(branch, overlay, workflow=CI_GATE_WORKFLOW)
     watch_run(run_id, "CI did not pass")
 
 
@@ -476,11 +489,85 @@ def rewrite_formula(path: Path, release: Release, sha256: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
+_ARCHIVE_DIGESTS: dict[str, str] = {}
+
+
+def archive_commit(path: Path) -> str | None:
+    """The commit id GitHub embedded in a generated tag archive, or None.
+
+    GitHub writes it as the `comment` record of the tar's global pax header,
+    which is exactly what CI's `git get-tar-commit-id` reads
+    (`sudo-release.yml`). Reading it with `tarfile` keeps the check in process:
+    no gzip pipe, no temp tar, nothing that needs a shell.
+    """
+    try:
+        with tarfile.open(path, mode="r:gz") as archive:
+            comment = (archive.pax_headers or {}).get("comment")
+    except (tarfile.TarError, OSError, EOFError):
+        return None
+    if isinstance(comment, str) and COMMIT_RE.fullmatch(comment.strip()):
+        return comment.strip()
+    return None
+
+
+def require_archive_matches_tag(release: Release, *, dry_run: bool) -> None:
+    """Bind the published archive's bytes to the local tag commit.
+
+    GitHub serves an archive by tag *name*, and until now nothing local tied
+    those bytes to the commit the tag points at: the binding existed only in
+    CI, and only transitively, through a `source.sha256` that carried no
+    attestation. Doing CI's check here makes the digest the formula pins
+    provably the tag's tree without trusting CI at all (adversary N6c,
+    2026-10-20).
+    """
+    if dry_run:
+        log(f"[dry-run] bind {release.archive_url} to {release.tag}")
+        return
+    expected = output(["git", "rev-parse", f"{release.tag}^{{commit}}"])
+    _require(
+        COMMIT_RE.fullmatch(expected) is not None,
+        f"cannot resolve {release.tag} to a local commit, so the archive "
+        f"cannot be bound to it: got {expected!r}",
+    )
+    validate_release_url(release.archive_url)
+    request = urllib.request.Request(
+        release.archive_url, headers={"User-Agent": "sudo-secretspec-release"}
+    )
+    with tempfile.NamedTemporaryFile(suffix=".tar.gz") as body:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            shutil.copyfileobj(response, body)
+        body.flush()
+        found = archive_commit(Path(body.name))
+    _require(
+        found is not None,
+        f"{release.archive_url} carries no commit id in its tar header, so it "
+        "is not an archive GitHub generated for this tag",
+    )
+    _require(
+        found == expected,
+        f"{release.archive_url} is commit {found}, but {release.tag} is "
+        f"{expected}: the archive is not the tag's tree",
+    )
+    log(f"archive of {release.tag} is commit {found}")
+
+
 def archive_sha256(release: Release, *, dry_run: bool) -> str:
+    """The sha256 of the tag's source archive, downloaded at most once.
+
+    Memoised per URL because the digest compared with CI's `source.sha256`
+    has to be the digest written into the formula. Hashing twice pinned a
+    number from a later, separate download that nothing had validated, and
+    GitHub's generated archives are not contractually byte-stable -- the
+    2023 gzip change moved every one of them (adversary N6b, 2026-10-20).
+    The module is re-executed per test, so the memo is per process.
+    """
     validate_release_url(release.archive_url)
     if dry_run:
         log(f"[dry-run] hash {release.archive_url}")
         return "0" * 64
+    cached = _ARCHIVE_DIGESTS.get(release.archive_url)
+    if cached is not None:
+        return cached
     request = urllib.request.Request(
         release.archive_url, headers={"User-Agent": "sudo-secretspec-release"}
     )
@@ -495,7 +582,9 @@ def archive_sha256(release: Release, *, dry_run: bool) -> str:
             with urllib.request.urlopen(request, timeout=60) as response:
                 while chunk := response.read(1024 * 1024):
                     digest.update(chunk)
-            return digest.hexdigest()
+            hexdigest = digest.hexdigest()
+            _ARCHIVE_DIGESTS[release.archive_url] = hexdigest
+            return hexdigest
         except (urllib.error.URLError, OSError) as error:
             last_error = error
             if attempt == ARCHIVE_ATTEMPTS:
@@ -561,6 +650,7 @@ def create_tag_and_release(
 def update_formula_commit(
     release: Release, *, dry_run: bool, state: CleanupState
 ) -> None:
+    require_archive_matches_tag(release, dry_run=dry_run)
     sha = archive_sha256(release, dry_run=dry_run)
     if dry_run:
         log(f"[dry-run] rewrite {FORMULA_REL} for {release.tag} sha256={sha}")
@@ -692,9 +782,8 @@ def bottle_entry(release: Release, path: Path) -> dict[str, Any]:
         name = spec["filename"]
         _require(
             isinstance(name, str)
-            and bool(name)
-            and name not in (".", "..")
-            and not {"/", "\\"} & set(name),
+            and BOTTLE_FILENAME_RE.fullmatch(name) is not None
+            and name not in (".", ".."),
             f"{path.name}: unsafe bottle file name {name!r}",
         )
     return entry
@@ -811,7 +900,17 @@ def fetch_bottle(release: Release, dest: Path, *, dry_run: bool) -> list[Path]:
             + ["-n", BOTTLE_ARTIFACT, "-D", str(dest)]
         )
         jsons = sorted(dest.glob("*.bottle.json"))
-        _require(bool(jsons), f"artifact {BOTTLE_ARTIFACT} holds no bottle JSON")
+        # Exactly one: every line of the merged block comes from a validated,
+        # attested JSON, but nothing said how many there should be, so a run
+        # that produced a second OS tag would add a `sha256 <tag>:` line for a
+        # bottle nobody meant to ship -- and an image transition is exactly
+        # when that happens (adversary F3.2, 2026-10-20). Shipping a second
+        # platform should be an edit here.
+        _require(
+            len(jsons) == 1,
+            f"artifact {BOTTLE_ARTIFACT} holds {len(jsons)} bottle JSON files "
+            f"({', '.join(p.name for p in jsons) or 'none'}); expected exactly one",
+        )
         ref = f"refs/tags/{release.tag}"
         for path in jsons:
             # The JSON is parsed by Homebrew into the tap formula's Ruby, so it
@@ -833,6 +932,13 @@ def fetch_bottle(release: Release, dest: Path, *, dry_run: bool) -> list[Path]:
         _require(
             source.is_file(), f"artifact {BOTTLE_ARTIFACT} lacks {SOURCE_SHA_FILE}"
         )
+        # Attested like the tarball and the JSON. It used to be the only input
+        # trusted here with no provenance at all, written to disk by the same
+        # job that runs every build.rs and proc-macro in Cargo.lock, so that
+        # code could forge the digest this comparison rests on (adversary N6a,
+        # 2026-10-20). The workflow now also signs it and derives it from a
+        # step output recorded before the build runs.
+        verify_attestation(source, source_ref=ref, source_digest=sha)
         _require(
             source.read_text(encoding="utf-8").strip()
             == archive_sha256(release, dry_run=False),
@@ -875,17 +981,38 @@ def verify_release_assets(
         for path in jsons:
             for spec in bottle_specs(release, path):
                 name = spec["filename"]
+                # One asset per download directory: `--pattern` is a glob, and
+                # the point of this step is to hash the asset Homebrew will
+                # fetch by exact name. A pattern that matched several would
+                # make the set checked here differ from the set installed, and
+                # one that matched none left `file_sha256` to raise
+                # FileNotFoundError outside any handler that names the
+                # fallback (adversary N7, 2026-10-20).
+                asset_dir = Path(work) / name
                 try:
+                    asset_dir.mkdir(parents=True)
                     run(
                         ["gh", "release", "download", release.tag, "-R", FORK_REPO]
-                        + ["--pattern", name, "-D", work]
+                        + ["--pattern", name, "-D", str(asset_dir)]
                     )
-                except subprocess.CalledProcessError as error:
+                    landed = sorted(p.name for p in asset_dir.iterdir())
+                    _require(
+                        landed == [name],
+                        f"downloading release asset {name} produced "
+                        f"{landed or 'no files'}; expected exactly that one name\n"
+                        + BOTTLE_FALLBACK_HINT,
+                    )
+                    actual = file_sha256(asset_dir / name)
+                except (subprocess.CalledProcessError, OSError) as error:
+                    detail = (
+                        describe(error)
+                        if isinstance(error, subprocess.CalledProcessError)
+                        else error
+                    )
                     raise ReleaseError(
-                        f"cannot download release asset {name}: {describe(error)}\n"
+                        f"cannot download release asset {name}: {detail}\n"
                         + BOTTLE_FALLBACK_HINT
                     ) from error
-                actual = file_sha256(Path(work) / name)
                 _require(
                     actual == spec["sha256"],
                     f"release asset {name} hashes to {actual}, but the CI artifact "

@@ -186,14 +186,19 @@ jobs:
             test "$commit" = "$GITHUB_SHA"
           fi
           sha="$(shasum -a 256 "$RUNNER_TEMP/src.tar.gz" | cut -d' ' -f1)"
-          # release.py hashes the same archive itself and compares.
+          # release.py hashes the same archive itself and compares. The digest
+          # also goes to $GITHUB_OUTPUT, which is recorded when this step ends
+          # and so cannot be rewritten by the `build.rs` and proc-macro code
+          # that runs under `brew install --build-bottle` in the next step; the
+          # file on disk can be (adversary N6a, 2026-10-20).
           echo "$sha" > "$RUNNER_TEMP/source.sha256"
+          echo "source_sha=$sha" >> "$GITHUB_OUTPUT"
           brew tap-new "$TAP"
           formula="$(brew --repository "$TAP")/Formula/sudo-secretspec.rb"
           cp packaging/homebrew/sudo-secretspec.rb "$formula"
           # The tag's own formula still names the previous release (release.py
           # restamps it after the tag exists), so restamp it with the same code.
-          python3 - "$formula" "${tag#v}" "$sha" <<'PY'
+          python3 -I - "$formula" "${tag#v}" "$sha" <<'PY'
           import sys
           from pathlib import Path
 
@@ -207,6 +212,7 @@ jobs:
       - name: Build the bottle
         env:
           TAG: ${{ steps.formula.outputs.tag }}
+          SOURCE_SHA: ${{ steps.formula.outputs.source_sha }}
         run: |
           set -euo pipefail
           brew install --build-bottle --verbose "$TAP/sudo-secretspec"
@@ -218,7 +224,7 @@ jobs:
             "$TAP/sudo-secretspec"
           # brew writes `name--version.tag.bottle.tar.gz` locally and expects the
           # upload to use the single-dash name its JSON records.
-          python3 - <<'PY'
+          python3 -I - <<'PY'
           import json
           from pathlib import Path
 
@@ -230,7 +236,10 @@ jobs:
                   local.rename(spec["filename"])
                   print(f"{local} -> {spec['filename']}")
           PY
-          cp "$RUNNER_TEMP/source.sha256" .
+          # From the step output, not the on-disk file the build could have
+          # overwritten (adversary N6a). The attest step below signs it.
+          printf '%s\n' "$SOURCE_SHA" > ./source.sha256
+          test "$(cat ./source.sha256)" = "$SOURCE_SHA"
           ls -l
           echo "BOTTLE_DIR=$PWD" >> "$GITHUB_ENV"
       # A signed statement that this workflow, at this ref and commit, built
@@ -242,6 +251,7 @@ jobs:
           subject-path: |
             ${{ env.BOTTLE_DIR }}/*.bottle.tar.gz
             ${{ env.BOTTLE_DIR }}/*.bottle.json
+            ${{ env.BOTTLE_DIR }}/source.sha256
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sudo-secretspec-bottle

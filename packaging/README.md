@@ -85,8 +85,21 @@ to the sha256 in its JSON; the JSON must hold one entry named
 `frdminc/sudo-secretspec/sudo-secretspec` at the release version with the tap's
 formula path, a known tag, cellar and rebuild, a 64-digit sha256 and a bare file
 name; and the CI source sha256 must equal the archive `release.py` hashes
-for the formula. Before the tap is pushed it downloads each asset from the
-GitHub Release and compares its sha256 too. Then it runs
+for the formula. The archive is downloaded and hashed **once** per run and the
+digest memoised: hashing it again for the formula pinned a number from a later,
+separate download that nothing had compared with CI, and GitHub's generated
+archives are not contractually byte-stable. Before the formula is rewritten,
+`require_archive_matches_tag` binds those bytes to the local tag commit by
+reading the commit id GitHub embeds in the tar's global pax header -- the same
+field CI's `git get-tar-commit-id` reads -- so the pinned digest is provably
+the tag's tree without trusting CI. The artifact must hold exactly one bottle
+JSON, and `source.sha256` is attested like the tarball and the JSON and
+verified before it is read: it is derived from a step output recorded before
+`brew install --build-bottle` runs, because the on-disk file is writable by
+every `build.rs` and proc-macro in `Cargo.lock`. Before the tap is pushed it
+downloads each asset from the GitHub Release into its own directory, requires
+exactly that one file name to land (`--pattern` is a glob) and compares its
+sha256 too. Then it runs
 `brew bottle --merge --write` into the tap formula, refuses to commit unless
 the `bottle do` block it wrote equals the one the validated fields make,
 pushes the tap and reinstalls

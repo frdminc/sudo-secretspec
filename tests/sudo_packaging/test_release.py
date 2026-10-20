@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import io
 import json
 import re
 import subprocess
 import sys
+import tarfile
 from pathlib import Path
 
 import pytest
@@ -741,6 +743,134 @@ def _brew_info(linked_keg):
     return json.dumps({"formulae": [{"linked_keg": linked_keg}]})
 
 
+def _tag_archive(path, commit):
+    """A gzipped tar carrying `commit` the way GitHub's generated archives do."""
+    headers = {"comment": commit} if commit else {}
+    with tarfile.open(
+        path, "w:gz", format=tarfile.PAX_FORMAT, pax_headers=headers
+    ) as tf:
+        member = tarfile.TarInfo("sudo-secretspec/README.md")
+        member.size = 0
+        tf.addfile(member, io.BytesIO(b""))
+    return path
+
+
+def test_archive_commit_reads_the_commit_github_embeds(release, tmp_path):
+    """Verified against the real v0.19.1-sudo.28 archive, whose pax comment is
+    c31befc3cb35bae1bb9431a58517dfb6ae6e04f4 -- the same value `git rev-parse`
+    gives for the tag, and the same one the attestation used as --source-digest.
+    """
+    commit = "c" * 40
+    assert release.archive_commit(_tag_archive(tmp_path / "a.tar.gz", commit)) == commit
+    assert release.archive_commit(_tag_archive(tmp_path / "b.tar.gz", None)) is None
+    (tmp_path / "junk.tar.gz").write_bytes(b"not a gzip stream")
+    assert release.archive_commit(tmp_path / "junk.tar.gz") is None
+
+
+def _fake_archive_download(monkeypatch, release, body: bytes):
+    class Response(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+    monkeypatch.setattr(
+        release.urllib.request, "urlopen", lambda *_a, **_k: Response(body)
+    )
+
+
+def test_the_archive_must_be_the_tag_commits_tree(monkeypatch, release, cut, tmp_path):
+    """N6c: nothing local used to bind the archive bytes to the tag commit.
+
+    GitHub serves an archive by tag *name*; the binding existed only in CI, and
+    only transitively, through a source.sha256 that carried no attestation.
+    """
+    wanted, other = "a" * 40, "b" * 40
+    monkeypatch.setattr(release, "output", lambda *_a, **_k: wanted)
+
+    _fake_archive_download(
+        monkeypatch, release, _tag_archive(tmp_path / "ok.tar.gz", wanted).read_bytes()
+    )
+    release.require_archive_matches_tag(cut, dry_run=False)  # the tag's own tree
+
+    _fake_archive_download(
+        monkeypatch, release, _tag_archive(tmp_path / "no.tar.gz", other).read_bytes()
+    )
+    with pytest.raises(release.ReleaseError, match="is not the tag's tree"):
+        release.require_archive_matches_tag(cut, dry_run=False)
+
+    _fake_archive_download(
+        monkeypatch, release, _tag_archive(tmp_path / "bare.tar.gz", None).read_bytes()
+    )
+    with pytest.raises(release.ReleaseError, match="carries no commit id"):
+        release.require_archive_matches_tag(cut, dry_run=False)
+
+
+def test_an_unresolvable_tag_is_refused_rather_than_skipped(monkeypatch, release, cut):
+    monkeypatch.setattr(release, "output", lambda *_a, **_k: "")
+    with pytest.raises(release.ReleaseError, match="cannot resolve"):
+        release.require_archive_matches_tag(cut, dry_run=False)
+
+
+def test_the_archive_is_hashed_once_so_the_pinned_digest_was_the_checked_one(
+    monkeypatch, release, cut
+):
+    """N6b: hash #2 was compared with CI, hash #3 was written to the formula."""
+    downloads = []
+
+    def urlopen(*_a, **_k):
+        downloads.append(1)
+        body = io.BytesIO(b"archive bytes")
+
+        class Response(io.BytesIO):
+            def __enter__(self):
+                return body
+
+            def __exit__(self, *_a):
+                return False
+
+        return Response(b"")
+
+    monkeypatch.setattr(release.urllib.request, "urlopen", urlopen)
+    first = release.archive_sha256(cut, dry_run=False)
+    second = release.archive_sha256(cut, dry_run=False)
+    assert first == second
+    assert len(downloads) == 1
+
+
+def test_a_glob_shaped_bottle_file_name_is_refused(release, cut, tmp_path):
+    """N7: the name reaches `gh release download --pattern`, which is a glob."""
+    for name in (
+        "*.bottle.tar.gz",
+        "sudo-secretspec-1.bottle.tar.g?",
+        "-rf",
+        ".hidden",
+        "a[b].bottle.tar.gz",
+    ):
+        path = tmp_path / "b.bottle.json"
+        path.write_text(json.dumps(bottle_json(release, cut, filename=name)))
+        with pytest.raises(release.ReleaseError, match="unsafe bottle file name"):
+            release.bottle_specs(cut, path)
+
+
+def test_ci_gate_names_its_workflow_so_one_run_must_match(monkeypatch, release):
+    """F3.3: with no workflow, find_run returns the newest of several matches."""
+    argvs = []
+
+    def fake_output(argv, **kwargs):
+        argvs.append(argv)
+        if argv[:3] == ["gh", "run", "list"]:
+            return json.dumps([{"databaseId": 8, "headSha": "d" * 40}])
+        return ""
+
+    monkeypatch.setattr(release, "output", fake_output)
+    release.find_run("ci/run/x", "d" * 40, workflow=release.CI_GATE_WORKFLOW)
+    listing = next(a for a in argvs if a[:3] == ["gh", "run", "list"])
+    assert "--workflow" in listing and release.CI_GATE_WORKFLOW in listing
+    assert "--event" in listing and "push" in listing
+
+
 def test_a_linked_head_keg_is_named_instead_of_blamed_on_the_bottle(
     monkeypatch, release
 ):
@@ -1051,8 +1181,12 @@ def test_fetch_bottle_verifies_the_json_and_tarball_attestations_against_the_tag
             "--deny-self-hosted-runners",
         ]
 
-    # The JSON first: it is verified before it is parsed.
-    assert verifies == [expected(json_file), expected(tarball)]
+    # The JSON first: it is verified before it is parsed. source.sha256 is
+    # verified too, and before it is read: it is the digest the "CI built this
+    # source" invariant rests on, and it used to arrive with no provenance at
+    # all from the job that runs every build.rs in Cargo.lock (adversary N6a).
+    source = tmp_path / release.SOURCE_SHA_FILE
+    assert verifies == [expected(json_file), expected(tarball), expected(source)]
     assert not any("--signer-workflow" in argv for argv in verifies)
     # Verified after the download, before the source-archive comparison.
     names = [argv[:3] for argv in calls]
