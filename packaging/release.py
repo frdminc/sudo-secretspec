@@ -596,7 +596,21 @@ def archive_facts(release: Release, *, dry_run: bool) -> tuple[str, str | None]:
                         digest.update(chunk)
                         body.write(chunk)
                         written += len(chunk)
-                    declared = response.headers.get("Content-Length")
+                    # `response.length` is what `http.client` itself
+                    # believed, counted down by the reads above. It is None
+                    # whenever the raw header must not be trusted: absent,
+                    # malformed (`Content-Length: ` or a proxy's folded
+                    # `40, 40` -- `http.client` tolerates both and reads to
+                    # close), or overridden by chunked encoding, which wins
+                    # while the raw header stays in `headers`. Comparing
+                    # against the raw string instead raised an uncaught
+                    # ValueError on the first two and wasted five attempts on
+                    # the third (adversary, 2026-10-20).
+                    declared = (
+                        response.headers.get("Content-Length")
+                        if response.length is not None
+                        else None
+                    )
                 # `http.client` does not raise on a body shorter than its
                 # Content-Length: `read` returns b"" and closes. Without this
                 # the attempt looks complete, the memo takes the digest of the
@@ -611,7 +625,11 @@ def archive_facts(release: Release, *, dry_run: bool) -> tuple[str, str | None]:
                 facts = (digest.hexdigest(), archive_commit(Path(body.name)))
             _ARCHIVE_FACTS[release.archive_url] = facts
             return facts
-        except (urllib.error.URLError, OSError) as error:
+        except (urllib.error.URLError, OSError, ValueError) as error:
+            # ValueError is belt and braces: the gate above means no header is
+            # parsed unless `http.client` already parsed it, but this loop is
+            # the only thing standing between a malformed response and a raw
+            # traceback after the tag and Release are published.
             last_error = error
             if attempt == ARCHIVE_ATTEMPTS:
                 break

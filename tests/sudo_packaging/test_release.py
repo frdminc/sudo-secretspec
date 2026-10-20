@@ -558,11 +558,15 @@ def test_interruption_cleanup_never_deletes_pushed_tag(monkeypatch, release, cut
 class FakeResponse:
     """Minimal stand-in for the object `urlopen` returns as a context manager."""
 
-    def __init__(self, payload: bytes, headers: dict | None = None):
+    def __init__(
+        self, payload: bytes, headers: dict | None = None, length: int | None = None
+    ):
         self._payload = payload
         # Real responses always carry one; an empty mapping means "undeclared",
         # which is the branch that skips the short-body check.
         self.headers = headers or {}
+        # `http.client` sets this only when it parsed the header itself.
+        self.length = length
 
     def __enter__(self):
         return self
@@ -772,11 +776,17 @@ def test_archive_commit_reads_the_commit_github_embeds(release, tmp_path):
 class _ByteResponse(io.BytesIO):
     """An opener stand-in: a context manager over a fixed body."""
 
-    def __init__(self, body: bytes, headers: dict | None = None):
+    def __init__(
+        self, body: bytes, headers: dict | None = None, length: int | None = 0
+    ):
         super().__init__(body)
         self.headers = (
             {"Content-Length": str(len(body))} if headers is None else headers
         )
+        # `http.client` counts this down as the body is read, and leaves it
+        # None whenever it did not parse a Content-Length of its own -- which
+        # is the gate `archive_facts` reads.
+        self.length = length
 
     def __enter__(self):
         return self
@@ -898,7 +908,7 @@ def test_a_redirect_off_github_https_is_refused(release):
         hop("https://codeload.github.com/frdminc/sudo-secretspec/tar.gz/refs/tags/v1")
 
 
-def test_the_archive_fetch_goes_through_the_pinned_opener(release):
+def test_the_archive_fetch_goes_through_the_pinned_opener(monkeypatch, release, cut):
     """The pin is one line of wiring, and deleting it used to leave every test
     green with the protection gone (adversary, 2026-10-20). It is module-private
     rather than `install_opener` so importing the formula rewriter in CI does
@@ -921,6 +931,24 @@ def test_the_archive_fetch_goes_through_the_pinned_opener(release):
         isinstance(h, release.PinnedRedirectHandler) for h in installed.handlers
     )
 
+    # And the fetch actually goes through it: asserting only on the opener's
+    # shape left the call site free to go back to `urllib.request.urlopen`
+    # with every test still green (adversary, 2026-10-20).
+    used = []
+
+    def opener(*_a, **_k):
+        used.append(1)
+        return _ByteResponse(b"body")
+
+    monkeypatch.setattr(release._OPENER, "open", opener)
+    monkeypatch.setattr(
+        release.urllib.request,
+        "urlopen",
+        lambda *_a, **_k: pytest.fail("fetched outside the pinned opener"),
+    )
+    release.archive_sha256(cut, dry_run=False)
+    assert used == [1]
+
 
 def test_a_truncated_download_is_retried_not_misdiagnosed(
     monkeypatch, release, cut, tmp_path
@@ -932,9 +960,13 @@ def test_a_truncated_download_is_retried_not_misdiagnosed(
     (adversary, 2026-10-20)."""
     commit = "e" * 40
     body = _tag_archive(tmp_path / "full.tar.gz", commit).read_bytes()
+    half = len(body) // 2
     responses = [
-        # Claims the full length, delivers half: a cut transfer.
-        _ByteResponse(body[: len(body) // 2], {"Content-Length": str(len(body))}),
+        # Claims the full length, delivers half: a cut transfer. `http.client`
+        # leaves `length` at the unread remainder rather than raising.
+        _ByteResponse(
+            body[:half], {"Content-Length": str(len(body))}, length=len(body) - half
+        ),
         _ByteResponse(body),
     ]
     monkeypatch.setattr(release._OPENER, "open", lambda *_a, **_k: responses.pop(0))
@@ -949,8 +981,47 @@ def test_a_truncated_download_is_retried_not_misdiagnosed(
 def test_an_undeclared_content_length_still_fetches(monkeypatch, release, cut):
     """Chunked responses carry no Content-Length, so the check has to skip."""
     monkeypatch.setattr(
-        release._OPENER, "open", lambda *_a, **_k: _ByteResponse(b"body", {})
+        release._OPENER,
+        "open",
+        lambda *_a, **_k: _ByteResponse(b"body", {}, length=None),
     )
+    assert (
+        release.archive_sha256(cut, dry_run=False)
+        == hashlib.sha256(b"body").hexdigest()
+    )
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        # `http.client` tolerates both of these -- `int(length)` raises
+        # ValueError there too, and it sets self.length = None and reads to
+        # close. The raw string stays in `headers`, so comparing against it
+        # raised an uncaught ValueError after the tag was published.
+        "",
+        "40, 40",
+        # Chunked wins over Content-Length, but the raw header remains, so the
+        # body was compared against a number that was never its length -- five
+        # attempts and 45s of backoff for a response that was complete.
+        "999",
+    ],
+)
+def test_a_content_length_http_client_ignored_is_ignored_here(
+    monkeypatch, release, cut, header
+):
+    """The gate is `response.length`, not the raw header: no header is parsed
+    unless `http.client` parsed it first (adversary, 2026-10-20)."""
+    # Without this a regression here takes 45s of real backoff per case before
+    # failing, which is itself the cost the chunked case used to pay.
+    monkeypatch.setattr(release.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(
+        release._OPENER,
+        "open",
+        lambda *_a, **_k: _ByteResponse(
+            b"body", {"Content-Length": header}, length=None
+        ),
+    )
+    # No ValueError, no retry, no misdiagnosis.
     assert (
         release.archive_sha256(cut, dry_run=False)
         == hashlib.sha256(b"body").hexdigest()
