@@ -238,8 +238,15 @@ jobs:
           PY
           # From the step output, not the on-disk file the build could have
           # overwritten (adversary N6a). The attest step below signs it.
+          # Check the value, not the copy: re-reading the file one line after
+          # writing it cannot fail, and cannot see a later overwrite either.
+          # An empty output would otherwise write a bare newline and surface
+          # much later as "the CI build compiled a different source archive".
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{64}$ ]] || {
+            echo "source_sha is not a sha256: '$SOURCE_SHA'" >&2
+            exit 1
+          }
           printf '%s\n' "$SOURCE_SHA" > ./source.sha256
-          test "$(cat ./source.sha256)" = "$SOURCE_SHA"
           ls -l
           echo "BOTTLE_DIR=$PWD" >> "$GITHUB_ENV"
       # A signed statement that this workflow, at this ref and commit, built

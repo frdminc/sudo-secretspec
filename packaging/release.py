@@ -74,13 +74,23 @@ ANY_VERSION_RE = re.compile(
 # that is only half restamped.
 FORMULA_VERSION_SITES = 4
 # GitHub generates the source tarball for a tag on first request, so the fetch
-# in `archive_sha256` can 404 or time out for a few seconds after the Release is
+# in `archive_facts` can 404 or time out for a few seconds after the Release is
 # created. That fetch happens *after* the tag and Release are published, which
 # are the irreversible steps -- a transient failure there drops the operator
 # into the justfile's "do NOT re-run, finish by hand" path for no reason. Retry
 # instead. Delays double from the first: 3s, 6s, 12s, 24s.
 ARCHIVE_ATTEMPTS = 5
 ARCHIVE_BACKOFF_SECONDS = 3
+# Every host allowed to serve archive bytes. github.com 302s a tag archive to
+# codeload.github.com, so the redirect target needs naming rather than
+# refusing (see `PinnedRedirectHandler`).
+ARCHIVE_HOSTS = ("github.com", "codeload.github.com")
+# Every failure raised after `create_tag_and_release` repeats this, because the
+# irreversible steps are already done by then and a re-run is refused.
+RESUME_BY_HAND_HINT = (
+    "The tag and Release are already published -- do not re-run `just release`; "
+    "finish by hand per the justfile RESUME RULES."
+)
 # The release gate is GitHub CI (2026-10-18): free runners, not a cold cargo
 # build on the maintainer's Mac. Actions can take a few seconds to register a
 # push, so look for the run a few times before giving up.
@@ -247,6 +257,32 @@ def validate_release_url(url: str) -> None:
     parsed = urlsplit(url)
     if parsed.scheme != "https" or parsed.hostname != "github.com":
         raise ReleaseError(f"refuse non-GitHub HTTPS release URL: {url!r}")
+
+
+class PinnedRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Re-check scheme and host on every redirect hop.
+
+    `validate_release_url` sees only the URL release.py built; urllib then
+    follows redirects wherever they point, and its default handler permits a
+    hop to plain `http`. So the host check did not constrain who actually
+    served the bytes (adversary, 2026-10-20). The hop cannot simply be
+    refused: GitHub's archive URL does redirect, to codeload.github.com.
+
+    `ReleaseError` is a RuntimeError, so it is not swallowed by
+    `archive_facts`'s `(URLError, OSError)` retry -- a redirect off GitHub is
+    not a transient failure and must not be retried into.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        parsed = urlsplit(newurl)
+        if parsed.scheme != "https" or parsed.hostname not in ARCHIVE_HOSTS:
+            raise ReleaseError(f"refuse redirect off GitHub HTTPS: {newurl!r}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+# One `urlopen` in this module, and every URL it is given is a GitHub release
+# or archive URL, so pinning the global opener is unambiguous here.
+urllib.request.install_opener(urllib.request.build_opener(PinnedRedirectHandler))
 
 
 def parent_slug(repo: dict) -> str | None:
@@ -489,7 +525,10 @@ def rewrite_formula(path: Path, release: Release, sha256: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
-_ARCHIVE_DIGESTS: dict[str, str] = {}
+# (digest, commit) per archive URL. One download fills both: hashing one body
+# and reading the commit out of another meant the number pinned into the
+# formula was never the body whose commit was checked (adversary, 2026-10-20).
+_ARCHIVE_FACTS: dict[str, tuple[str, str | None]] = {}
 
 
 def archive_commit(path: Path) -> str | None:
@@ -499,6 +538,11 @@ def archive_commit(path: Path) -> str | None:
     which is exactly what CI's `git get-tar-commit-id` reads
     (`sudo-release.yml`). Reading it with `tarfile` keeps the check in process:
     no gzip pipe, no temp tar, nothing that needs a shell.
+
+    The record is data *inside* the archive, so anyone who can produce the
+    bytes can choose it. This identifies which archive GitHub generated; it is
+    not evidence about the tree, and nothing here should be read as a defence
+    against a forged archive.
     """
     try:
         with tarfile.open(path, mode="r:gz") as archive:
@@ -510,62 +554,21 @@ def archive_commit(path: Path) -> str | None:
     return None
 
 
-def require_archive_matches_tag(release: Release, *, dry_run: bool) -> None:
-    """Bind the published archive's bytes to the local tag commit.
+def archive_facts(release: Release, *, dry_run: bool) -> tuple[str, str | None]:
+    """The tag archive's sha256 and embedded commit id, from one download.
 
-    GitHub serves an archive by tag *name*, and until now nothing local tied
-    those bytes to the commit the tag points at: the binding existed only in
-    CI, and only transitively, through a `source.sha256` that carried no
-    attestation. Doing CI's check here makes the digest the formula pins
-    provably the tag's tree without trusting CI at all (adversary N6c,
-    2026-10-20).
-    """
-    if dry_run:
-        log(f"[dry-run] bind {release.archive_url} to {release.tag}")
-        return
-    expected = output(["git", "rev-parse", f"{release.tag}^{{commit}}"])
-    _require(
-        COMMIT_RE.fullmatch(expected) is not None,
-        f"cannot resolve {release.tag} to a local commit, so the archive "
-        f"cannot be bound to it: got {expected!r}",
-    )
-    validate_release_url(release.archive_url)
-    request = urllib.request.Request(
-        release.archive_url, headers={"User-Agent": "sudo-secretspec-release"}
-    )
-    with tempfile.NamedTemporaryFile(suffix=".tar.gz") as body:
-        with urllib.request.urlopen(request, timeout=60) as response:
-            shutil.copyfileobj(response, body)
-        body.flush()
-        found = archive_commit(Path(body.name))
-    _require(
-        found is not None,
-        f"{release.archive_url} carries no commit id in its tar header, so it "
-        "is not an archive GitHub generated for this tag",
-    )
-    _require(
-        found == expected,
-        f"{release.archive_url} is commit {found}, but {release.tag} is "
-        f"{expected}: the archive is not the tag's tree",
-    )
-    log(f"archive of {release.tag} is commit {found}")
-
-
-def archive_sha256(release: Release, *, dry_run: bool) -> str:
-    """The sha256 of the tag's source archive, downloaded at most once.
-
-    Memoised per URL because the digest compared with CI's `source.sha256`
-    has to be the digest written into the formula. Hashing twice pinned a
-    number from a later, separate download that nothing had validated, and
-    GitHub's generated archives are not contractually byte-stable -- the
+    Memoised per URL, because the digest compared with CI's `source.sha256`
+    has to be the digest written into the formula, and the commit checked has
+    to belong to those same bytes. Each extra download was a window of its
+    own: GitHub's generated archives are not contractually byte-stable -- the
     2023 gzip change moved every one of them (adversary N6b, 2026-10-20).
     The module is re-executed per test, so the memo is per process.
     """
     validate_release_url(release.archive_url)
     if dry_run:
-        log(f"[dry-run] hash {release.archive_url}")
-        return "0" * 64
-    cached = _ARCHIVE_DIGESTS.get(release.archive_url)
+        log(f"[dry-run] fetch {release.archive_url}")
+        return "0" * 64, None
+    cached = _ARCHIVE_FACTS.get(release.archive_url)
     if cached is not None:
         return cached
     request = urllib.request.Request(
@@ -579,12 +582,15 @@ def archive_sha256(release: Release, *, dry_run: bool) -> str:
         # body and the retry together.
         digest = hashlib.sha256()
         try:
-            with urllib.request.urlopen(request, timeout=60) as response:
-                while chunk := response.read(1024 * 1024):
-                    digest.update(chunk)
-            hexdigest = digest.hexdigest()
-            _ARCHIVE_DIGESTS[release.archive_url] = hexdigest
-            return hexdigest
+            with tempfile.NamedTemporaryFile(suffix=".tar.gz") as body:
+                with urllib.request.urlopen(request, timeout=60) as response:
+                    while chunk := response.read(1024 * 1024):
+                        digest.update(chunk)
+                        body.write(chunk)
+                body.flush()
+                facts = (digest.hexdigest(), archive_commit(Path(body.name)))
+            _ARCHIVE_FACTS[release.archive_url] = facts
+            return facts
         except (urllib.error.URLError, OSError) as error:
             last_error = error
             if attempt == ARCHIVE_ATTEMPTS:
@@ -597,9 +603,52 @@ def archive_sha256(release: Release, *, dry_run: bool) -> str:
             delay *= 2
     raise ReleaseError(
         f"could not fetch {release.archive_url} after {ARCHIVE_ATTEMPTS} attempts: "
-        f"{last_error}. The tag and Release are already published -- do not re-run "
-        "`just release`; finish by hand per the justfile RESUME RULES."
+        f"{last_error}. {RESUME_BY_HAND_HINT}"
     )
+
+
+def require_archive_matches_tag(release: Release, *, dry_run: bool) -> None:
+    """Check the published archive is the one GitHub generated for this tag.
+
+    GitHub serves an archive by tag *name*, and until now nothing local tied
+    those bytes to the commit the tag points at: the binding existed only in
+    CI, and only transitively, through a `source.sha256` that carried no
+    attestation. Doing CI's own check here catches the accidents that binding
+    was there to catch -- a stale tag, a regenerated archive of a different
+    tree, an archive fetched for the wrong ref.
+
+    It is an accident check, not an integrity check: the commit id lives in
+    the archive's pax header, so anyone who can serve the archive can also
+    choose what it says (adversary, 2026-10-20). What makes it worth running
+    is that it reads the *same bytes* `archive_facts` hashed, so the digest
+    pinned into the formula and the commit checked cannot disagree.
+    """
+    if dry_run:
+        log(f"[dry-run] bind {release.archive_url} to {release.tag}")
+        return
+    expected = output(["git", "rev-parse", f"{release.tag}^{{commit}}"])
+    _require(
+        COMMIT_RE.fullmatch(expected) is not None,
+        f"cannot resolve {release.tag} to a local commit, so the archive "
+        f"cannot be checked against it: got {expected!r}. {RESUME_BY_HAND_HINT}",
+    )
+    found = archive_facts(release, dry_run=dry_run)[1]
+    _require(
+        found is not None,
+        f"{release.archive_url} carries no commit id in its tar header, so it "
+        f"is not an archive GitHub generated for this tag. {RESUME_BY_HAND_HINT}",
+    )
+    _require(
+        found == expected,
+        f"{release.archive_url} is commit {found}, but {release.tag} is "
+        f"{expected}: the archive is not the tag's tree. {RESUME_BY_HAND_HINT}",
+    )
+    log(f"archive of {release.tag} is commit {found}")
+
+
+def archive_sha256(release: Release, *, dry_run: bool) -> str:
+    """The sha256 of the tag's source archive, downloaded at most once."""
+    return archive_facts(release, dry_run=dry_run)[0]
 
 
 def create_tag_and_release(
@@ -933,11 +982,18 @@ def fetch_bottle(release: Release, dest: Path, *, dry_run: bool) -> list[Path]:
             source.is_file(), f"artifact {BOTTLE_ARTIFACT} lacks {SOURCE_SHA_FILE}"
         )
         # Attested like the tarball and the JSON. It used to be the only input
-        # trusted here with no provenance at all, written to disk by the same
-        # job that runs every build.rs and proc-macro in Cargo.lock, so that
-        # code could forge the digest this comparison rests on (adversary N6a,
-        # 2026-10-20). The workflow now also signs it and derives it from a
-        # step output recorded before the build runs.
+        # trusted here with no provenance at all (adversary N6a, 2026-10-20);
+        # the workflow now signs it and writes it from a step output recorded
+        # before `brew install --build-bottle` runs, which stops the obvious
+        # attack of a build.rs overwriting the file the next step copies.
+        #
+        # What an attestation proves is "this workflow produced these bytes",
+        # never "these bytes predate the third-party code". The bottle job's
+        # filesystem stays writable between the build step and the attest
+        # step, so a process the build left behind could still rewrite this
+        # file and have it signed. Splitting the digest into a job that runs
+        # no cargo and no brew is the only fix; that is F3.1, which the
+        # operator accepted by design (2026-10-20).
         verify_attestation(source, source_ref=ref, source_digest=sha)
         _require(
             source.read_text(encoding="utf-8").strip()

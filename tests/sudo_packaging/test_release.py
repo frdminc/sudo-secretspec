@@ -10,6 +10,7 @@ import re
 import subprocess
 import sys
 import tarfile
+import urllib.error
 from pathlib import Path
 
 import pytest
@@ -767,76 +768,139 @@ def test_archive_commit_reads_the_commit_github_embeds(release, tmp_path):
     assert release.archive_commit(tmp_path / "junk.tar.gz") is None
 
 
+class _ByteResponse(io.BytesIO):
+    """A urlopen stand-in: a context manager over a fixed body."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_a):
+        return False
+
+
 def _fake_archive_download(monkeypatch, release, body: bytes):
-    class Response(io.BytesIO):
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_a):
-            return False
-
     monkeypatch.setattr(
-        release.urllib.request, "urlopen", lambda *_a, **_k: Response(body)
+        release.urllib.request, "urlopen", lambda *_a, **_k: _ByteResponse(body)
     )
 
 
 def test_the_archive_must_be_the_tag_commits_tree(monkeypatch, release, cut, tmp_path):
-    """N6c: nothing local used to bind the archive bytes to the tag commit.
+    """N6c: nothing local used to check the archive bytes against the tag.
 
-    GitHub serves an archive by tag *name*; the binding existed only in CI, and
+    GitHub serves an archive by tag *name*; the check existed only in CI, and
     only transitively, through a source.sha256 that carried no attestation.
     """
     wanted, other = "a" * 40, "b" * 40
     monkeypatch.setattr(release, "output", lambda *_a, **_k: wanted)
 
-    _fake_archive_download(
-        monkeypatch, release, _tag_archive(tmp_path / "ok.tar.gz", wanted).read_bytes()
-    )
-    release.require_archive_matches_tag(cut, dry_run=False)  # the tag's own tree
-
-    _fake_archive_download(
-        monkeypatch, release, _tag_archive(tmp_path / "no.tar.gz", other).read_bytes()
-    )
-    with pytest.raises(release.ReleaseError, match="is not the tag's tree"):
-        release.require_archive_matches_tag(cut, dry_run=False)
-
-    _fake_archive_download(
-        monkeypatch, release, _tag_archive(tmp_path / "bare.tar.gz", None).read_bytes()
-    )
-    with pytest.raises(release.ReleaseError, match="carries no commit id"):
-        release.require_archive_matches_tag(cut, dry_run=False)
+    for body, expected in (
+        (_tag_archive(tmp_path / "ok.tar.gz", wanted), None),
+        (_tag_archive(tmp_path / "no.tar.gz", other), "is not the tag's tree"),
+        (_tag_archive(tmp_path / "bare.tar.gz", None), "carries no commit id"),
+    ):
+        # One release per archive: the facts are memoised per URL, which is the
+        # whole point of the fix, so a second body needs a fresh memo.
+        release._ARCHIVE_FACTS.clear()
+        _fake_archive_download(monkeypatch, release, body.read_bytes())
+        if expected is None:
+            release.require_archive_matches_tag(cut, dry_run=False)
+        else:
+            with pytest.raises(release.ReleaseError, match=expected):
+                release.require_archive_matches_tag(cut, dry_run=False)
 
 
-def test_an_unresolvable_tag_is_refused_rather_than_skipped(monkeypatch, release, cut):
+def test_every_post_tag_archive_failure_names_the_resume_path(
+    monkeypatch, release, cut, tmp_path
+):
+    """These raise after the tag and Release are published, so a bare message
+    leaves the operator with no way out (adversary finding 4, 2026-10-20)."""
+
+    def failure() -> str:
+        with pytest.raises(release.ReleaseError) as caught:
+            release.require_archive_matches_tag(cut, dry_run=False)
+        return str(caught.value)
+
     monkeypatch.setattr(release, "output", lambda *_a, **_k: "")
-    with pytest.raises(release.ReleaseError, match="cannot resolve"):
-        release.require_archive_matches_tag(cut, dry_run=False)
+    messages = [failure()]
+    assert "cannot resolve" in messages[0]
+
+    monkeypatch.setattr(release, "output", lambda *_a, **_k: "a" * 40)
+    for name, commit in (("bare", None), ("other", "b" * 40)):
+        release._ARCHIVE_FACTS.clear()
+        body = _tag_archive(tmp_path / f"{name}.tar.gz", commit).read_bytes()
+        _fake_archive_download(monkeypatch, release, body)
+        messages.append(failure())
+
+    assert len(messages) == 3
+    for text in messages:
+        assert release.RESUME_BY_HAND_HINT in text
 
 
-def test_the_archive_is_hashed_once_so_the_pinned_digest_was_the_checked_one(
+def test_a_dead_archive_url_is_a_release_error_not_a_raw_traceback(
     monkeypatch, release, cut
 ):
-    """N6b: hash #2 was compared with CI, hash #3 was written to the formula."""
+    """`__main__` catches only ReleaseError and CalledProcessError, and an
+    HTTPError is an OSError, so an unretried fetch here printed a traceback
+    after the irreversible steps (adversary finding 4, 2026-10-20)."""
+
+    def urlopen(*_a, **_k):
+        raise urllib.error.HTTPError(cut.archive_url, 404, "Not Found", {}, None)
+
+    monkeypatch.setattr(release.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(release.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(release, "output", lambda *_a, **_k: "a" * 40)
+    with pytest.raises(release.ReleaseError, match="could not fetch"):
+        release.require_archive_matches_tag(cut, dry_run=False)
+
+
+def test_a_redirect_off_github_https_is_refused(release):
+    """`validate_release_url` sees the first URL only, and urllib's default
+    handler will follow a 302 to plain http (adversary finding 1, 2026-10-20).
+    github.com 302s a tag archive to codeload.github.com, so that one hop has
+    to stay allowed."""
+    handler = release.PinnedRedirectHandler()
+
+    def hop(url):
+        return handler.redirect_request(None, None, 302, "Found", {}, url)
+
+    for url in (
+        "http://codeload.github.com/frdminc/sudo-secretspec/tar.gz/refs/tags/v1",
+        "https://codeload.github.com.evil.example/x.tar.gz",
+        "https://raw.githubusercontent.com/x.tar.gz",
+        "file:///etc/passwd",
+    ):
+        with pytest.raises(release.ReleaseError, match="refuse redirect"):
+            hop(url)
+
+    # The real hop: allowed, so it gets past the check and into urllib's own
+    # handler, which is what raises on the stub request object.
+    with pytest.raises(AttributeError):
+        hop("https://codeload.github.com/frdminc/sudo-secretspec/tar.gz/refs/tags/v1")
+
+
+def test_the_archive_is_fetched_once_for_both_the_digest_and_the_commit(
+    monkeypatch, release, cut, tmp_path
+):
+    """N6b: hash #2 was compared with CI, hash #3 was written to the formula --
+    and the first fix added a *third* download for the commit check, so the
+    bytes bound to the tag were not the bytes pinned (adversary finding 2)."""
+    commit = "d" * 40
+    body = _tag_archive(tmp_path / "once.tar.gz", commit).read_bytes()
     downloads = []
 
     def urlopen(*_a, **_k):
         downloads.append(1)
-        body = io.BytesIO(b"archive bytes")
-
-        class Response(io.BytesIO):
-            def __enter__(self):
-                return body
-
-            def __exit__(self, *_a):
-                return False
-
-        return Response(b"")
+        return _ByteResponse(body)
 
     monkeypatch.setattr(release.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(release, "output", lambda *_a, **_k: commit)
+
+    release.require_archive_matches_tag(cut, dry_run=False)
     first = release.archive_sha256(cut, dry_run=False)
     second = release.archive_sha256(cut, dry_run=False)
-    assert first == second
+
     assert len(downloads) == 1
+    assert first == second == hashlib.sha256(body).hexdigest()
 
 
 def test_a_glob_shaped_bottle_file_name_is_refused(release, cut, tmp_path):
