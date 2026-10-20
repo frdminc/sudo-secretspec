@@ -125,6 +125,33 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # A hosted label can be remapped in place -- `macos-latest` moved from
+      # macOS 15 to 26 with no workflow change, which is precisely what made
+      # v0.19.1-sudo.27 unpourable. Assert the image here, in CI, instead of
+      # discovering it at the pour on the operator's Mac, which was the only
+      # detector before 2026-10-20 (adversary F1.4, F1.5). Bump EXPECT_MACOS
+      # deliberately when the Mac that pours these bottles moves.
+      - name: Assert the runner is the GitHub-hosted macOS 27 arm64 image
+        env:
+          EXPECT_MACOS: "27"
+          EXPECT_ARCH: arm64
+        run: |
+          set -euo pipefail
+          # Defence in depth with release.py's `gh attestation verify
+          # --deny-self-hosted-runners`: GitHub resolves an unrecognized
+          # `runs-on` label against self-hosted pools rather than failing it.
+          if [ "${RUNNER_ENVIRONMENT:-}" != "github-hosted" ]; then
+            echo "::error::runner is '${RUNNER_ENVIRONMENT:-unset}', not github-hosted"
+            exit 1
+          fi
+          version="$(sw_vers -productVersion)"
+          major="${version%%.*}"
+          arch="$(uname -m)"
+          echo "runner: macOS $version $arch, image ${ImageOS:-unknown} ${ImageVersion:-}"
+          if [ "$major" != "$EXPECT_MACOS" ] || [ "$arch" != "$EXPECT_ARCH" ]; then
+            echo "::error::expected macOS $EXPECT_MACOS on $EXPECT_ARCH, got $major on $arch: the runs-on label was remapped, so the bottle tag changes and stops pouring"
+            exit 1
+          fi
       # `brew install` refuses a formula that is not in a tap, so build from a
       # throwaway tap of the same name as the real one: the bottle JSON names the
       # formula `frdminc/sudo-secretspec/sudo-secretspec`, and `brew bottle

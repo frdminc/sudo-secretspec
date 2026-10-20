@@ -737,6 +737,40 @@ def test_ci_gate_refuses_a_red_run_and_names_it(monkeypatch, release):
         release.ci_gate(dry_run=False)
 
 
+def test_watch_run_gives_up_on_a_run_that_never_finishes(monkeypatch, release):
+    # `timeout-minutes` in the workflow caps a job's EXECUTION, not the time it
+    # sits queued, and GitHub cancels a job waiting on a label nothing matches
+    # only after about a day. Without this deadline the bottle watch would block
+    # with the tag and Release already public (adversary F1.3, 2026-10-20).
+    seen = {}
+
+    def fake_run(argv, **kwargs):
+        seen["argv"] = argv
+        seen["timeout"] = kwargs.get("timeout")
+        raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
+
+    monkeypatch.setattr(release, "run", fake_run)
+    with pytest.raises(release.ReleaseError, match="queued or stuck"):
+        release.watch_run(5, "the bottle run did not pass")
+    assert seen["argv"][:4] == ["gh", "run", "watch", "5"]
+    assert seen["timeout"] == release.CI_WATCH_SECONDS
+
+
+def test_the_bottle_watch_waits_longer_and_names_its_deadline(monkeypatch, release):
+    # The bottle job's own cap is 90 minutes against the gate jobs' 60, so its
+    # watch has to outlast the gate's or a legitimate build would be cut off.
+    assert release.BOTTLE_WATCH_SECONDS > release.CI_WATCH_SECONDS
+
+    def fake_run(argv, **kwargs):
+        raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
+
+    monkeypatch.setattr(release, "run", fake_run)
+    with pytest.raises(release.ReleaseError, match="after 110 minutes"):
+        release.watch_run(
+            5, "the bottle run did not pass", timeout_s=release.BOTTLE_WATCH_SECONDS
+        )
+
+
 def test_ci_gate_refuses_a_stale_local_ci_base(monkeypatch, release):
     # github-ci-run overlays a local ci/base before origin's, and fetch leaves
     # it where it was, so an old workflow would gate the release.

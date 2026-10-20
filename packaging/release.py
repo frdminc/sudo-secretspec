@@ -86,6 +86,13 @@ ARCHIVE_BACKOFF_SECONDS = 3
 CI_WRAPPER = ROOT / "scripts" / "github-ci-run"
 CI_RUN_LOOKUPS = 12
 CI_RUN_LOOKUP_SECONDS = 5
+# Deadlines for `watch_run`. `timeout-minutes` in the workflow caps a job's
+# EXECUTION; neither it nor `gh run watch` bounds the time a job sits queued,
+# and GitHub cancels a job waiting on a label nothing matches only after about
+# 24 hours. Each value is the job's own limit plus slack for queueing: the CI
+# gate's jobs cap at 60 minutes, the bottle job at 90 (sudo-release.yml).
+CI_WATCH_SECONDS = 75 * 60
+BOTTLE_WATCH_SECONDS = 110 * 60
 # The macOS bottle is built by `sudo-release.yml` on the tag push (2026-10-18),
 # so `brew reinstall` pours it instead of compiling the crate graph on this Mac.
 # The workflow uploads the bottle and its JSON as this artifact on every run.
@@ -174,6 +181,7 @@ def run(
     check: bool = True,
     dry_run: bool = False,
     env: dict[str, str] | None = None,
+    timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
     if dry_run:
         log("[dry-run] " + " ".join(str(value) for value in argv))
@@ -186,6 +194,7 @@ def run(
         capture_output=capture,
         check=check,
         env={**os.environ, **env} if env else None,
+        timeout=timeout,
     )
 
 
@@ -342,15 +351,31 @@ def find_run(branch: str, sha: str, *, workflow: str | None = None) -> int:
     raise ReleaseError(f"no GitHub Actions run appeared for {branch}")
 
 
-def watch_run(run_id: int, failure: str) -> str:
-    """Block until the run finishes; raise `failure` plus its URL unless green."""
+def watch_run(run_id: int, failure: str, *, timeout_s: float = CI_WATCH_SECONDS) -> str:
+    """Block until the run finishes; raise `failure` plus its URL unless green.
+
+    The wait is bounded. A `runs-on` label that matches nothing leaves the job
+    queued rather than failing, and an unbounded watch would then block here
+    for about a day -- for the bottle, *after* the tag and Release are already
+    public, which is the one state release.py refuses to re-enter (2026-10-20:
+    moving the bottle job to `xcode-27` is exactly the kind of edit that can
+    mistype a label).
+    """
     url = f"https://github.com/{FORK_REPO}/actions/runs/{run_id}"
     log(f"CI: {url}")
-    watched = run(
-        ["gh", "run", "watch", str(run_id), "-R", FORK_REPO, "--exit-status"],
-        capture=False,
-        check=False,
-    )
+    try:
+        watched = run(
+            ["gh", "run", "watch", str(run_id), "-R", FORK_REPO, "--exit-status"],
+            capture=False,
+            check=False,
+            timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired:
+        raise ReleaseError(
+            f"{failure}: no verdict after {timeout_s / 60:.0f} minutes, so the "
+            "run is queued or stuck rather than red (a runs-on label that "
+            f"matches no runner looks exactly like this): {url}"
+        ) from None
     _require(watched.returncode == 0, f"{failure}: {url}")
     return url
 
@@ -764,7 +789,11 @@ def fetch_bottle(release: Release, dest: Path, *, dry_run: bool) -> list[Path]:
     sha = output(["git", "rev-parse", f"{release.tag}^{{commit}}"])
     try:
         run_id = find_run(release.tag, sha, workflow=BOTTLE_WORKFLOW)
-        watch_run(run_id, "the bottle run did not pass")
+        watch_run(
+            run_id,
+            "the bottle run did not pass",
+            timeout_s=BOTTLE_WATCH_SECONDS,
+        )
         run(
             ["gh", "run", "download", str(run_id), "-R", FORK_REPO]
             + ["-n", BOTTLE_ARTIFACT, "-D", str(dest)]
