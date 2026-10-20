@@ -206,6 +206,23 @@ Projects can extend other configurations via `extends = ["../shared/common"]`. T
 - Run specific test: `cargo test test_name`
 - Test CI runs on Ubuntu and macOS using devenv
 
+### Python packaging tests (`tests/sudo_packaging/`)
+
+The downstream release driver (`packaging/release.py`) is Python, not Rust, and
+its tests need an interpreter that the bare `python3` on `PATH` may not be:
+
+```bash
+uv run --python 3.13 --with pytest python -m pytest tests/sudo_packaging/ -q
+```
+
+Pin 3.13 because that is what `.github/workflows/sudo-release.yml` pins, and
+because the suite is interpreter-sensitive: `tarfile.extractall(filter=...)`
+does not exist before 3.12, and its *default* changed to `data` in 3.14. On this
+Mac (2026-10-20) `python3` resolves to 3.15 with no pytest installed, and
+`/usr/bin/python3` is Xcode's 3.9.6, which has pytest and reports 9 spurious
+failures in the archive-binding tests. Neither is a regression; both look like
+one.
+
 ### Provider Integration Tests
 
 Provider tests are located in `secretspec/src/provider/tests.rs` and test all provider implementations generically.
