@@ -89,14 +89,31 @@ for the formula. The archive is downloaded and hashed **once** per run and the
 digest memoised: hashing it again for the formula pinned a number from a later,
 separate download that nothing had compared with CI, and GitHub's generated
 archives are not contractually byte-stable. Before the formula is rewritten,
-`require_archive_matches_tag` checks those same bytes against the local tag
-commit by reading the commit id GitHub embeds in the tar's global pax header --
-the same field CI's `git get-tar-commit-id` reads. That is an **accident**
-check, not an integrity one: the record lives inside the archive, so whoever
-produces the bytes chooses it. What it does catch is a stale tag, a
-regenerated archive of a different tree, or a fetch for the wrong ref, and
-because it reads the memoised download it cannot disagree with the digest that
-ships. The artifact must hold exactly one bottle JSON, and `source.sha256` is
+`require_archive_matches_tag` checks those same bytes against the tag two
+ways. First it reads the commit id GitHub embeds in the tar's global pax
+header -- the same field CI's `git get-tar-commit-id` reads. That one is an
+**accident** check, not an integrity one: the record lives inside the archive,
+so whoever produces the bytes chooses it. It is kept because it gives a precise
+diagnosis for the common cases (a stale tag, a regenerated archive of a
+different tree, a fetch for the wrong ref).
+
+Second, and this is the binding: the archive is extracted and its **tree** is
+compared against `git archive` of the tag, built with the same
+`<repo>-<version>/` prefix. Every path, executable bit, symlink target and
+content digest on both sides, and nothing git does not track -- no mtimes, no
+uid/gid, no directories. A forged archive can carry the genuine commit id and
+cannot survive this: verified by building one that adds a hostile `build.rs`
+to the real v0.19.1-sudo.28 archive, which passes the pax check and fails the
+tree check naming `build.rs`. The two sides were also proved to agree on the
+real thing -- GitHub's v0.19.1-sudo.28 archive and `git archive` of its tag
+fingerprint to 601 identical entries, zero differences (adversary 1b,
+2026-10-20).
+
+Extraction uses `filter="data"`, explicitly: this is the one place release.py
+writes untrusted bytes to disk, and on Python 3.13, which `sudo-release.yml`
+pins, the `extractall` default still escapes the destination with only a
+DeprecationWarning. Both checks read the memoised download, so the digest
+pinned into the formula is the digest of the tree that was checked. The artifact must hold exactly one bottle JSON, and `source.sha256` is
 attested like the tarball and the JSON and verified before it is read. Its
 bytes are written from a step output recorded before `brew install
 --build-bottle` runs, so the on-disk file a `build.rs` can reach is no longer

