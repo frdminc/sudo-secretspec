@@ -737,6 +737,69 @@ def test_ci_gate_refuses_a_red_run_and_names_it(monkeypatch, release):
         release.ci_gate(dry_run=False)
 
 
+def _brew_info(linked_keg):
+    return json.dumps({"formulae": [{"linked_keg": linked_keg}]})
+
+
+def test_a_linked_head_keg_is_named_instead_of_blamed_on_the_bottle(
+    monkeypatch, release
+):
+    """The real .23-.28 pour failure: a HEAD keg, not a missing bottle.
+
+    `brew reinstall` reuses the linked keg's spec, so a linked HEAD keg makes
+    `--force-bottle` report "has no bottle" however good the published bottle
+    is -- and the build-from-source hint is actively wrong, because a HEAD
+    build is what is already installed. The guard must refuse before the
+    reinstall and name the unlink/install remedy.
+    """
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        if argv[:3] == ["brew", "info", "--json=v2"]:
+            return completed(argv, _brew_info("HEAD-7c1f700"))
+        return completed(argv)
+
+    monkeypatch.setattr(release, "run", fake_run)
+    with pytest.raises(release.ReleaseError) as excinfo:
+        release.brew_install_and_test(build_from_source=False, dry_run=False)
+    message = str(excinfo.value)
+    assert "HEAD-7c1f700" in message
+    assert "brew unlink" in message and "--force-bottle" in message
+    assert "link --overwrite" in message
+    assert "--build-from-source" not in message
+    assert not any(argv[:2] == ["brew", "reinstall"] for argv in calls)
+
+
+def test_a_stable_linked_keg_still_pours(monkeypatch, release):
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        if argv[:3] == ["brew", "info", "--json=v2"]:
+            return completed(argv, _brew_info("0.19.1-sudo.28"))
+        if argv[:2] == ["brew", "--prefix"]:
+            return completed(argv, "/opt/homebrew/opt/sudo-secretspec\n")
+        return completed(argv)
+
+    monkeypatch.setattr(release, "run", fake_run)
+    prefix = release.brew_install_and_test(build_from_source=False, dry_run=False)
+    assert prefix == "/opt/homebrew/opt/sudo-secretspec"
+    assert ["brew", "reinstall", "--force-bottle", release.FORMULA_NAME] in calls
+
+
+def test_unreadable_brew_info_never_fails_the_release(monkeypatch, release):
+    """The guard only ever improves a message; it must not become a new way to fail."""
+
+    def fake_run(argv, **kwargs):
+        if argv[:3] == ["brew", "info", "--json=v2"]:
+            return completed(argv, "not json at all")
+        return completed(argv)
+
+    monkeypatch.setattr(release, "run", fake_run)
+    assert release.linked_head_keg(dry_run=False) is None
+
+
 def test_watch_run_gives_up_on_a_run_that_never_finishes(monkeypatch, release):
     # `timeout-minutes` in the workflow caps a job's EXECUTION, not the time it
     # sits queued, and GitHub cancels a job waiting on a label nothing matches

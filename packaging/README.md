@@ -97,6 +97,18 @@ quiet local compile: `--build-from-source`
 on an older macOS of the same architecture, so the runner's bottle installs on
 newer macOS releases.
 
+Before the reinstall it checks for a linked HEAD keg (`linked_head_keg`) and
+refuses with its own hint if it finds one. `brew reinstall` reuses the spec of
+the keg that is linked, so a linked HEAD keg makes `--force-bottle` report
+"has no bottle" however good the published bottle is, and the
+build-from-source fallback is the wrong advice for it: a HEAD build is exactly
+what is already installed. The remedy the hint names is
+`brew unlink ... && brew install --force-bottle ...`, revertible with
+`brew link --overwrite <head keg>`. This is what kept 0.19.1-sudo.23 through
+.28 from pouring on djbclark's Mac (found 2026-10-20, with HEAD-7c1f700
+linked); unreadable `brew info` output counts as "not a HEAD keg", so the
+check can only ever improve a message, never fail a release.
+
 ## Homebrew safety boundary
 
 The formula runs `cargo install` twice — once for the upstream `secretspec`

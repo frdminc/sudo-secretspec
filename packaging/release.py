@@ -132,6 +132,18 @@ BOTTLE_FALLBACK_HINT = (
     f"--build-from-source {FORMULA_NAME}` (what `release.py --build-from-source` "
     "runs); that compiles the whole crate graph locally."
 )
+# A HEAD keg is a different failure with a different remedy, so it gets its
+# own hint: compiling the crate graph would not help, because `brew reinstall`
+# would still resolve the HEAD spec, which by definition carries no bottle.
+HEAD_KEG_HINT = (
+    "A HEAD keg is linked ({keg}), and `brew reinstall` reuses the spec of the "
+    "linked keg, so it resolves HEAD -- which has no bottle at any version. The "
+    "bottle this release published is fine; the install is what cannot take it. "
+    f"To move this Mac onto the stable spec: `brew unlink {FORMULA_NAME} && brew "
+    f"install --force-bottle {FORMULA_NAME}`; to go back, `brew link --overwrite "
+    "{keg}`. Upgrading the privileged boundary is a separate, explicit step "
+    "(see the formula's caveats)."
+)
 
 
 class ReleaseError(RuntimeError):
@@ -968,10 +980,42 @@ def install_from_source(*, dry_run: bool) -> None:
     )
 
 
+def linked_head_keg(*, dry_run: bool) -> str | None:
+    """The linked keg's name when it is a HEAD keg, else None.
+
+    `brew reinstall` reuses the spec of the keg that is linked. A HEAD keg
+    therefore makes `--force-bottle` fail with "has no bottle" however good
+    the published bottle is, and the build-from-source hint is wrong for it:
+    a HEAD build is exactly what is already installed. Unreadable or absent
+    `brew info` output means "not a HEAD keg": this check only ever turns one
+    confusing message into a precise one, so it must never be the thing that
+    fails a release.
+    """
+    if dry_run:
+        return None
+    try:
+        info = json.loads(
+            output(
+                ["brew", "info", "--json=v2", FORMULA_NAME],
+                env=BREW_ENV,
+                check=False,
+            )
+            or "{}"
+        )
+        linked = (info.get("formulae") or [{}])[0].get("linked_keg")
+    except (json.JSONDecodeError, OSError, AttributeError, IndexError, TypeError):
+        return None
+    if isinstance(linked, str) and linked.upper().startswith("HEAD"):
+        return linked
+    return None
+
+
 def brew_install_and_test(*, build_from_source: bool, dry_run: bool) -> str:
     if build_from_source:
         install_from_source(dry_run=dry_run)
     else:
+        head_keg = linked_head_keg(dry_run=dry_run)
+        _require(head_keg is None, HEAD_KEG_HINT.format(keg=head_keg))
         # --force-bottle makes brew refuse rather than quietly compile when it
         # finds no bottle it can pour; the cause is named, not hidden.
         result = run(
