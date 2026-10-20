@@ -92,7 +92,19 @@ jobs:
   # into the tap formula.
   bottle:
     if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
-    runs-on: macos-latest
+    # xcode-27, not macos-latest: on 2026-10-20 the first live pour of the
+    # v0.19.1-sudo.27 bottle failed because macos-latest is still macOS 26, so
+    # the bottle was tagged arm64_tahoe while the target Mac runs macOS 27.0.1
+    # (arm64_golden_gate) and Homebrew refused it with "`--force-bottle` passed
+    # but ... has no bottle!". The xcode-27 image (GitHub-hosted, macOS 27,
+    # arm64) went generally available 2026-10-15: GitHub changelog
+    # "Xcode 27 runner image generally available" (2026-10-15) and
+    # actions/runner-images#14404, which documents `runs-on: xcode-27`.
+    # Label probed 2026-10-20 by a workflow_dispatch run of this workflow
+    # before any release relied on it (adversary F1.3: an unmatched label
+    # leaves the job queued for ~24h *after* the tag and Release are public,
+    # because watch_run has no deadline).
+    runs-on: xcode-27
     timeout-minutes: 90
     # id-token and attestations sign the build provenance below; neither one
     # grants write access to the repository, its releases or its tags.
