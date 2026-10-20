@@ -276,13 +276,20 @@ class PinnedRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         parsed = urlsplit(newurl)
         if parsed.scheme != "https" or parsed.hostname not in ARCHIVE_HOSTS:
-            raise ReleaseError(f"refuse redirect off GitHub HTTPS: {newurl!r}")
+            raise ReleaseError(
+                f"refuse redirect off GitHub HTTPS: {newurl!r}. {RESUME_BY_HAND_HINT}"
+            )
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-# One `urlopen` in this module, and every URL it is given is a GitHub release
-# or archive URL, so pinning the global opener is unambiguous here.
-urllib.request.install_opener(urllib.request.build_opener(PinnedRedirectHandler))
+# Private, not `install_opener`: the global opener is process state, and
+# `sudo-release.yml` imports this module inside the bottle job, which has no
+# business having its redirect policy changed by importing a formula rewriter.
+# Keeping it here also gives the test something to assert the fetch goes
+# through (adversary, 2026-10-20). `build_opener` replaces the default
+# `HTTPRedirectHandler` rather than stacking beside it, which is what the pin
+# depends on.
+_OPENER = urllib.request.build_opener(PinnedRedirectHandler)
 
 
 def parent_slug(repo: dict) -> str | None:
@@ -583,10 +590,23 @@ def archive_facts(release: Release, *, dry_run: bool) -> tuple[str, str | None]:
         digest = hashlib.sha256()
         try:
             with tempfile.NamedTemporaryFile(suffix=".tar.gz") as body:
-                with urllib.request.urlopen(request, timeout=60) as response:
+                written = 0
+                with _OPENER.open(request, timeout=60) as response:
                     while chunk := response.read(1024 * 1024):
                         digest.update(chunk)
                         body.write(chunk)
+                        written += len(chunk)
+                    declared = response.headers.get("Content-Length")
+                # `http.client` does not raise on a body shorter than its
+                # Content-Length: `read` returns b"" and closes. Without this
+                # the attempt looks complete, the memo takes the digest of the
+                # truncated bytes, and the tar carries no pax header -- so a
+                # transient cut surfaced as the permanent-sounding "not an
+                # archive GitHub generated for this tag" and burned the
+                # release into finish-by-hand instead of retrying (adversary,
+                # 2026-10-20). An OSError is what the loop below retries.
+                if declared is not None and written != int(declared):
+                    raise OSError(f"truncated download: {written} of {declared} bytes")
                 body.flush()
                 facts = (digest.hexdigest(), archive_commit(Path(body.name)))
             _ARCHIVE_FACTS[release.archive_url] = facts
@@ -608,7 +628,7 @@ def archive_facts(release: Release, *, dry_run: bool) -> tuple[str, str | None]:
 
 
 def require_archive_matches_tag(release: Release, *, dry_run: bool) -> None:
-    """Check the published archive is the one GitHub generated for this tag.
+    """Check the archive's own commit record against the local tag commit.
 
     GitHub serves an archive by tag *name*, and until now nothing local tied
     those bytes to the commit the tag points at: the binding existed only in
@@ -626,7 +646,18 @@ def require_archive_matches_tag(release: Release, *, dry_run: bool) -> None:
     if dry_run:
         log(f"[dry-run] bind {release.archive_url} to {release.tag}")
         return
-    expected = output(["git", "rev-parse", f"{release.tag}^{{commit}}"])
+    # `output` runs with check=True and `git rev-parse` exits 128 on an
+    # unknown tag, so the real failure here is a CalledProcessError, not the
+    # guard below -- which made the guard reachable only under a monkeypatch
+    # (adversary, 2026-10-20). Both now carry the resume path.
+    try:
+        expected = output(["git", "rev-parse", f"{release.tag}^{{commit}}"])
+    except subprocess.CalledProcessError as error:
+        raise ReleaseError(
+            f"cannot resolve {release.tag} to a local commit, so the archive "
+            f"cannot be checked against it: {describe(error)}. "
+            f"{RESUME_BY_HAND_HINT}"
+        ) from error
     _require(
         COMMIT_RE.fullmatch(expected) is not None,
         f"cannot resolve {release.tag} to a local commit, so the archive "

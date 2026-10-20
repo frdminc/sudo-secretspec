@@ -176,9 +176,13 @@ jobs:
           url="https://github.com/$GITHUB_REPOSITORY/archive/refs/tags/$tag.tar.gz"
           curl -fsSL --retry 5 --retry-all-errors -o "$RUNNER_TEMP/src.tar.gz" "$url"
           if [ "$GITHUB_REF_TYPE" = tag ]; then
-            # The archive is fetched by tag name, so bind its bytes to the commit
-            # this run was triggered for: GitHub embeds the commit id in every
-            # archive it generates. A temp file, not a pipe: with pipefail the
+            # The archive is fetched by tag name, so check its own commit
+            # record against the commit this run was triggered for: GitHub
+            # embeds the id in every archive it generates. An accident check,
+            # not an integrity one -- the record is inside the archive, so
+            # whoever produces the bytes chooses it (same wording as
+            # `archive_commit`'s docstring; adversary, 2026-10-20).
+            # A temp file, not a pipe: with pipefail the
             # early exit of get-tar-commit-id would fail a pipe on SIGPIPE.
             gzip -dc "$RUNNER_TEMP/src.tar.gz" > "$RUNNER_TEMP/src.tar"
             commit="$(git get-tar-commit-id < "$RUNNER_TEMP/src.tar")"

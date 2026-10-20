@@ -558,8 +558,11 @@ def test_interruption_cleanup_never_deletes_pushed_tag(monkeypatch, release, cut
 class FakeResponse:
     """Minimal stand-in for the object `urlopen` returns as a context manager."""
 
-    def __init__(self, payload: bytes):
+    def __init__(self, payload: bytes, headers: dict | None = None):
         self._payload = payload
+        # Real responses always carry one; an empty mapping means "undeclared",
+        # which is the branch that skips the short-body check.
+        self.headers = headers or {}
 
     def __enter__(self):
         return self
@@ -589,7 +592,7 @@ def test_the_archive_fetch_survives_a_tarball_that_is_not_ready_yet(
             raise release.urllib.error.URLError("not found")
         return FakeResponse(b"tarball")
 
-    monkeypatch.setattr(release.urllib.request, "urlopen", flaky)
+    monkeypatch.setattr(release._OPENER, "open", flaky)
     monkeypatch.setattr(release.time, "sleep", slept.append)
 
     assert (
@@ -608,8 +611,8 @@ def test_a_tarball_that_never_appears_names_the_by_hand_resume_path(
     monkeypatch, release, cut
 ):
     monkeypatch.setattr(
-        release.urllib.request,
-        "urlopen",
+        release._OPENER,
+        "open",
         lambda *_a, **_k: (_ for _ in ()).throw(release.urllib.error.URLError("gone")),
     )
     monkeypatch.setattr(release.time, "sleep", lambda _s: None)
@@ -639,9 +642,7 @@ def test_a_partial_download_does_not_poison_the_retry(monkeypatch, release, cut)
             raise OSError("connection reset")
 
     responses = [HalfThenFail(), FakeResponse(b"tarball")]
-    monkeypatch.setattr(
-        release.urllib.request, "urlopen", lambda *_a, **_k: responses.pop(0)
-    )
+    monkeypatch.setattr(release._OPENER, "open", lambda *_a, **_k: responses.pop(0))
     monkeypatch.setattr(release.time, "sleep", lambda _s: None)
 
     assert (
@@ -769,7 +770,13 @@ def test_archive_commit_reads_the_commit_github_embeds(release, tmp_path):
 
 
 class _ByteResponse(io.BytesIO):
-    """A urlopen stand-in: a context manager over a fixed body."""
+    """An opener stand-in: a context manager over a fixed body."""
+
+    def __init__(self, body: bytes, headers: dict | None = None):
+        super().__init__(body)
+        self.headers = (
+            {"Content-Length": str(len(body))} if headers is None else headers
+        )
 
     def __enter__(self):
         return self
@@ -779,9 +786,7 @@ class _ByteResponse(io.BytesIO):
 
 
 def _fake_archive_download(monkeypatch, release, body: bytes):
-    monkeypatch.setattr(
-        release.urllib.request, "urlopen", lambda *_a, **_k: _ByteResponse(body)
-    )
+    monkeypatch.setattr(release._OPENER, "open", lambda *_a, **_k: _ByteResponse(body))
 
 
 def test_the_archive_must_be_the_tag_commits_tree(monkeypatch, release, cut, tmp_path):
@@ -843,10 +848,10 @@ def test_a_dead_archive_url_is_a_release_error_not_a_raw_traceback(
     HTTPError is an OSError, so an unretried fetch here printed a traceback
     after the irreversible steps (adversary finding 4, 2026-10-20)."""
 
-    def urlopen(*_a, **_k):
+    def opener(*_a, **_k):
         raise urllib.error.HTTPError(cut.archive_url, 404, "Not Found", {}, None)
 
-    monkeypatch.setattr(release.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(release._OPENER, "open", opener)
     monkeypatch.setattr(release.time, "sleep", lambda _s: None)
     monkeypatch.setattr(release, "output", lambda *_a, **_k: "a" * 40)
     with pytest.raises(release.ReleaseError, match="could not fetch"):
@@ -868,14 +873,109 @@ def test_a_redirect_off_github_https_is_refused(release):
         "https://codeload.github.com.evil.example/x.tar.gz",
         "https://raw.githubusercontent.com/x.tar.gz",
         "file:///etc/passwd",
+        # urllib `urljoin`s a relative Location against the request URL before
+        # calling us, so the handler only ever sees absolute URLs -- this is
+        # what that resolution looks like when it lands off-host.
+        "http://127.0.0.1:9/final",
+        # `urlsplit` strips userinfo from .hostname, so the host actually
+        # contacted is the one checked.
+        "https://github.com@127.0.0.1:9/final",
+        # `https:///x` has no host at all; `hostname` is None.
+        "https:///final",
     ):
         with pytest.raises(release.ReleaseError, match="refuse redirect"):
             hop(url)
+
+    # The refusal is raised after the tag and Release are published, and is
+    # deliberately not retried, so it has to name the way out.
+    with pytest.raises(release.ReleaseError) as caught:
+        hop("http://evil.example/x.tar.gz")
+    assert release.RESUME_BY_HAND_HINT in str(caught.value)
 
     # The real hop: allowed, so it gets past the check and into urllib's own
     # handler, which is what raises on the stub request object.
     with pytest.raises(AttributeError):
         hop("https://codeload.github.com/frdminc/sudo-secretspec/tar.gz/refs/tags/v1")
+
+
+def test_the_archive_fetch_goes_through_the_pinned_opener(release):
+    """The pin is one line of wiring, and deleting it used to leave every test
+    green with the protection gone (adversary, 2026-10-20). It is module-private
+    rather than `install_opener` so importing the formula rewriter in CI does
+    not change that process's redirect policy."""
+    assert any(
+        isinstance(handler, release.PinnedRedirectHandler)
+        for handler in release._OPENER.handlers
+    )
+    # `build_opener` must *replace* the default handler, not stack beside it.
+    redirect_handlers = [
+        type(h).__name__
+        for h in release._OPENER.handlers
+        if isinstance(h, release.urllib.request.HTTPRedirectHandler)
+    ]
+    assert redirect_handlers == ["PinnedRedirectHandler"]
+    # And it is not the process-global opener: nothing else in this process
+    # should acquire a GitHub-only redirect policy by importing release.py.
+    installed = getattr(release.urllib.request, "_opener", None)
+    assert installed is None or not any(
+        isinstance(h, release.PinnedRedirectHandler) for h in installed.handlers
+    )
+
+
+def test_a_truncated_download_is_retried_not_misdiagnosed(
+    monkeypatch, release, cut, tmp_path
+):
+    """`http.client` does not raise on a body shorter than its Content-Length:
+    `read` returns b"" and closes. The attempt looked complete, so the memo
+    took the digest of the truncated bytes and the missing pax header surfaced
+    as the permanent-sounding "not an archive GitHub generated for this tag"
+    (adversary, 2026-10-20)."""
+    commit = "e" * 40
+    body = _tag_archive(tmp_path / "full.tar.gz", commit).read_bytes()
+    responses = [
+        # Claims the full length, delivers half: a cut transfer.
+        _ByteResponse(body[: len(body) // 2], {"Content-Length": str(len(body))}),
+        _ByteResponse(body),
+    ]
+    monkeypatch.setattr(release._OPENER, "open", lambda *_a, **_k: responses.pop(0))
+    monkeypatch.setattr(release.time, "sleep", lambda _s: None)
+
+    digest, found = release.archive_facts(cut, dry_run=False)
+    assert responses == []  # the short body was retried, not accepted
+    assert found == commit
+    assert digest == hashlib.sha256(body).hexdigest()
+
+
+def test_an_undeclared_content_length_still_fetches(monkeypatch, release, cut):
+    """Chunked responses carry no Content-Length, so the check has to skip."""
+    monkeypatch.setattr(
+        release._OPENER, "open", lambda *_a, **_k: _ByteResponse(b"body", {})
+    )
+    assert (
+        release.archive_sha256(cut, dry_run=False)
+        == hashlib.sha256(b"body").hexdigest()
+    )
+
+
+def test_an_unknown_tag_is_a_release_error_not_a_called_process_error(
+    monkeypatch, release, cut
+):
+    """`output` runs with check=True and `git rev-parse` exits 128, so the real
+    failure was a CalledProcessError and the COMMIT_RE guard was reachable only
+    under a monkeypatch (adversary, 2026-10-20)."""
+
+    def boom(*_a, **_k):
+        raise subprocess.CalledProcessError(
+            128, ["git", "rev-parse"], output="", stderr="fatal: ambiguous argument"
+        )
+
+    monkeypatch.setattr(release, "output", boom)
+    with pytest.raises(release.ReleaseError) as caught:
+        release.require_archive_matches_tag(cut, dry_run=False)
+    message = str(caught.value)
+    assert "cannot resolve" in message
+    assert "fatal: ambiguous argument" in message
+    assert release.RESUME_BY_HAND_HINT in message
 
 
 def test_the_archive_is_fetched_once_for_both_the_digest_and_the_commit(
@@ -888,11 +988,11 @@ def test_the_archive_is_fetched_once_for_both_the_digest_and_the_commit(
     body = _tag_archive(tmp_path / "once.tar.gz", commit).read_bytes()
     downloads = []
 
-    def urlopen(*_a, **_k):
+    def opener(*_a, **_k):
         downloads.append(1)
         return _ByteResponse(body)
 
-    monkeypatch.setattr(release.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(release._OPENER, "open", opener)
     monkeypatch.setattr(release, "output", lambda *_a, **_k: commit)
 
     release.require_archive_matches_tag(cut, dry_run=False)
