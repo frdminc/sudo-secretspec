@@ -2255,10 +2255,37 @@ def test_any_post_publication_failure_names_the_resume_path(
     everything nobody enumerated (adversary F3, 2026-10-23).
     """
 
+    # Fully published: tag pushed AND the Release created, which is what
+    # RESUME_BY_HAND_HINT claims. The tag-pushed-only case is its own test.
+    _published(monkeypatch, release)
+
+    def boom(**_kwargs):
+        raise error
+
+    monkeypatch.setattr(release, "brew_install_and_test", boom)
+    with pytest.raises(release.ReleaseError) as caught:
+        release.main(["--version", cut.version, "--skip-tests"])
+    message = str(caught.value)
+    assert release.RESUME_BY_HAND_HINT in message
+    assert str(error) in message
+    # The type, too: __main__ turns this into a string-valued SystemExit,
+    # which CPython prints with no traceback and no type name, so the message
+    # is all the operator gets (adversary F2, 2026-10-23).
+    assert type(error).__name__ in message, message
+
+
+def _published(monkeypatch, release, *, release_created=True):
+    """Stub everything up to the post-publication path, leaving the release
+    "published" exactly as far as the caller asks.
+
+    `tag_pushed` and `release_created` are set separately because
+    `create_tag_and_release` sets them at different moments -- the push, then
+    `gh release create` -- and the resume hint has to tell the two apart.
+    """
+
     def publish(_release, _notes, state, **_kwargs):
-        # The one fact this test needs: the tag is pushed, so nothing after it
-        # may tell the operator to re-run.
         state.tag_pushed = True
+        state.release_created = release_created
 
     monkeypatch.setattr(release, "preflight", lambda _release, **kwargs: None)
     monkeypatch.setattr(release, "run", lambda argv, **kwargs: completed(argv))
@@ -2269,14 +2296,192 @@ def test_any_post_publication_failure_names_the_resume_path(
     monkeypatch.setattr(release, "merge_bottle", lambda *a, **k: None)
     monkeypatch.setattr(release, "brew_refresh", lambda *a, **k: Path("/tap"))
 
+
+def test_each_self_sufficient_marker_appears_in_the_hint_it_stands_for(release):
+    """`SELF_SUFFICIENT_HINT_MARKERS` holds fragments rather than the hint
+    constants, because HEAD_KEG_HINT is used through `.format(keg=...)` and so
+    is never a substring of the message it produces.
+
+    A fragment that stops matching its hint would silently re-open F1 -- the
+    handler would append a second "already published" claim again -- so the
+    coupling is asserted here rather than assumed.
+    """
+    hints = (
+        release.RESUME_BY_HAND_HINT,
+        release.BOTTLE_FALLBACK_HINT,
+        release.HEAD_KEG_HINT.format(keg="sudo-secretspec/HEAD-7c1f700"),
+    )
+    assert len(release.SELF_SUFFICIENT_HINT_MARKERS) == len(hints)
+    for marker, hint in zip(release.SELF_SUFFICIENT_HINT_MARKERS, hints):
+        assert marker in hint, marker
+    # And the tag-only wording is covered by the first marker, since it ends
+    # with the same sentence.
+    assert release.SELF_SUFFICIENT_HINT_MARKERS[0] in release.RESUME_TAG_ONLY_HINT
+
+
+@pytest.mark.parametrize(
+    ("hint_name", "already_published_count"),
+    [("BOTTLE_FALLBACK_HINT", 1), ("HEAD_KEG_HINT", 0)],
+    ids=["bottle_fallback", "head_keg"],
+)
+def test_a_failure_that_already_names_its_remedy_is_not_given_a_second_one(
+    monkeypatch, release, cut, hint_name, already_published_count
+):
+    """Every hint in `SELF_SUFFICIENT_HINT_MARKERS` already says the release is
+    published and names the one route out of its own failure. Appending the
+    generic hint on top states the claim twice, joined by "..", with two
+    conflicting recipes: `brew reinstall --build-from-source` from the bottle
+    hint against the justfile's "pour the bottle", which is the step that just
+    failed (adversary F1, 2026-10-23).
+
+    The expected count is per-hint rather than a flat 1: BOTTLE_FALLBACK_HINT
+    uses the phrase "already published" once, HEAD_KEG_HINT not at all (it says
+    "The bottle this release published is fine"). Both numbers go UP by one the
+    moment the guard stops covering that hint, so each case fails on the bug
+    while asserting the true text of its own hint.
+    """
+    hint = getattr(release, hint_name)
+    if hint_name == "HEAD_KEG_HINT":
+        hint = hint.format(keg="sudo-secretspec/HEAD-7c1f700")
+    _published(monkeypatch, release)
+
     def boom(**_kwargs):
-        raise error
+        raise release.ReleaseError(f"no usable macOS bottle for the tag\n{hint}")
 
     monkeypatch.setattr(release, "brew_install_and_test", boom)
     with pytest.raises(release.ReleaseError) as caught:
         release.main(["--version", cut.version, "--skip-tests"])
-    assert release.RESUME_BY_HAND_HINT in str(caught.value)
-    assert str(error) in str(caught.value)
+    message = str(caught.value)
+    assert message.count("already published") == already_published_count, message
+    # Neither generic hint was appended, and the error's own remedy survived
+    # whole -- the point of passing it through rather than re-dressing it.
+    assert release.RESUME_BY_HAND_HINT not in message
+    assert release.RESUME_TAG_ONLY_HINT not in message
+    assert hint in message
+    assert ".." not in message
+
+
+@pytest.mark.parametrize("gh_fails", [False, True], ids=["created", "gh_failed"])
+def test_release_created_is_set_only_once_gh_release_create_returns(
+    monkeypatch, release, cut, gh_fails
+):
+    """The flag the resume wording depends on, pinned where it is actually
+    assigned.
+
+    Every other test in this file stubs `create_tag_and_release` and sets both
+    flags by hand, so flipping the real `state.release_created = True` to
+    `False` left all 133 tests green (mutation M22, 2026-10-23) -- the same
+    shape as the M9 miss: a guard whose only test never reaches the code that
+    sets it. This test runs the real function.
+    """
+    state = release.CleanupState()
+    monkeypatch.setattr(release, "output", lambda argv, **kwargs: "")
+
+    def fake_run(argv, **kwargs):
+        if gh_fails and argv[:3] == ["gh", "release", "create"]:
+            raise subprocess.CalledProcessError(1, argv, stderr="release exists\n")
+        return completed(argv)
+
+    monkeypatch.setattr(release, "run", fake_run)
+
+    if gh_fails:
+        with pytest.raises(subprocess.CalledProcessError):
+            release.create_tag_and_release(cut, "notes", state, dry_run=False)
+        # The tag is out there, but there is no Release to finish from.
+        assert state.tag_pushed is True
+        assert state.release_created is False
+    else:
+        release.create_tag_and_release(cut, "notes", state, dry_run=False)
+        assert state.tag_pushed is True
+        assert state.release_created is True
+
+
+def test_a_post_publication_command_failure_keeps_the_command_output(
+    monkeypatch, release, cut
+):
+    """`main`'s handler intercepts the CalledProcessError, so __main__'s own
+    `except subprocess.CalledProcessError: raise SystemExit(describe(error))`
+    can no longer fire for anything inside `_release_body`. Without the
+    `describe` branch the operator loses the failed command's stderr -- the
+    entire reason brew refused -- which is exactly what `describe` exists to
+    prevent (adversary F3.1, 2026-10-23).
+    """
+    _published(monkeypatch, release)
+
+    def boom(**_kwargs):
+        raise subprocess.CalledProcessError(
+            1,
+            ["brew", "install", "sudo-secretspec"],
+            stderr="Error: The `brew link` step did not complete successfully\n",
+        )
+
+    monkeypatch.setattr(release, "brew_install_and_test", boom)
+    with pytest.raises(release.ReleaseError) as caught:
+        release.main(["--version", cut.version, "--skip-tests"])
+    message = str(caught.value)
+    assert "brew link" in message, message
+    assert release.RESUME_BY_HAND_HINT in message
+
+
+def test_a_post_publication_failure_before_the_release_exists_says_so(
+    monkeypatch, release, cut
+):
+    """`tag_pushed` is set between `git push` of the tag and `gh release
+    create`, so a failure in between left the operator told "the tag AND
+    Release are already published" when only the tag was -- and the
+    justfile's hand-finish needs a Release that does not exist (adversary F4,
+    2026-10-23).
+    """
+    _published(monkeypatch, release, release_created=False)
+
+    def boom(**_kwargs):
+        raise RuntimeError("gh release create failed")
+
+    monkeypatch.setattr(release, "brew_install_and_test", boom)
+    with pytest.raises(release.ReleaseError) as caught:
+        release.main(["--version", cut.version, "--skip-tests"])
+    message = str(caught.value)
+    assert release.RESUME_TAG_ONLY_HINT in message, message
+    assert release.RESUME_BY_HAND_HINT not in message
+    assert "and Release are already published" not in message
+
+
+def test_a_post_publication_interrupt_is_not_redressed_as_a_release_error(
+    monkeypatch, release, cut
+):
+    """The handler catches `Exception`, not `BaseException`, on purpose:
+    Ctrl-C and `SystemExit` must reach the operator as themselves. Widening it
+    is the natural wrong answer to "is there a post-publication path with no
+    hint?", and nothing else in the suite would notice (mutation M18,
+    adversary F5, 2026-10-23).
+    """
+    _published(monkeypatch, release)
+
+    def boom(**_kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(release, "brew_install_and_test", boom)
+    with pytest.raises(KeyboardInterrupt):
+        release.main(["--version", cut.version, "--skip-tests"])
+
+
+def test_an_unfingerprintable_tree_logs_what_actually_went_wrong(
+    release, tmp_path, capsys
+):
+    """The caller's `_require` can only offer three causes at once -- "not a
+    single prefixed directory, or a refused member, or could not be
+    fingerprinted" -- attack first and accident last, for what is usually
+    neither: v0.19.1-sudo.15 ran out of disk after publishing.
+
+    Nothing held this log line in place (mutation M14 deleted it and all 126
+    tests still passed), and the type is the point: `OSError` reads very
+    differently from `SpecialFileError` (adversary F2 and F3.3, 2026-10-23).
+    """
+    missing = tmp_path / "not-there.tar.gz"
+    assert release.extracted_tree(missing, prefix="root") is None
+    out = capsys.readouterr().out
+    assert "cannot fingerprint" in out, out
+    assert "FileNotFoundError" in out, out
 
 
 def test_a_special_file_member_is_refused_so_the_filter_choice_is_pinned(

@@ -91,6 +91,15 @@ RESUME_BY_HAND_HINT = (
     "The tag and Release are already published -- do not re-run `just release`; "
     "finish by hand per the justfile RESUME RULES."
 )
+# The tag push and the Release creation are two steps, and `tag_pushed` is set
+# between them, so a failure in `gh release create` used to be told "the tag
+# AND Release are already published" -- half false, and the justfile's
+# hand-finish needs a Release that does not exist (adversary F4, 2026-10-23).
+RESUME_TAG_ONLY_HINT = (
+    "The tag is pushed but the Release was not created -- do not re-run `just "
+    "release`; finish by hand per the justfile RESUME RULES, starting with "
+    "`gh release create`."
+)
 # The release gate is GitHub CI (2026-10-18): free runners, not a cold cargo
 # build on the maintainer's Mac. Actions can take a few seconds to register a
 # push, so look for the run a few times before giving up.
@@ -166,6 +175,27 @@ HEAD_KEG_HINT = (
     f"install --force-bottle {FORMULA_NAME}`; to go back, `brew link --overwrite "
     "{keg}`. Upgrading the privileged boundary is a separate, explicit step "
     "(see the formula's caveats)."
+)
+# Every hint above is SELF-SUFFICIENT: it already says the release is (partly)
+# published and names the one recovery route for its own failure. `main`'s
+# handler appends a hint of its own, so an error that already carries any of
+# them must pass through untouched -- otherwise the operator reads the claim
+# twice with two CONFLICTING routes. That is what shipped in 0c19acb: the
+# guard knew only RESUME_BY_HAND_HINT, so every BOTTLE_FALLBACK_HINT failure
+# (five functions, eight raise sites, all post-publication) stated "The tag
+# and Release are already published" twice, joined by "..", offering both
+# `brew reinstall --build-from-source` and the justfile's pour-the-bottle
+# recipe -- the thing that had just failed to exist (adversary F1,
+# 2026-10-23).
+#
+# These are FRAGMENTS, not the constants, because HEAD_KEG_HINT is used
+# through `.format(keg=...)` and so is never a substring of the message it
+# produces. One test asserts each fragment really does appear in its hint, so
+# a reword that breaks the coupling fails rather than silently re-opening F1.
+SELF_SUFFICIENT_HINT_MARKERS = (
+    "finish by hand per the justfile RESUME RULES",
+    "so re-running release.py is refused",
+    "reuses the spec of the linked keg",
 )
 
 
@@ -965,6 +995,7 @@ def create_tag_and_release(
                 notes_file.name,
             ]
         )
+    state.release_created = True
 
 
 def update_formula_commit(
@@ -1561,6 +1592,9 @@ def verify_readback(release: Release, prefix: str) -> None:
 class CleanupState:
     tag_created: bool = False
     tag_pushed: bool = False
+    # Set only once `gh release create` has returned, so the resume hint can
+    # claim the Release exists only when it does (adversary F4, 2026-10-23).
+    release_created: bool = False
     formula_changed: bool = False
 
 
@@ -1664,14 +1698,32 @@ def main(argv: list[str] | None = None) -> int:
         # untouched.
         if not state.tag_pushed:
             raise
-        if isinstance(error, ReleaseError) and RESUME_BY_HAND_HINT in str(error):
+        message = str(error)
+        if isinstance(error, ReleaseError) and any(
+            marker in message for marker in SELF_SUFFICIENT_HINT_MARKERS
+        ):
             raise
-        detail = (
-            describe(error)
-            if isinstance(error, subprocess.CalledProcessError)
-            else str(error)
-        )
-        raise ReleaseError(f"{detail}. {RESUME_BY_HAND_HINT}") from error
+        if isinstance(error, subprocess.CalledProcessError):
+            # `describe` carries the failed command's own stderr, and since
+            # this handler now intercepts the CalledProcessError, __main__'s
+            # `except subprocess.CalledProcessError` can no longer fire for
+            # anything inside `_release_body`. Without this branch "Error:
+            # the `brew link` step did not complete successfully" -- the whole
+            # reason brew refused -- is lost (adversary F3.1, 2026-10-23).
+            detail = describe(error)
+        elif isinstance(error, ReleaseError):
+            # Our own errors carry curated operator-facing prose; the type
+            # name would only add noise.
+            detail = message
+        else:
+            # Anything nobody enumerated. __main__ turns this into a
+            # string-valued SystemExit, and CPython prints such a SystemExit's
+            # argument ALONE -- no traceback, no type, no __cause__ chain -- so
+            # without the type name the operator cannot tell a ValueError from
+            # an OSError (adversary F2, 2026-10-23).
+            detail = f"{type(error).__name__}: {error}"
+        hint = RESUME_BY_HAND_HINT if state.release_created else RESUME_TAG_ONLY_HINT
+        raise ReleaseError(f"{detail}. {hint}") from error
     log(f"done: {release.title} ({release.tag})")
     return 0
 
