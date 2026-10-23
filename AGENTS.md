@@ -239,6 +239,16 @@ would gate the release-tag leg on a changed-file comparison.
 No `--` after `bg`: it takes the command directly and refuses a lone `--` with
 exit 2, which reads exactly like the tests failing.
 
+**Every `gh` command in this checkout needs `--repo frdminc/sudo-secretspec`.**
+The repo has two remotes -- `origin` (the fork) and `upstream`
+(`cachix/secretspec`) -- and `gh` resolves to the **upstream** one, so a query
+without the flag silently answers about a different repository. It does not
+error: `gh run list --branch sudo-main` returns `[]` (upstream has no such
+branch) and a bare `gh run list` shows upstream's pull-request runs, both of
+which read as facts about this fork. `gh run watch <id>` is the only one that
+fails loudly, with `HTTP 404` naming `cachix/secretspec`. One wrong conclusion
+was published from this on 2026-10-23 before the 404 exposed it.
+
 Pin 3.13 because that is what the workflow's `packaging` job pins **for the
 tests** -- a release itself runs under `#!/usr/bin/env python3`, whatever that
 resolves to, and the `bottle` job executes `release.py` under its image's bare
