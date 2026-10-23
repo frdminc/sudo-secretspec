@@ -95,10 +95,16 @@ RESUME_BY_HAND_HINT = (
 # between them, so a failure in `gh release create` used to be told "the tag
 # AND Release are already published" -- half false, and the justfile's
 # hand-finish needs a Release that does not exist (adversary F4, 2026-10-23).
+# Worded as uncertainty, not fact: the flag records only that release.py did
+# not SEE `gh release create` return. A signal in that window, or a dropped
+# connection after the API accepted the create, leaves the Release in place
+# with the flag False -- so telling the operator to run `gh release create`
+# would send them at a command that refuses (adversary F2, 2026-10-23). It
+# keeps the first SELF_SUFFICIENT_HINT_MARKERS fragment.
 RESUME_TAG_ONLY_HINT = (
-    "The tag is pushed but the Release was not created -- do not re-run `just "
-    "release`; finish by hand per the justfile RESUME RULES, starting with "
-    "`gh release create`."
+    "The tag is pushed, but release.py did not see `gh release create` succeed "
+    "-- do not re-run `just release`; check `gh release view <tag>` first, then "
+    "finish by hand per the justfile RESUME RULES."
 )
 # The release gate is GitHub CI (2026-10-18): free runners, not a cold cargo
 # build on the maintainer's Mac. Actions can take a few seconds to register a
@@ -995,7 +1001,11 @@ def create_tag_and_release(
                 notes_file.name,
             ]
         )
-    state.release_created = True
+        # Inside the `with`, immediately after the call that earns it: an
+        # OSError from __exit__'s close or unlink -- a $TMPDIR reaper, EIO --
+        # would otherwise leave the flag False after a fully successful
+        # `gh release create` (adversary F2c, 2026-10-23).
+        state.release_created = True
 
 
 def update_formula_commit(
@@ -1339,6 +1349,22 @@ def fetch_bottle(release: Release, dest: Path, *, dry_run: bool) -> list[Path]:
         ValueError,
         OSError,
     ) as error:
+        # The inner error may already carry a hint of its own, and the one that
+        # does is reachable: the `source.sha256` comparison above is the run's
+        # FIRST archive download (fetch_bottle precedes update_formula_commit),
+        # so `archive_facts` exhausting its attempts raises a ReleaseError
+        # ending in RESUME_BY_HAND_HINT. Wrapping that and appending
+        # BOTTLE_FALLBACK_HINT states "already published" twice with two
+        # conflicting routes -- and here the bottle route is the MORE wrong of
+        # the two, because what failed was a source download, not the bottle.
+        #
+        # `main`'s guard cannot help: by the time it sees this the composition
+        # has already happened, so it correctly re-raises untouched. The guard
+        # has to be here too (adversary F1, 2026-10-23).
+        if isinstance(error, ReleaseError) and any(
+            marker in str(error) for marker in SELF_SUFFICIENT_HINT_MARKERS
+        ):
+            raise
         detail = (
             describe(error)
             if isinstance(error, subprocess.CalledProcessError)

@@ -229,8 +229,10 @@ Since 2026-10-23 a **push to `sudo-main` runs that `packaging` job by itself**:
 tags. Only that job fires -- `bottle` is gated on `ref_type == 'tag' ||
 workflow_dispatch` and `publish-bottle` on a tag push -- so a branch push costs
 one short macOS job and never builds a bottle. Before that the branch triggered
-**no workflow at all** and a commit could sit on it unverified; `0c19acb` did,
-until it was dispatched by hand. Note that block carries no `paths` filter on
+**no workflow at all** and a commit could sit on it unverified unless someone
+ran `scripts/github-ci-run` by hand, which is how `0c19acb` was checked
+(overlay branch `ci/run/0c19acb-0c19acb4`, Linux CI, 2026-10-23) -- that is a
+*push* of an overlay branch, not a `workflow_dispatch`. Note that block carries no `paths` filter on
 purpose: GitHub ANDs `paths` with both `branches` and `tags`, so adding one
 would gate the release-tag leg on a changed-file comparison.
 

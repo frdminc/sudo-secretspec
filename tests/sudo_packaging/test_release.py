@@ -2449,11 +2449,20 @@ def test_a_post_publication_failure_before_the_release_exists_says_so(
 def test_a_post_publication_interrupt_is_not_redressed_as_a_release_error(
     monkeypatch, release, cut
 ):
-    """The handler catches `Exception`, not `BaseException`, on purpose:
-    Ctrl-C and `SystemExit` must reach the operator as themselves. Widening it
-    is the natural wrong answer to "is there a post-publication path with no
-    hint?", and nothing else in the suite would notice (mutation M18,
-    adversary F5, 2026-10-23).
+    """The handler catches `Exception`, not `BaseException`, so a
+    `BaseException` from a non-signal source passes through as itself. Widening
+    it is the natural wrong answer to "is there a post-publication path with no
+    hint?", and nothing else in the suite would notice (mutation M18).
+
+    Note what this does NOT describe. A real post-publication Ctrl-C does not
+    raise `KeyboardInterrupt` at all: `interrupt_cleanup` replaces the SIGINT
+    and SIGTERM handlers for the whole of `_release_body` with one that raises
+    `ReleaseError("interrupted by SIGINT")`, and with a Python signal handler
+    installed CPython never raises `KeyboardInterrupt`. That error is an
+    `Exception`, so it is redressed and given the hint -- correctly, since the
+    tag is out. Nothing inside `_release_body` raises `SystemExit` either. An
+    earlier version of this docstring offered both as the scenario (adversary
+    F4, 2026-10-23).
     """
     _published(monkeypatch, release)
 
@@ -2463,6 +2472,98 @@ def test_a_post_publication_interrupt_is_not_redressed_as_a_release_error(
     monkeypatch.setattr(release, "brew_install_and_test", boom)
     with pytest.raises(KeyboardInterrupt):
         release.main(["--version", cut.version, "--skip-tests"])
+
+
+def test_an_error_that_merely_quotes_a_hint_still_gets_the_resume_path(
+    monkeypatch, release, cut
+):
+    """The guard is `isinstance(error, ReleaseError) AND a marker matches`, and
+    the `isinstance` half is what the fragment mechanism rests on.
+
+    A fragment match is looser than a constant match, so a non-ReleaseError
+    whose text happens to contain one -- `gh` or `brew` stderr that quoted a
+    hint back, an OSError on a path named after one -- would otherwise be
+    passed through with NO resume hint at all. That is the mirror image of the
+    doubled hint and strictly worse: silence instead of noise. Dropping the
+    `isinstance` left all 135 tests green (mutation N4, adversary F3.1,
+    2026-10-23).
+    """
+    _published(monkeypatch, release)
+    quoted = release.SELF_SUFFICIENT_HINT_MARKERS[0]
+
+    def boom(**_kwargs):
+        raise OSError(f"brew said: {quoted}")
+
+    monkeypatch.setattr(release, "brew_install_and_test", boom)
+    with pytest.raises(release.ReleaseError) as caught:
+        release.main(["--version", cut.version, "--skip-tests"])
+    message = str(caught.value)
+    assert release.RESUME_BY_HAND_HINT in message, message
+    assert "OSError" in message
+
+
+def test_a_release_error_without_a_hint_is_not_prefixed_with_its_type(
+    monkeypatch, release, cut
+):
+    """The three-way `detail` branch names the type for anything nobody
+    enumerated, and deliberately does NOT for a ReleaseError, whose message is
+    curated operator-facing prose. That arm was pinned by nothing: both
+    `detail = f"{type(error).__name__}: {error}"` and `message = repr(error)`
+    left all 135 tests green (mutations N7 and N9, adversary F3.2,
+    2026-10-23), the second rendering the message as
+    `ReleaseError('tap working tree is dirty: ...'). The tag and ...`.
+    """
+    _published(monkeypatch, release)
+
+    def boom(**_kwargs):
+        raise release.ReleaseError("tap working tree is dirty: /tmp/tap")
+
+    monkeypatch.setattr(release, "brew_install_and_test", boom)
+    with pytest.raises(release.ReleaseError) as caught:
+        release.main(["--version", cut.version, "--skip-tests"])
+    message = str(caught.value)
+    assert message.startswith("tap working tree is dirty: /tmp/tap"), message
+    assert "ReleaseError" not in message
+
+
+def test_a_bottle_failure_does_not_double_a_hint_the_inner_error_already_carried(
+    monkeypatch, release, cut, tmp_path
+):
+    """`fetch_bottle` composes its own hint onto whatever it caught, and the
+    error it can catch with a hint already on it is reachable: the
+    `source.sha256` comparison is the run's FIRST archive download, so
+    `archive_facts` exhausting its attempts raises a ReleaseError ending in
+    RESUME_BY_HAND_HINT.
+
+    `main`'s guard structurally cannot fix this -- the composition happens
+    before it sees anything, so it correctly re-raises untouched -- which is
+    why the guard has to be at the inner wrap too (adversary F1, 2026-10-23).
+    Here the appended bottle route is the MORE wrong of the two, because what
+    failed was a source download.
+    """
+    inner = release.ReleaseError(
+        "could not fetch the archive after 5 attempts: connection reset. "
+        + release.RESUME_BY_HAND_HINT
+    )
+
+    def boom(*_a, **_k):
+        raise inner
+
+    # Injected at the first call inside the try rather than at
+    # `archive_sha256`, because reaching that line needs the whole artifact
+    # pipeline to succeed first -- the earlier version of this test raised a
+    # FileNotFoundError on the missing source.sha256 instead and so proved
+    # nothing about the guard. The guard covers the whole `except`, and the
+    # reachable producer of a hint-carrying inner error is documented at the
+    # guard itself.
+    monkeypatch.setattr(release, "output", lambda argv, **kwargs: "deadbeef")
+    monkeypatch.setattr(release, "find_run", boom)
+
+    with pytest.raises(release.ReleaseError) as caught:
+        release.fetch_bottle(cut, tmp_path, dry_run=False)
+    message = str(caught.value)
+    assert message.count("already published") == 1, message
+    assert release.BOTTLE_FALLBACK_HINT not in message
 
 
 def test_an_unfingerprintable_tree_logs_what_actually_went_wrong(
