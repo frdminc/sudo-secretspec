@@ -2299,26 +2299,25 @@ def _published(monkeypatch, release, *, release_created=True):
     monkeypatch.setattr(release, "brew_refresh", lambda *a, **k: Path("/tap"))
 
 
-def test_every_hint_carrying_raise_site_declares_itself_self_sufficient(release):
-    """A raise site whose message carries one of the hints must pass
-    `self_sufficient=True`, or the two wrapping handlers append a second,
-    conflicting route to it.
+# How many `ReleaseError`/`_require` calls declare themselves self-sufficient.
+# Pinned as a number on purpose, so that adding or removing one is a visible
+# diff in review rather than something the derived check absorbs silently.
+SELF_SUFFICIENT_SITES = 18
 
-    The set is DERIVED from the module and the file's AST, not listed here.
-    Every earlier version of this check listed what it knew, and that is
-    exactly how the defect shipped twice: `0c19acb`'s guard knew one hint of
-    three, and the hard-coded `hints` tuple that replaced it would have passed
-    a fifth hint added with no registration (adversary F8, ninth review,
-    2026-10-23). This fails the day a hint-carrying raise site forgets the
-    keyword, whichever hint it is.
-    """
-    hint_names = {name for name in dir(release) if name.endswith("_HINT")}
-    assert len(hint_names) >= 4, hint_names
-    # `main` composes through a local named `hint`, chosen between two
-    # constants, so the local counts as carrying one.
-    carriers = hint_names | {"hint"}
-    offenders = []
-    for node in ast.walk(ast.parse(RELEASE_PY.read_text(encoding="utf-8"))):
+
+def _release_error_calls(release):
+    """Every `ReleaseError(...)`/`_require(...)` call in release.py, as
+    (line, message expressions, declares self-sufficient, inside _require,
+    is a _require call)."""
+    tree = ast.parse(RELEASE_PY.read_text(encoding="utf-8"))
+    inside_require = {
+        inner.lineno
+        for fn in ast.walk(tree)
+        if isinstance(fn, ast.FunctionDef) and fn.name == "_require"
+        for inner in ast.walk(fn)
+    }
+    calls = []
+    for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
         called = (
@@ -2328,22 +2327,82 @@ def test_every_hint_carrying_raise_site_declares_itself_self_sufficient(release)
         )
         if called not in {"ReleaseError", "_require"}:
             continue
-        if not any(
-            isinstance(inner, ast.Name) and inner.id in carriers
-            for arg in node.args
-            for inner in ast.walk(arg)
-        ):
-            continue
-        if not any(
+        # Positional args AND keyword values, because a hint passed as
+        # `message=...` is as real as one passed positionally (adversary A10).
+        expressions = list(node.args) + [
+            keyword.value
+            for keyword in node.keywords
+            if keyword.arg != "self_sufficient"
+        ]
+        declares = any(
             keyword.arg == "self_sufficient"
             and isinstance(keyword.value, ast.Constant)
             and keyword.value.value is True
             for keyword in node.keywords
-        ):
-            offenders.append(node.lineno)
-    assert offenders == [], (
-        f"release.py lines missing self_sufficient=True: {offenders}"
-    )
+        )
+        calls.append(
+            (
+                node.lineno,
+                expressions,
+                declares,
+                node.lineno in inside_require,
+                called == "_require",
+            )
+        )
+    return calls
+
+
+def test_self_sufficient_is_declared_exactly_where_a_hint_is_carried(release):
+    """The flag and the hint have to agree in BOTH directions.
+
+    A hint-carrying raise site that forgets `self_sufficient=True` gets a
+    second, conflicting hint appended -- the doubled-"already published"
+    defect that shipped in 0c19acb and 2efe431. A site flagged WITHOUT a hint
+    is the opposite and worse failure: both wraps pass it through untouched, so
+    the operator gets no route at all. Five such false flags, including one on
+    `fetch_bottle`'s `source.sha256` integrity check, passed all 143 tests when
+    only the first direction was checked (adversary G1, tenth review,
+    2026-10-23).
+
+    The set of hint names is read off the module, not listed here, and the
+    message is scanned in positional AND keyword arguments (A10). A message
+    held in a local variable is refused outright (A9): `msg = f"...{HINT}";
+    raise ReleaseError(msg)` hides the hint from any syntactic check, and the
+    one legitimate bare name is `_require`'s own pass-through of `message`.
+    """
+    hint_names = {name for name in dir(release) if name.endswith("_HINT")}
+    assert len(hint_names) >= 4, hint_names
+    # `main` composes through a local named `hint`, chosen between two
+    # constants, so the local counts as carrying one.
+    carriers = hint_names | {"hint"}
+
+    def carries(expressions):
+        return any(
+            isinstance(inner, ast.Name) and inner.id in carriers
+            for expression in expressions
+            for inner in ast.walk(expression)
+        )
+
+    disagree, hidden, flagged = [], [], 0
+    for line, expressions, declares, in_require, called_require in _release_error_calls(
+        release
+    ):
+        if in_require:
+            continue
+        flagged += declares
+        if carries(expressions) != declares:
+            disagree.append(
+                (line, "carries a hint" if carries(expressions) else "no hint")
+            )
+        # The message argument itself may not be an opaque local. For
+        # `_require(condition, message)` that is the second positional; for
+        # `ReleaseError(message)` the first.
+        message = expressions[1] if called_require else expressions[0]
+        if isinstance(message, ast.Name) and message.id not in carriers:
+            hidden.append(line)
+    assert disagree == [], f"flag and hint disagree at release.py lines: {disagree}"
+    assert hidden == [], f"message hidden in a local at release.py lines: {hidden}"
+    assert flagged == SELF_SUFFICIENT_SITES, flagged
 
 
 @pytest.mark.parametrize(
@@ -2671,6 +2730,76 @@ def test_a_bottle_failure_does_not_double_a_hint_the_inner_error_already_carried
         # Not self-sufficient, so the bottle route is appended exactly once.
         assert release.BOTTLE_FALLBACK_HINT in message, message
         assert "no usable macOS bottle" in message
+
+
+def test_the_real_archive_download_failing_is_not_given_the_bottle_route(
+    monkeypatch, release, cut, tmp_path
+):
+    """The producer the docstring above names, run for real.
+
+    Every other test of `fetch_bottle`'s guard injects a pre-flagged error at
+    `find_run`, a stub standing in for the raise site -- the fifth time the
+    unpinned thing was the line a stub replaces. Here only the network is
+    replaced: the real `archive_sha256` reaches the real `archive_facts`, which
+    exhausts its retries and raises the real hint-carrying ReleaseError, and
+    `fetch_bottle` has to pass it through. Moving that hint into a local, or
+    dropping `self_sufficient=True` at the raise site, restores the doubled
+    "already published" with two conflicting routes -- a syntactic check on
+    the AST test could not tell (adversary G2, A9, tenth review, 2026-10-23).
+    """
+    real_archive_sha256 = release.archive_sha256
+    fake_bottle_run(
+        monkeypatch,
+        release,
+        cut,
+        runs=[{"databaseId": 8, "headSha": TAG_SHA}],
+    )
+    monkeypatch.setattr(release, "archive_sha256", real_archive_sha256)
+
+    def reset(*_args, **_kwargs):
+        raise urllib.error.URLError("connection reset")
+
+    monkeypatch.setattr(release._OPENER, "open", reset)
+    monkeypatch.setattr(release.time, "sleep", lambda _s: None)
+
+    with pytest.raises(release.ReleaseError) as caught:
+        release.fetch_bottle(cut, tmp_path, dry_run=False)
+    message = str(caught.value)
+    assert "could not fetch" in message, message
+    assert message.count("already published") == 1, message
+    assert release.BOTTLE_FALLBACK_HINT not in message
+    assert "no usable macOS bottle" not in message
+
+
+def test_the_tag_only_hint_and_the_justfile_rule_it_points_at_stay_together(release):
+    """`RESUME_TAG_ONLY_HINT` sends the operator to a rule in the justfile, and
+    that rule is keyed on a sentence release.py prints. If either drifts the
+    operator is pointed at a rule that no longer exists, or follows the
+    post-publication one, whose `brew reinstall` pours the PREVIOUS release's
+    bottle in this state. Reverting the hint to its 2efe431 wording, and
+    deleting the justfile bullet, both passed 143 tests (adversary G4, A16 and
+    A17, tenth review, 2026-10-23).
+    """
+    hint = release.RESUME_TAG_ONLY_HINT
+    assert "gh release view" in hint
+    assert f"--repo {release.FORK_REPO}" in hint
+    assert "do not re-run `just release`" in hint
+    # Not the post-publication wording, which claims the Release exists.
+    assert "Release are already published" not in hint
+    justfile = (ROOT / "justfile").read_text(encoding="utf-8")
+    sentence = (
+        "The tag is pushed, but release.py did not see `gh release create` succeed"
+    )
+    assert sentence in hint
+    # The justfile wraps its comment lines, so compare with the comment
+    # markers and line breaks removed.
+    flattened = " ".join(
+        line.removeprefix("#").strip() for line in justfile.splitlines()
+    )
+    assert sentence in flattened
+    assert "no formula commit yet" in flattened
+    assert f"gh release view <tag> --repo {release.FORK_REPO}" in flattened
+    assert "publish-bottle" in flattened
 
 
 def test_a_bottle_json_quoting_a_hint_still_gets_the_bottle_route(

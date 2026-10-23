@@ -244,20 +244,28 @@ otherwise.** The repo has two remotes -- `origin` (the fork) and `upstream`
 (`cachix/secretspec`) -- and with no `gh-resolved` set, `gh` picks **upstream**.
 Run `gh repo set-default frdminc/sudo-secretspec` once (it writes
 `remote.origin.gh-resolved`) and every unflagged command answers about the
-fork; `--repo frdminc/sudo-secretspec` is still right to pass explicitly, and
-is the only thing that works in a fresh clone.
+fork. `--repo frdminc/sudo-secretspec` is still right to pass explicitly: it
+works in any clone, and a plain clone of the fork has only `origin`, so the
+trap appears once `upstream` has been added and `set-default` has not been run.
 
 Which way it fails matters, because the dangerous direction is the quiet one:
 
-- **Loud**, so you cannot miss it: anything addressed by id or name --
-  `gh run view <id>`, `gh run watch <id>`, `gh api repos/.../actions/runs/<id>`,
-  `gh release view <tag>`. They exit non-zero, and the first three print
-  `HTTP 404` naming `cachix/secretspec`.
+- **Loud, and names the wrong repository**: `gh run view <id>` and
+  `gh run watch <id>` print `HTTP 404` with a URL under
+  `repos/cachix/secretspec`, and exit non-zero.
+- **Loud, but names nothing**: `gh release view <tag>` exits 1 with
+  `release not found` -- **also for a Release that exists on the fork**. It
+  reads as a fact about the fork, and it is exactly the check the tag-only
+  RESUME RULE in the justfile asks for. `gh api repos/{owner}/{repo}/...`
+  prints `gh: Not Found (HTTP 404)` and no repository (a literal
+  `repos/frdminc/...` path never reaches upstream at all). Check the `--repo`
+  before believing any "not found".
 - **Silent**, and this is the trap: queries that succeed with an upstream or
   empty answer. `gh run list --branch sudo-main` exits 0 with nothing (`[]`
   with `--json`), because upstream has no such branch; a bare `gh run list`
-  shows upstream's pull-request runs; `gh repo view` reports
-  `cachix/secretspec`. Each reads as a fact about this fork.
+  shows upstream's pull-request runs; `gh pr list` shows upstream's PRs;
+  `gh repo view` reports `cachix/secretspec`. Each reads as a fact about this
+  fork.
 
 A CI conclusion was stated from such a query on 2026-10-23 and had to be
 retracted for want of evidence -- re-querying with the flag happened to support

@@ -100,20 +100,18 @@ RESUME_BY_HAND_HINT = (
 # connection after the API accepted the create, leaves the Release in place
 # with the flag False -- so telling the operator to run `gh release create`
 # outright would send them at a command that refuses (adversary F2,
-# 2026-10-23). It branches on what `gh release view` reports instead, and says
-# what the RESUME RULES assume: in the state that selects this hint there is no
-# Release, no formula commit and no synced tap, so the rules' `brew reinstall`
-# repairs none of them and would pour the PREVIOUS release's bottle. An
-# uncertain hint that dead-ends is no better than a false one that does not
-# (adversary F5, 2026-10-23).
+# 2026-10-23). In this state there is also NO formula commit, tap sync or
+# bottle merge, so the post-publication rule's `brew reinstall` would pour the
+# PREVIOUS release's bottle; the justfile has a rule of its own for exactly
+# this state, and this hint names it rather than the one that does not apply
+# (adversary F5, then G3, 2026-10-23). The justfile quotes the first sentence
+# below, and a test pins that the two stay together.
 RESUME_TAG_ONLY_HINT = (
     "The tag is pushed, but release.py did not see `gh release create` succeed "
-    "-- do not re-run `just release`. Check `gh release view <tag> --repo "
-    f"{FORK_REPO}` first: if the Release is there, finish by hand per the "
-    "justfile RESUME RULES. If it is not, create it (`gh release create <tag> "
-    f"--repo {FORK_REPO} --title <title> --notes-file <notes>`), then follow "
-    "those rules -- they assume the Release, the formula commit and the tap are "
-    "all public already, which is why the tag-only state has its own rule."
+    "-- do not re-run `just release`. Follow the 'no formula commit yet' rule in "
+    "the justfile RESUME RULES: it starts with `gh release view <tag> --repo "
+    f"{FORK_REPO}`, because the Release may exist even though release.py never "
+    "saw it return, and it lists the steps release.py has no resume mode for."
 )
 # The release gate is GitHub CI (2026-10-18): free runners, not a cold cargo
 # build on the maintainer's Mac. Actions can take a few seconds to register a
