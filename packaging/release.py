@@ -778,6 +778,11 @@ def require_archive_matches_tag(release: Release, *, dry_run: bool) -> None:
 
     Both read the bytes `archive_facts` hashed, so the digest pinned into the
     formula is the digest of the tree that was checked.
+
+    This is therefore the release's binding, and it trusts CI for none of it.
+    The attested `source.sha256` that `fetch_bottle` checks is corroboration
+    on top -- "CI saw these bytes" -- not the thing being relied on (operator
+    decision, 2026-10-23; see the comment there).
     """
     if dry_run:
         log(f"[dry-run] bind {release.archive_url} to {release.tag}")
@@ -1206,9 +1211,28 @@ def fetch_bottle(release: Release, dest: Path, *, dry_run: bool) -> list[Path]:
         # never "these bytes predate the third-party code". The bottle job's
         # filesystem stays writable between the build step and the attest
         # step, so a process the build left behind could still rewrite this
-        # file and have it signed. Splitting the digest into a job that runs
-        # no cargo and no brew is the only fix; that is F3.1, which the
-        # operator accepted by design (2026-10-20).
+        # file and have it signed (adversary F3.1, 2026-10-20).
+        #
+        # So this check is belt-and-braces, not the binding. The binding is
+        # `require_archive_matches_tag`: it compares the published archive's
+        # whole tree against `git archive` of the tag, locally, trusting CI
+        # for none of it (adversary 1b, implemented 2026-10-20). What is left
+        # here is corroboration -- "CI saw these bytes" -- which is worth
+        # having and is not evidence of anything stronger.
+        #
+        # The review's escalation of F3.1 -- move the digest into a job that
+        # runs no cargo and no brew and verify *that job's* attestation --
+        # cannot be enforced, which is why it is not built. The only identity
+        # `verify_attestation` can pin is the certificate identity, and that
+        # names the workflow FILE, not the job. Checked against the real .28
+        # predicate rather than inferred: `runDetails.builder.id`, the
+        # workflow `externalParameters`, and the certificate's SAN,
+        # `buildSignerURI` and `buildConfigURI` all read `sudo-release.yml`
+        # and nothing finer, while `metadata.invocationId` names the run,
+        # which two jobs share. A second job here would mint attestations
+        # indistinguishable from this one's. A separate workflow file would
+        # have a distinct identity; the operator chose to make 1b the real
+        # check instead (2026-10-23).
         verify_attestation(source, source_ref=ref, source_digest=sha)
         _require(
             source.read_text(encoding="utf-8").strip()

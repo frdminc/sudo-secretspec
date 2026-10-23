@@ -113,13 +113,32 @@ Extraction uses `filter="data"`, explicitly: this is the one place release.py
 writes untrusted bytes to disk, and on Python 3.13, which `sudo-release.yml`
 pins, the `extractall` default still escapes the destination with only a
 DeprecationWarning. Both checks read the memoised download, so the digest
-pinned into the formula is the digest of the tree that was checked. The artifact must hold exactly one bottle JSON, and `source.sha256` is
+pinned into the formula is the digest of the tree that was checked.
+
+The artifact must hold exactly one bottle JSON, and `source.sha256` is
 attested like the tarball and the JSON and verified before it is read. Its
 bytes are written from a step output recorded before `brew install
 --build-bottle` runs, so the on-disk file a `build.rs` can reach is no longer
-what gets copied; an attestation still proves only "this workflow produced
-these bytes", and the bottle job's filesystem stays writable between the build
-and the attest step (F3.1, accepted by design). Before the tap is pushed it
+what gets copied. That check is **belt-and-braces, not the binding**: an
+attestation proves only "this workflow produced these bytes", never "these
+bytes predate the third-party code", and the bottle job's filesystem stays
+writable between the build step and the attest step (F3.1). The tree
+comparison above is what the release relies on, and it trusts CI for none of
+it; all `source.sha256` adds on top is "CI saw these bytes".
+
+F3.1's escalation -- compute the digest in a job that runs no cargo and no
+brew, and verify *that job's* attestation -- is deliberately not implemented,
+because a verifier cannot express it. The only identity `gh attestation
+verify` can pin is the certificate identity, and that names the workflow
+**file**, not the job. In the real v0.19.1-sudo.28 predicate, `builder.id`,
+the workflow `externalParameters` and the certificate's SAN all read
+`sudo-release.yml` and nothing finer, while `invocationId` names the run,
+which two jobs share, so a second job would mint attestations
+indistinguishable from the bottle job's. A separate workflow file would have
+a distinct identity; the operator chose to make the tree comparison the real
+check instead (2026-10-23).
+
+Before the tap is pushed it
 downloads each asset from the GitHub Release into its own directory, requires
 exactly that one file name to land (`--pattern` is a glob) and compares its
 sha256 too. Then it runs
