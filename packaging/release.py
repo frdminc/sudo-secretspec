@@ -99,12 +99,21 @@ RESUME_BY_HAND_HINT = (
 # not SEE `gh release create` return. A signal in that window, or a dropped
 # connection after the API accepted the create, leaves the Release in place
 # with the flag False -- so telling the operator to run `gh release create`
-# would send them at a command that refuses (adversary F2, 2026-10-23). It
-# keeps the first SELF_SUFFICIENT_HINT_MARKERS fragment.
+# outright would send them at a command that refuses (adversary F2,
+# 2026-10-23). It branches on what `gh release view` reports instead, and says
+# what the RESUME RULES assume: in the state that selects this hint there is no
+# Release, no formula commit and no synced tap, so the rules' `brew reinstall`
+# repairs none of them and would pour the PREVIOUS release's bottle. An
+# uncertain hint that dead-ends is no better than a false one that does not
+# (adversary F5, 2026-10-23).
 RESUME_TAG_ONLY_HINT = (
     "The tag is pushed, but release.py did not see `gh release create` succeed "
-    "-- do not re-run `just release`; check `gh release view <tag>` first, then "
-    "finish by hand per the justfile RESUME RULES."
+    "-- do not re-run `just release`. Check `gh release view <tag> --repo "
+    f"{FORK_REPO}` first: if the Release is there, finish by hand per the "
+    "justfile RESUME RULES. If it is not, create it (`gh release create <tag> "
+    f"--repo {FORK_REPO} --title <title> --notes-file <notes>`), then follow "
+    "those rules -- they assume the Release, the formula commit and the tap are "
+    "all public already, which is why the tag-only state has its own rule."
 )
 # The release gate is GitHub CI (2026-10-18): free runners, not a cold cargo
 # build on the maintainer's Mac. Actions can take a few seconds to register a
@@ -182,31 +191,46 @@ HEAD_KEG_HINT = (
     "{keg}`. Upgrading the privileged boundary is a separate, explicit step "
     "(see the formula's caveats)."
 )
-# Every hint above is SELF-SUFFICIENT: it already says the release is (partly)
-# published and names the one recovery route for its own failure. `main`'s
-# handler appends a hint of its own, so an error that already carries any of
-# them must pass through untouched -- otherwise the operator reads the claim
-# twice with two CONFLICTING routes. That is what shipped in 0c19acb: the
-# guard knew only RESUME_BY_HAND_HINT, so every BOTTLE_FALLBACK_HINT failure
-# (five functions, eight raise sites, all post-publication) stated "The tag
-# and Release are already published" twice, joined by "..", offering both
-# `brew reinstall --build-from-source` and the justfile's pour-the-bottle
-# recipe -- the thing that had just failed to exist (adversary F1,
-# 2026-10-23).
+# Every hint above is SELF-SUFFICIENT: it already says how far the release got
+# and names the one recovery route for its own failure. Two places wrap an
+# error and append a hint of their own (`fetch_bottle` and `main`), so an
+# error that already carries one must pass through untouched -- otherwise the
+# operator reads the claim twice with two CONFLICTING routes. That is what
+# shipped in 0c19acb: the guard knew only RESUME_BY_HAND_HINT, so every
+# BOTTLE_FALLBACK_HINT failure (five functions, eight raise sites, all
+# post-publication) stated "The tag and Release are already published" twice,
+# joined by "..", offering both `brew reinstall --build-from-source` and the
+# justfile's pour-the-bottle recipe -- the thing that had just failed to exist
+# (adversary F1, 2026-10-23).
 #
-# These are FRAGMENTS, not the constants, because HEAD_KEG_HINT is used
-# through `.format(keg=...)` and so is never a substring of the message it
-# produces. One test asserts each fragment really does appear in its hint, so
-# a reword that breaks the coupling fails rather than silently re-opening F1.
-SELF_SUFFICIENT_HINT_MARKERS = (
-    "finish by hand per the justfile RESUME RULES",
-    "so re-running release.py is refused",
-    "reuses the spec of the linked keg",
-)
+# The carrier is a FLAG ON THE EXCEPTION, not a substring of its message.
+# Three heads were spent patching a substring heuristic and each left a hole:
+# first it knew one hint of three, then -- once the guard reached inside
+# `fetch_bottle` -- a fragment match fired on messages that merely QUOTED a
+# hint, because `bottle_entry` reports a rejected field by echoing its value,
+# so a JSON field carrying "finish by hand per the justfile RESUME RULES" had
+# BOTTLE_FALLBACK_HINT and the "no usable macOS bottle" framing stripped from
+# its failure. Bottle JSON is attacker-reachable by this file's own threat
+# model (see `fetch_bottle`), so that let the content choose which recovery
+# route the operator was shown (adversary F1, ninth review, 2026-10-23). A
+# flag cannot be forged by message text, needs no marker/hint coupling test,
+# and states the property at the raise site, where the author knows the answer.
 
 
 class ReleaseError(RuntimeError):
-    """Release invariant failed."""
+    """Release invariant failed.
+
+    `self_sufficient` marks a message that already says how far the release got
+    and names its own recovery route, so the two wrapping handlers re-raise it
+    untouched instead of appending a second, conflicting one. Set it at every
+    raise site whose message carries one of the hints above; the test
+    `test_every_hint_carrying_raise_site_declares_itself_self_sufficient`
+    walks this file's AST and fails on one that forgets.
+    """
+
+    def __init__(self, *args: object, self_sufficient: bool = False) -> None:
+        super().__init__(*args)
+        self.self_sufficient = self_sufficient
 
 
 @dataclass(frozen=True)
@@ -325,7 +349,8 @@ class PinnedRedirectHandler(urllib.request.HTTPRedirectHandler):
         parsed = urlsplit(newurl)
         if parsed.scheme != "https" or parsed.hostname not in ARCHIVE_HOSTS:
             raise ReleaseError(
-                f"refuse redirect off GitHub HTTPS: {newurl!r}. {RESUME_BY_HAND_HINT}"
+                f"refuse redirect off GitHub HTTPS: {newurl!r}. {RESUME_BY_HAND_HINT}",
+                self_sufficient=True,
             )
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
@@ -361,9 +386,9 @@ def parent_slug(repo: dict) -> str | None:
     return None
 
 
-def _require(value: bool, message: str) -> None:
+def _require(value: bool, message: str, *, self_sufficient: bool = False) -> None:
     if not value:
-        raise ReleaseError(message)
+        raise ReleaseError(message, self_sufficient=self_sufficient)
 
 
 def preflight(release: Release, *, allow_dirty: bool) -> None:
@@ -837,7 +862,8 @@ def archive_facts(
             delay *= 2
     raise ReleaseError(
         f"could not fetch {release.archive_url} after {ARCHIVE_ATTEMPTS} attempts: "
-        f"{last_error}. {RESUME_BY_HAND_HINT}"
+        f"{last_error}. {RESUME_BY_HAND_HINT}",
+        self_sufficient=True,
     )
 
 
@@ -883,23 +909,27 @@ def require_archive_matches_tag(release: Release, *, dry_run: bool) -> None:
         raise ReleaseError(
             f"cannot resolve {release.tag} to a local commit, so the archive "
             f"cannot be checked against it: {describe(error)}. "
-            f"{RESUME_BY_HAND_HINT}"
+            f"{RESUME_BY_HAND_HINT}",
+            self_sufficient=True,
         ) from error
     _require(
         COMMIT_RE.fullmatch(expected) is not None,
         f"cannot resolve {release.tag} to a local commit, so the archive "
         f"cannot be checked against it: got {expected!r}. {RESUME_BY_HAND_HINT}",
+        self_sufficient=True,
     )
     found, archive = archive_facts(release, dry_run=dry_run)[1:]
     _require(
         found is not None,
         f"{release.archive_url} carries no commit id in its tar header, so it "
         f"is not an archive GitHub generated for this tag. {RESUME_BY_HAND_HINT}",
+        self_sufficient=True,
     )
     _require(
         found == expected,
         f"{release.archive_url} names commit {found}, but {release.tag} is "
         f"{expected}: the archive is not this tag's. {RESUME_BY_HAND_HINT}",
+        self_sufficient=True,
     )
     _require(
         archive is not None,
@@ -908,17 +938,20 @@ def require_archive_matches_tag(release: Release, *, dry_run: bool) -> None:
         "refuses (an absolute path, `..`, a special file, or an escaping "
         "symlink or hardlink), or could not be fingerprinted. "
         f"{RESUME_BY_HAND_HINT}",
+        self_sufficient=True,
     )
     expected_tree = tag_tree(release)
     _require(
         expected_tree is not None,
         f"cannot fingerprint {release.tag}'s own tree with `git archive`, so "
         f"the archive has nothing to be checked against. {RESUME_BY_HAND_HINT}",
+        self_sufficient=True,
     )
     _require(
         archive == expected_tree,
         f"{release.archive_url} is not {release.tag}'s tree: "
         f"{describe_tree_mismatch(archive, expected_tree)}. {RESUME_BY_HAND_HINT}",
+        self_sufficient=True,
     )
     log(
         f"archive of {release.tag} is commit {found} and matches its tree "
@@ -1002,9 +1035,15 @@ def create_tag_and_release(
             ]
         )
         # Inside the `with`, immediately after the call that earns it: an
-        # OSError from __exit__'s close or unlink -- a $TMPDIR reaper, EIO --
-        # would otherwise leave the flag False after a fully successful
-        # `gh release create` (adversary F2c, 2026-10-23).
+        # OSError out of __exit__ would otherwise leave the flag False after a
+        # fully successful `gh release create`, and the tag-only hint would
+        # then send the operator looking for a Release that exists (adversary
+        # F2c, 2026-10-23). What can actually propagate from here is an EIO or
+        # ENOSPC from the final `close()`, or an `unlink` failing with
+        # something other than FileNotFoundError: `tempfile`'s own closer
+        # wraps that one in `except FileNotFoundError: pass`, so a $TMPDIR
+        # reaper deleting the file cannot raise at all -- an earlier version of
+        # this comment named exactly that (adversary F4, ninth review).
         state.release_created = True
 
 
@@ -1361,9 +1400,15 @@ def fetch_bottle(release: Release, dest: Path, *, dry_run: bool) -> list[Path]:
         # `main`'s guard cannot help: by the time it sees this the composition
         # has already happened, so it correctly re-raises untouched. The guard
         # has to be here too (adversary F1, 2026-10-23).
-        if isinstance(error, ReleaseError) and any(
-            marker in str(error) for marker in SELF_SUFFICIENT_HINT_MARKERS
-        ):
+        #
+        # It reads the FLAG, never the message. The validation errors from
+        # `bottle_entry` echo the rejected field value, so a substring test
+        # here fired on bottle JSON that merely quoted a hint and stripped the
+        # bottle route from a bottle failure (adversary F1, ninth review).
+        # `isinstance` is load-bearing: the other five caught types have no
+        # such attribute, and reading one off them would be an AttributeError
+        # inside an exception handler.
+        if isinstance(error, ReleaseError) and error.self_sufficient:
             raise
         detail = (
             describe(error)
@@ -1371,7 +1416,9 @@ def fetch_bottle(release: Release, dest: Path, *, dry_run: bool) -> list[Path]:
             else error
         )
         raise ReleaseError(
-            f"no usable macOS bottle for {release.tag}: {detail}\n{BOTTLE_FALLBACK_HINT}"
+            f"no usable macOS bottle for {release.tag}: {detail}\n"
+            f"{BOTTLE_FALLBACK_HINT}",
+            self_sufficient=True,
         ) from error
     return jsons
 
@@ -1413,6 +1460,7 @@ def verify_release_assets(
                         f"downloading release asset {name} produced "
                         f"{landed or 'no files'}; expected exactly that one name\n"
                         + BOTTLE_FALLBACK_HINT,
+                        self_sufficient=True,
                     )
                     actual = file_sha256(asset_dir / name)
                 except (subprocess.CalledProcessError, OSError) as error:
@@ -1423,13 +1471,15 @@ def verify_release_assets(
                     )
                     raise ReleaseError(
                         f"cannot download release asset {name}: {detail}\n"
-                        + BOTTLE_FALLBACK_HINT
+                        + BOTTLE_FALLBACK_HINT,
+                        self_sufficient=True,
                     ) from error
                 _require(
                     actual == spec["sha256"],
                     f"release asset {name} hashes to {actual}, but the CI artifact "
                     f"recorded {spec['sha256']}; the tap was not touched\n"
                     + BOTTLE_FALLBACK_HINT,
+                    self_sufficient=True,
                 )
 
 
@@ -1470,6 +1520,7 @@ def merge_bottle(
             and release.tag in merged,
             f"brew bottle --merge wrote no bottle block for {release.tag}\n"
             + BOTTLE_FALLBACK_HINT,
+            self_sufficient=True,
         )
         # Homebrew pastes the JSON's strings into Ruby source; nothing but the
         # block the validated fields make may reach a commit.
@@ -1478,6 +1529,7 @@ def merge_bottle(
             "the bottle block brew bottle --merge wrote differs from the one the "
             "validated JSON fields make; nothing was committed or pushed\n"
             + BOTTLE_FALLBACK_HINT,
+            self_sufficient=True,
         )
     except ReleaseError:
         run(["git", "checkout", "--", str(TAP_FORMULA_REL)], cwd=tap)
@@ -1554,7 +1606,11 @@ def brew_install_and_test(*, build_from_source: bool, dry_run: bool) -> str:
         install_from_source(dry_run=dry_run)
     else:
         head_keg = linked_head_keg(dry_run=dry_run)
-        _require(head_keg is None, HEAD_KEG_HINT.format(keg=head_keg))
+        _require(
+            head_keg is None,
+            HEAD_KEG_HINT.format(keg=head_keg),
+            self_sufficient=True,
+        )
         # --force-bottle makes brew refuse rather than quietly compile when it
         # finds no bottle it can pour; the cause is named, not hidden.
         result = run(
@@ -1568,6 +1624,7 @@ def brew_install_and_test(*, build_from_source: bool, dry_run: bool) -> str:
             result.returncode == 0,
             f"brew could not pour a bottle for {FORMULA_NAME}.\n"
             + BOTTLE_FALLBACK_HINT,
+            self_sufficient=True,
         )
     prefix = (
         output(["brew", "--prefix", FORMULA_NAME], dry_run=dry_run)
@@ -1725,9 +1782,12 @@ def main(argv: list[str] | None = None) -> int:
         if not state.tag_pushed:
             raise
         message = str(error)
-        if isinstance(error, ReleaseError) and any(
-            marker in message for marker in SELF_SUFFICIENT_HINT_MARKERS
-        ):
+        # The flag, never the message: an error whose text merely QUOTES a hint
+        # (a `_require` echoing a rejected field value, a CalledProcessError
+        # whose stderr contains one) still needs the resume path appended.
+        # `isinstance` is load-bearing -- an arbitrary Exception has no such
+        # attribute (adversary F2, ninth review, 2026-10-23).
+        if isinstance(error, ReleaseError) and error.self_sufficient:
             raise
         if isinstance(error, subprocess.CalledProcessError):
             # `describe` carries the failed command's own stderr, and since
@@ -1749,7 +1809,7 @@ def main(argv: list[str] | None = None) -> int:
             # an OSError (adversary F2, 2026-10-23).
             detail = f"{type(error).__name__}: {error}"
         hint = RESUME_BY_HAND_HINT if state.release_created else RESUME_TAG_ONLY_HINT
-        raise ReleaseError(f"{detail}. {hint}") from error
+        raise ReleaseError(f"{detail}. {hint}", self_sufficient=True) from error
     log(f"done: {release.title} ({release.tag})")
     return 0
 

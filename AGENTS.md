@@ -239,15 +239,29 @@ would gate the release-tag leg on a changed-file comparison.
 No `--` after `bg`: it takes the command directly and refuses a lone `--` with
 exit 2, which reads exactly like the tests failing.
 
-**Every `gh` command in this checkout needs `--repo frdminc/sudo-secretspec`.**
-The repo has two remotes -- `origin` (the fork) and `upstream`
-(`cachix/secretspec`) -- and `gh` resolves to the **upstream** one, so a query
-without the flag silently answers about a different repository. It does not
-error: `gh run list --branch sudo-main` returns `[]` (upstream has no such
-branch) and a bare `gh run list` shows upstream's pull-request runs, both of
-which read as facts about this fork. `gh run watch <id>` is the only one that
-fails loudly, with `HTTP 404` naming `cachix/secretspec`. One wrong conclusion
-was published from this on 2026-10-23 before the 404 exposed it.
+**`gh` in this checkout answers about `cachix/secretspec` unless told
+otherwise.** The repo has two remotes -- `origin` (the fork) and `upstream`
+(`cachix/secretspec`) -- and with no `gh-resolved` set, `gh` picks **upstream**.
+Run `gh repo set-default frdminc/sudo-secretspec` once (it writes
+`remote.origin.gh-resolved`) and every unflagged command answers about the
+fork; `--repo frdminc/sudo-secretspec` is still right to pass explicitly, and
+is the only thing that works in a fresh clone.
+
+Which way it fails matters, because the dangerous direction is the quiet one:
+
+- **Loud**, so you cannot miss it: anything addressed by id or name --
+  `gh run view <id>`, `gh run watch <id>`, `gh api repos/.../actions/runs/<id>`,
+  `gh release view <tag>`. They exit non-zero, and the first three print
+  `HTTP 404` naming `cachix/secretspec`.
+- **Silent**, and this is the trap: queries that succeed with an upstream or
+  empty answer. `gh run list --branch sudo-main` exits 0 with nothing (`[]`
+  with `--json`), because upstream has no such branch; a bare `gh run list`
+  shows upstream's pull-request runs; `gh repo view` reports
+  `cachix/secretspec`. Each reads as a fact about this fork.
+
+A CI conclusion was stated from such a query on 2026-10-23 and had to be
+retracted for want of evidence -- re-querying with the flag happened to support
+it, but the original query had not.
 
 Pin 3.13 because that is what the workflow's `packaging` job pins **for the
 tests** -- a release itself runs under `#!/usr/bin/env python3`, whatever that

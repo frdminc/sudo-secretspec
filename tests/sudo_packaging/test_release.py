@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import importlib.util
 import io
@@ -11,6 +12,7 @@ import re
 import subprocess
 import sys
 import tarfile
+import types
 import urllib.error
 from pathlib import Path
 
@@ -2297,26 +2299,51 @@ def _published(monkeypatch, release, *, release_created=True):
     monkeypatch.setattr(release, "brew_refresh", lambda *a, **k: Path("/tap"))
 
 
-def test_each_self_sufficient_marker_appears_in_the_hint_it_stands_for(release):
-    """`SELF_SUFFICIENT_HINT_MARKERS` holds fragments rather than the hint
-    constants, because HEAD_KEG_HINT is used through `.format(keg=...)` and so
-    is never a substring of the message it produces.
+def test_every_hint_carrying_raise_site_declares_itself_self_sufficient(release):
+    """A raise site whose message carries one of the hints must pass
+    `self_sufficient=True`, or the two wrapping handlers append a second,
+    conflicting route to it.
 
-    A fragment that stops matching its hint would silently re-open F1 -- the
-    handler would append a second "already published" claim again -- so the
-    coupling is asserted here rather than assumed.
+    The set is DERIVED from the module and the file's AST, not listed here.
+    Every earlier version of this check listed what it knew, and that is
+    exactly how the defect shipped twice: `0c19acb`'s guard knew one hint of
+    three, and the hard-coded `hints` tuple that replaced it would have passed
+    a fifth hint added with no registration (adversary F8, ninth review,
+    2026-10-23). This fails the day a hint-carrying raise site forgets the
+    keyword, whichever hint it is.
     """
-    hints = (
-        release.RESUME_BY_HAND_HINT,
-        release.BOTTLE_FALLBACK_HINT,
-        release.HEAD_KEG_HINT.format(keg="sudo-secretspec/HEAD-7c1f700"),
+    hint_names = {name for name in dir(release) if name.endswith("_HINT")}
+    assert len(hint_names) >= 4, hint_names
+    # `main` composes through a local named `hint`, chosen between two
+    # constants, so the local counts as carrying one.
+    carriers = hint_names | {"hint"}
+    offenders = []
+    for node in ast.walk(ast.parse(RELEASE_PY.read_text(encoding="utf-8"))):
+        if not isinstance(node, ast.Call):
+            continue
+        called = (
+            node.func.id
+            if isinstance(node.func, ast.Name)
+            else getattr(node.func, "attr", "")
+        )
+        if called not in {"ReleaseError", "_require"}:
+            continue
+        if not any(
+            isinstance(inner, ast.Name) and inner.id in carriers
+            for arg in node.args
+            for inner in ast.walk(arg)
+        ):
+            continue
+        if not any(
+            keyword.arg == "self_sufficient"
+            and isinstance(keyword.value, ast.Constant)
+            and keyword.value.value is True
+            for keyword in node.keywords
+        ):
+            offenders.append(node.lineno)
+    assert offenders == [], (
+        f"release.py lines missing self_sufficient=True: {offenders}"
     )
-    assert len(release.SELF_SUFFICIENT_HINT_MARKERS) == len(hints)
-    for marker, hint in zip(release.SELF_SUFFICIENT_HINT_MARKERS, hints):
-        assert marker in hint, marker
-    # And the tag-only wording is covered by the first marker, since it ends
-    # with the same sentence.
-    assert release.SELF_SUFFICIENT_HINT_MARKERS[0] in release.RESUME_TAG_ONLY_HINT
 
 
 @pytest.mark.parametrize(
@@ -2327,8 +2354,8 @@ def test_each_self_sufficient_marker_appears_in_the_hint_it_stands_for(release):
 def test_a_failure_that_already_names_its_remedy_is_not_given_a_second_one(
     monkeypatch, release, cut, hint_name, already_published_count
 ):
-    """Every hint in `SELF_SUFFICIENT_HINT_MARKERS` already says the release is
-    published and names the one route out of its own failure. Appending the
+    """Every self-sufficient hint already says how far the release got and
+    names the one route out of its own failure. Appending the
     generic hint on top states the claim twice, joined by "..", with two
     conflicting recipes: `brew reinstall --build-from-source` from the bottle
     hint against the justfile's "pour the bottle", which is the step that just
@@ -2346,7 +2373,9 @@ def test_a_failure_that_already_names_its_remedy_is_not_given_a_second_one(
     _published(monkeypatch, release)
 
     def boom(**_kwargs):
-        raise release.ReleaseError(f"no usable macOS bottle for the tag\n{hint}")
+        raise release.ReleaseError(
+            f"no usable macOS bottle for the tag\n{hint}", self_sufficient=True
+        )
 
     monkeypatch.setattr(release, "brew_install_and_test", boom)
     with pytest.raises(release.ReleaseError) as caught:
@@ -2394,6 +2423,52 @@ def test_release_created_is_set_only_once_gh_release_create_returns(
         release.create_tag_and_release(cut, "notes", state, dry_run=False)
         assert state.tag_pushed is True
         assert state.release_created is True
+
+
+def test_release_created_survives_a_notes_file_that_cannot_be_closed(
+    monkeypatch, release, cut
+):
+    """The flag is set INSIDE the `with`, right after the call that earns it.
+
+    Outside it, an OSError out of `__exit__` -- an EIO or ENOSPC from the final
+    `close()`, or an `unlink` failing with anything other than
+    FileNotFoundError -- leaves the flag False after a fully successful
+    `gh release create`, and the operator is then sent looking for a Release
+    that exists. Restoring the pre-2efe431 placement left all 138 tests green
+    (mutation NA, adversary F3, ninth review, 2026-10-23): the one test that
+    runs the real function never made the block's exit fail, and every other
+    test stubs the function and sets the flag by hand.
+    """
+
+    class ExplodingNotes:
+        """A NamedTemporaryFile whose exit fails after a clean body."""
+
+        def __init__(self, *_args, **_kwargs):
+            self.name = "/tmp/notes-that-cannot-be-closed.md"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            raise OSError(5, "I/O error")
+
+        def write(self, _text):
+            return None
+
+        def flush(self):
+            return None
+
+    state = release.CleanupState()
+    monkeypatch.setattr(release, "output", lambda argv, **kwargs: "")
+    monkeypatch.setattr(release, "run", lambda argv, **kwargs: completed(argv))
+    monkeypatch.setattr(
+        release, "tempfile", types.SimpleNamespace(NamedTemporaryFile=ExplodingNotes)
+    )
+
+    with pytest.raises(OSError):
+        release.create_tag_and_release(cut, "notes", state, dry_run=False)
+    assert state.tag_pushed is True
+    assert state.release_created is True
 
 
 def test_a_post_publication_command_failure_keeps_the_command_output(
@@ -2474,32 +2549,43 @@ def test_a_post_publication_interrupt_is_not_redressed_as_a_release_error(
         release.main(["--version", cut.version, "--skip-tests"])
 
 
+@pytest.mark.parametrize(
+    "kind", ["os_error", "unflagged_release_error"], ids=["os_error", "release_error"]
+)
 def test_an_error_that_merely_quotes_a_hint_still_gets_the_resume_path(
-    monkeypatch, release, cut
+    monkeypatch, release, cut, kind
 ):
-    """The guard is `isinstance(error, ReleaseError) AND a marker matches`, and
-    the `isinstance` half is what the fragment mechanism rests on.
+    """The guard reads `error.self_sufficient`, never the message, and both
+    halves of `isinstance(error, ReleaseError) and error.self_sufficient` are
+    load-bearing.
 
-    A fragment match is looser than a constant match, so a non-ReleaseError
-    whose text happens to contain one -- `gh` or `brew` stderr that quoted a
-    hint back, an OSError on a path named after one -- would otherwise be
-    passed through with NO resume hint at all. That is the mirror image of the
-    doubled hint and strictly worse: silence instead of noise. Dropping the
-    `isinstance` left all 135 tests green (mutation N4, adversary F3.1,
-    2026-10-23).
+    An error whose text merely QUOTES a hint -- `gh` or `brew` stderr that
+    echoed one back, a `_require` reporting a rejected field by printing its
+    value -- must still get the resume path. Detecting self-sufficiency by
+    substring is what made that fail: the fragment matched and the error was
+    passed through with NO hint at all, which is the mirror image of the
+    doubled hint and strictly worse, silence instead of noise. Dropping the
+    `isinstance` half left all 135 tests green (mutation N4, adversary F3.1,
+    2026-10-23); reading the message instead of the flag is what shipped in
+    2efe431 (adversary F1, ninth review).
     """
     _published(monkeypatch, release)
-    quoted = release.SELF_SUFFICIENT_HINT_MARKERS[0]
+    quoted = release.RESUME_BY_HAND_HINT
 
     def boom(**_kwargs):
-        raise OSError(f"brew said: {quoted}")
+        if kind == "os_error":
+            raise OSError(f"brew said: {quoted}")
+        # A ReleaseError that quotes a hint without declaring itself
+        # self-sufficient: the flag says it is not, so the hint is appended.
+        raise release.ReleaseError(f"tap formula mentions: {quoted}")
 
     monkeypatch.setattr(release, "brew_install_and_test", boom)
     with pytest.raises(release.ReleaseError) as caught:
         release.main(["--version", cut.version, "--skip-tests"])
     message = str(caught.value)
     assert release.RESUME_BY_HAND_HINT in message, message
-    assert "OSError" in message
+    if kind == "os_error":
+        assert "OSError" in message
 
 
 def test_a_release_error_without_a_hint_is_not_prefixed_with_its_type(
@@ -2526,8 +2612,13 @@ def test_a_release_error_without_a_hint_is_not_prefixed_with_its_type(
     assert "ReleaseError" not in message
 
 
+@pytest.mark.parametrize(
+    ("kind", "keeps_its_own_route"),
+    [("flagged", True), ("quoting", False), ("os_error", False)],
+    ids=["flagged", "merely_quoting", "os_error_quoting"],
+)
 def test_a_bottle_failure_does_not_double_a_hint_the_inner_error_already_carried(
-    monkeypatch, release, cut, tmp_path
+    monkeypatch, release, cut, tmp_path, kind, keeps_its_own_route
 ):
     """`fetch_bottle` composes its own hint onto whatever it caught, and the
     error it can catch with a hint already on it is reachable: the
@@ -2540,11 +2631,22 @@ def test_a_bottle_failure_does_not_double_a_hint_the_inner_error_already_carried
     why the guard has to be at the inner wrap too (adversary F1, 2026-10-23).
     Here the appended bottle route is the MORE wrong of the two, because what
     failed was a source download.
+
+    The three cases pin that the guard reads the FLAG and not the message, at
+    this site as well as at `main`'s: an error that merely quotes a hint, and a
+    non-ReleaseError that quotes one, both still need the bottle route. A
+    substring test here stripped it from any `bottle_entry` validation failure
+    whose echoed field value contained the sentence (adversary F1 and F2, ninth
+    review, 2026-10-23).
     """
-    inner = release.ReleaseError(
-        "could not fetch the archive after 5 attempts: connection reset. "
-        + release.RESUME_BY_HAND_HINT
-    )
+    detail = "could not fetch the archive after 5 attempts: connection reset. "
+    if kind == "os_error":
+        inner = OSError(detail + release.RESUME_BY_HAND_HINT)
+    else:
+        inner = release.ReleaseError(
+            detail + release.RESUME_BY_HAND_HINT,
+            self_sufficient=kind == "flagged",
+        )
 
     def boom(*_a, **_k):
         raise inner
@@ -2562,8 +2664,46 @@ def test_a_bottle_failure_does_not_double_a_hint_the_inner_error_already_carried
     with pytest.raises(release.ReleaseError) as caught:
         release.fetch_bottle(cut, tmp_path, dry_run=False)
     message = str(caught.value)
-    assert message.count("already published") == 1, message
-    assert release.BOTTLE_FALLBACK_HINT not in message
+    if keeps_its_own_route:
+        assert message.count("already published") == 1, message
+        assert release.BOTTLE_FALLBACK_HINT not in message
+    else:
+        # Not self-sufficient, so the bottle route is appended exactly once.
+        assert release.BOTTLE_FALLBACK_HINT in message, message
+        assert "no usable macOS bottle" in message
+
+
+def test_a_bottle_json_quoting_a_hint_still_gets_the_bottle_route(
+    monkeypatch, release, cut, tmp_path
+):
+    """The reachable false positive the substring guard had, end to end.
+
+    `bottle_entry` reports every bottle-JSON validation failure by echoing the
+    rejected value, so a `formula.path` carrying the sentence "finish by hand
+    per the justfile RESUME RULES" produced a ReleaseError whose text matched
+    the registry -- and `fetch_bottle` re-raised it with no
+    BOTTLE_FALLBACK_HINT and without the "no usable macOS bottle" framing. The
+    bottle job's filesystem stays writable between build and attest (see
+    `fetch_bottle`), so the JSON's content is attacker-reachable and could
+    choose which recovery route the operator was shown (adversary F1, ninth
+    review, 2026-10-23).
+
+    This test fails on the substring guard and passes on the flag.
+    """
+    quoted = f"Library/Taps/x/y/Formula/z.rb -- {release.RESUME_BY_HAND_HINT}"
+    fake_bottle_run(
+        monkeypatch,
+        release,
+        cut,
+        runs=[{"databaseId": 8, "headSha": TAG_SHA}],
+        doc=bottle_json(release, cut, path=quoted),
+    )
+    with pytest.raises(release.ReleaseError) as caught:
+        release.fetch_bottle(cut, tmp_path, dry_run=False)
+    message = str(caught.value)
+    assert "formula path" in message, message
+    assert release.BOTTLE_FALLBACK_HINT in message, message
+    assert "no usable macOS bottle" in message
 
 
 def test_an_unfingerprintable_tree_logs_what_actually_went_wrong(

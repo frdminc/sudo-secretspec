@@ -10,6 +10,16 @@
 # RESUME RULES after a failure:
 # - Failed before or during tests: fix, then re-run `just release <version>`.
 #   Stamping and the stamp commit are idempotent no-ops the second time.
+# - Failed AFTER "git push origin <tag>" but with NO GitHub Release yet (the
+#   tag push and `gh release create` are two steps, and release.py says so:
+#   "release.py did not see `gh release create` succeed"): do NOT re-run —
+#   preflight will refuse the published serial. Check `gh release view <tag>
+#   --repo frdminc/sudo-secretspec` first, because a signal or a dropped
+#   connection can leave the Release in place while release.py never saw it
+#   return. If it is missing, `gh release create <tag> --repo
+#   frdminc/sudo-secretspec --title <title> --notes-file <notes>`, then follow
+#   the rule below. The rule below does NOT cover this state on its own: its
+#   `brew reinstall` would pour the previous release's bottle.
 # - Failed AFTER "git push origin <tag>" (tag/Release/formula/tap already
 #   public): do NOT re-run — release.py preflight will refuse the published
 #   serial. Finish by hand: `brew update --force && brew reinstall
