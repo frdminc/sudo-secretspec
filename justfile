@@ -21,29 +21,40 @@
 #      exist although release.py never saw it return. "release not found"
 #      names no repository, so check the --repo before believing it.
 #   2. If it is missing, write the notes file (the one passed to `just
-#      release`, else `python3 -c 'import sys; sys.path.insert(0, "packaging");
-#      import release; sys.stdout.write(release.default_notes())' > <notes>`)
-#      and create it, with --verify-tag so a mistyped <tag> aborts instead of
-#      creating a NEW public tag at the branch head: `gh release create <tag>
-#      --verify-tag --repo frdminc/sudo-secretspec --title "$(git tag -l
-#      --format='%(contents:subject)' <tag>)" --notes-file <notes>` (the title
-#      is the annotated tag's subject; an empty title means <tag> is wrong).
+#      release`, else `python3 -B -c 'import sys; sys.path.insert(0,
+#      "packaging"); import release; sys.stdout.write(release.default_notes())'
+#      > <notes>`, from the repo root) and read the title FIRST:
+#      `title=$(git tag -l --format='%(contents:subject)' <tag>); test -n
+#      "$title" || echo "tag not in this clone: git fetch --tags origin"`. An
+#      empty title means the tag is not in THIS clone; `gh release create`
+#      would accept `--title ""`. Then create it, with --verify-tag so a
+#      mistyped <tag> aborts instead of creating a NEW public tag at the
+#      branch head: `gh release create <tag> --verify-tag --repo
+#      frdminc/sudo-secretspec --title "$title" --notes-file <notes>`.
 #   3. `publish-bottle` polls only about ten minutes for the Release, then
 #      fails; its upload has no --clobber. If it failed for want of the
 #      Release, find the tag's run with `gh run list --repo
 #      frdminc/sudo-secretspec --branch <tag>` (always --repo), and once the
 #      bottle job is green re-run it: `gh run rerun <run-id> --failed --repo
-#      frdminc/sudo-secretspec`. If a partial upload is already on the Release,
-#      upload the missing assets by hand with `gh release upload --clobber`.
-#   4. Do what fetch_bottle, update_formula_commit, sync_tap and merge_bottle
-#      do, IN THAT ORDER and without skipping the first: fetch_bottle runs
-#      `gh attestation verify` on the bottle JSON, every tarball and
-#      source.sha256, validates each JSON field, and checks source.sha256
-#      against the digest of the tag's archive -- the only check tying the
-#      shipped binary to the verified tree. Then the formula url and sha256,
-#      commit, tap push, and `brew bottle --merge --write` with the VERIFIED
-#      bottle JSON. Read those four functions first; they are the only
-#      description, and release.py has no mode that runs them for you.
+#      frdminc/sudo-secretspec`. Never upload assets by hand: step 4's
+#      verify_release_assets expects exactly the job's files. If a partial
+#      upload is on the Release, remove those assets (`gh release delete-asset
+#      <tag> <name> --repo frdminc/sudo-secretspec`) before the re-run.
+#   4. This is the step release.py cannot do for you, and a hand version is
+#      only as safe as your copy of what it does. In `_release_body` order,
+#      read and reproduce `fetch_bottle` (gh attestation verify with the
+#      workflow identity, source ref and tag commit on the bottle JSON, every
+#      tarball and source.sha256; field validation; the tarball-hash check),
+#      `update_formula_commit` (which starts with `require_archive_matches_tag`),
+#      `sync_tap`, and `merge_bottle` (which starts with
+#      `verify_release_assets`). ONE download of the tag's archive must feed
+#      the tree check, the source.sha256 comparison and the formula sha256
+#      (`archive_facts` memoises it for exactly that reason); a fresh download
+#      per step lets the three disagree unseen. The source.sha256 comparison is
+#      the only check tying the shipped binary to the verified tree, so it is
+#      not optional. Finish with `verify_readback`, which step 5's rule does
+#      not do. The next slice is a `--resume-after-release` mode so this is
+#      code, not prose.
 #   5. Then follow the rule below.
 # - Failed AFTER "git push origin <tag>" (tag/Release/formula/tap already
 #   public): do NOT re-run — release.py preflight will refuse the published

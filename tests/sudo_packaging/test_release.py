@@ -1909,8 +1909,12 @@ def test_fetch_bottle_refuses_a_ci_build_of_another_source_archive(
         runs=[{"databaseId": 8, "headSha": TAG_SHA}],
         source="6" * 64,
     )
-    with pytest.raises(release.ReleaseError, match="different source archive"):
+    with pytest.raises(release.ReleaseError, match="different source archive") as seen:
         release.fetch_bottle(cut, tmp_path, dry_run=False)
+    # The integrity refusal must still tell the operator what to do (a false
+    # flag here would pass it through bare: adversary X1, twelfth review).
+    assert release.BOTTLE_FALLBACK_HINT in str(seen.value)
+    assert seen.value.self_sufficient is True
 
 
 def test_fetch_bottle_refuses_an_artifact_without_the_source_hash(
@@ -2372,18 +2376,54 @@ def _release_error_aliases():
     errors the call scan never sees (adversary B5/N6/N7)."""
     tree = ast.parse(RELEASE_PY.read_text(encoding="utf-8"))
     watched = {"ReleaseError", "_require"}
+
+    def names_watched(expression):
+        return expression is not None and any(
+            (isinstance(inner, ast.Name) and inner.id in watched)
+            or (isinstance(inner, ast.Attribute) and inner.attr in watched)
+            for inner in ast.walk(expression)
+        )
+
     lines = []
     for node in ast.walk(tree):
         if isinstance(node, ast.ClassDef):
-            if any(isinstance(b, ast.Name) and b.id in watched for b in node.bases):
+            # Any base that mentions the class, however it is spelled
+            # (`sys.modules[__name__].ReleaseError`: adversary X11).
+            if any(names_watched(base) for base in node.bases):
                 lines.append(node.lineno)
-        elif (
-            isinstance(node, ast.Assign)
-            and isinstance(node.value, ast.Name)
-            and node.value.id in watched
-        ):
-            lines.append(node.lineno)
-    return lines
+        elif isinstance(node, ast.Assign | ast.AnnAssign) and names_watched(node.value):
+            lines.append(node.lineno)  # `_Fail = ReleaseError`, `_Fail: type = ...`
+        elif isinstance(node, ast.Call):
+            callee = getattr(node.func, "id", getattr(node.func, "attr", ""))
+            # `partial(ReleaseError, ...)` and `type("X", (ReleaseError,), {})`
+            # build errors through a name the call scan does not know (X6b, X7).
+            if callee in {"partial", "type"} and any(
+                names_watched(arg) for arg in node.args
+            ):
+                lines.append(node.lineno)
+    # The flag is read at catch time by the guards, so setting it after
+    # construction is a false flag the constructor audit never sees (X1).
+    # The constructor itself is the one place allowed to set it.
+    own_body = {
+        id(inner)
+        for cls in ast.walk(tree)
+        if isinstance(cls, ast.ClassDef) and cls.name == "ReleaseError"
+        for inner in ast.walk(cls)
+    }
+    for node in ast.walk(tree):
+        if id(node) in own_body:
+            continue
+        targets = (
+            node.targets
+            if isinstance(node, ast.Assign)
+            else [node.target]
+            if isinstance(node, ast.AnnAssign | ast.AugAssign)
+            else []
+        )
+        for target in targets:
+            if isinstance(target, ast.Attribute) and target.attr == "self_sufficient":
+                lines.append(node.lineno)
+    return sorted(set(lines))
 
 
 def test_self_sufficient_is_declared_exactly_where_a_hint_is_carried(release):
@@ -2893,25 +2933,52 @@ def test_the_tag_only_hint_and_the_justfile_rule_it_points_at_stay_together(rele
     )
     assert sentence in hint
     # The justfile wraps its comment lines, so compare with the comment
-    # markers and line breaks removed.
+    # markers and line breaks removed -- and only inside THIS bullet, up to the
+    # next one, so a phrase cannot migrate to the post-publication bullet and
+    # still satisfy the pin (adversary F4b, twelfth review, 2026-10-23).
     flattened = " ".join(
         line.removeprefix("#").strip() for line in justfile.splitlines()
     )
-    assert sentence in flattened
-    assert "no formula commit yet" in flattened
-    assert f"gh release view <tag> --repo {release.FORK_REPO}" in flattened
-    assert "publish-bottle" in flattened
-    # The commands the operator will copy: the right repository, a tag that
-    # must already exist (J2, F2), and the verification step that
-    # `release.py` does in fetch_bottle (F1).
-    assert (
-        f"gh release create <tag> --verify-tag --repo {release.FORK_REPO}" in flattened
-    )
-    assert (
-        "Do what fetch_bottle, update_formula_commit, sync_tap and merge_bottle"
-        in flattened
-    )
-    assert "gh attestation verify" in flattened
+    assert flattened.count(sentence) == 1
+    start = flattened.index(sentence)
+    end = flattened.index("- Failed AFTER", start)
+    bullet = flattened[start:end]
+    assert "no formula commit yet" in bullet
+    # Steps in order; the operator reads them top to bottom.
+    steps = [f" {n}. " for n in range(1, 6)]
+    positions = [bullet.index(step) for step in steps]
+    assert positions == sorted(positions), positions
+    # Every command the operator copies names the fork explicitly, and none
+    # names the upstream repository (the silent case returns `[]`).
+    commands = re.findall(r"`(gh [^`]+)`", bullet)
+    assert len(commands) >= 4, commands
+    for command in commands:
+        assert "cachix" not in command, command
+        # A bare mention (`gh release create`) names a command; only a full
+        # invocation carries arguments that must name the fork.
+        if len(command.split()) > 3 and command.startswith(("gh run ", "gh release ")):
+            assert f"--repo {release.FORK_REPO}" in command, command
+    assert any(c.startswith("gh release create <tag> --verify-tag") for c in commands)
+    # The title is read and checked BEFORE the Release is created.
+    assert bullet.index("test -n") < bullet.index("gh release create <tag>")
+    # Step 4 names the checks the hand route has to reproduce, in order, and
+    # the one-download condition they depend on.
+    step4 = bullet[positions[3] : positions[4]]
+    names = [
+        "fetch_bottle",
+        "update_formula_commit",
+        "require_archive_matches_tag",
+        "sync_tap",
+        "merge_bottle",
+        "verify_release_assets",
+        "verify_readback",
+    ]
+    at = [step4.index(name) for name in names]
+    assert at == sorted(at), dict(zip(names, at))
+    assert "ONE download" in step4
+    assert "gh attestation verify" in step4
+    # Nothing in the bullet tells the operator to upload assets by hand.
+    assert "Never upload assets by hand" in bullet
 
 
 def test_a_bottle_json_quoting_a_hint_still_gets_the_bottle_route(
