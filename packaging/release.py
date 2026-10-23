@@ -587,9 +587,27 @@ def tree_entries(root: Path) -> dict[str, tuple[str, str]]:
 
     `followlinks=False` so a symlinked directory is recorded as a symlink
     rather than walked into (and cannot make the walk cyclic).
+
+    `onerror` raises, because `os.walk`'s default silently *discards* a
+    directory it cannot list -- and since directories are not entries here,
+    an unlistable directory would vanish from the fingerprint along with
+    everything under it. That is a hiding primitive: a hostile archive adds
+    a traversable-but-unlistable directory (mode 0o111) holding, say, a
+    `.cargo/config.toml` with `rustc-wrapper`, which cargo opens by exact
+    name at build time. Today the data filter normalises directory modes to
+    0o755 so the walk descends and the extra path is reported -- but that is
+    a CPython implementation detail, not a guarantee, and it is the only
+    thing standing between a fail-open walk and a silent forgery (adversary
+    F4, 2026-10-23). Raising makes the refusal ours.
     """
     entries: dict[str, tuple[str, str]] = {}
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+
+    def refuse(error: OSError) -> None:
+        raise error
+
+    for dirpath, dirnames, filenames in os.walk(
+        root, followlinks=False, onerror=refuse
+    ):
         for name in filenames + dirnames:
             path = Path(dirpath) / name
             relative = path.relative_to(root).as_posix()
@@ -609,30 +627,48 @@ def extracted_tree(tarball: Path, *, prefix: str) -> dict[str, tuple[str, str]] 
 
     This is the one place release.py writes bytes it does not trust to the
     filesystem, and the whole premise of the caller is that the archive may
-    not be the tag's tree. `filter="data"` refuses absolute paths, `..`
-    traversal, device and special files, setuid/setgid bits, and symlinks
-    whose targets escape the destination. A refusal raises `FilterError`, a
-    `TarError`, reported here as "cannot fingerprint" and turned into a
-    failed binding by the caller.
+    not be the tag's tree.
 
-    Passing it explicitly is not redundant: the default is interpreter
-    dependent. Probed 2026-10-20 -- on 3.13, which `sudo-release.yml` pins,
-    an unfiltered `extractall` writes a `../../escaped.txt` member outside
-    the destination with only a DeprecationWarning; on 3.14, this Mac's
-    interpreter, the default is already `data` and refuses. So the argument
-    is what makes the refusal independent of which Python runs the release.
+    What `filter="data"` *refuses*, raising `FilterError` (a `TarError`): an
+    absolute path, `..` traversal, a device or other special file, a symlink
+    or hardlink whose target escapes the destination. What it instead
+    *normalises*, silently and without raising: setuid, setgid and sticky
+    bits, group/other write bits on files, and directory and symlink modes
+    altogether. Probed on 3.13.14 and 3.14.7 (adversary F3, 2026-10-23):
+    0o4755 and 0o2755 members both land as 0o755, 0o666 as 0o644, a 0o111
+    directory as 0o755. So the fingerprint below compares *post-filter*
+    modes, and a mode-only divergence in those bits is invisible to it --
+    which is harmless here only because git cannot express them either, so
+    the `git archive` side is always 0o100644 or 0o100755.
+
+    Passing the argument explicitly is not redundant, and the reason is not
+    any particular interpreter: never depend on a default that changes under
+    you. It does change -- probed 2026-10-20, confirmed 2026-10-23: 3.13
+    still writes a `../../escaped.txt` member *outside* the destination with
+    only a DeprecationWarning, while 3.14 refuses with
+    `OutsideDestinationError`. The release driver runs under
+    `#!/usr/bin/env python3`, whatever that resolves to on the operator's
+    machine; 3.13 is what `sudo-release.yml`'s packaging job pins for the
+    tests, which is a different thing (adversary F2, 2026-10-23).
     """
     with tempfile.TemporaryDirectory() as workspace:
         destination = Path(workspace)
+        # Everything that touches the extracted bytes is inside the `try`,
+        # not just `extractall`: `iterdir`, `is_dir` and `tree_entries` all
+        # stat, readlink and read files, and `tree_entries` now raises on an
+        # unlistable directory by design. An OSError escaping here would
+        # reach the operator as a bare traceback with no resume path, after
+        # the tag and the Release are already public -- the exact shape of
+        # the defect 9e1312e was written to fix (adversary F5, 2026-10-23).
         try:
             with tarfile.open(tarball, mode="r:*") as archive:
                 archive.extractall(destination, filter="data")
+            roots = list(destination.iterdir())
+            if len(roots) != 1 or roots[0].name != prefix or not roots[0].is_dir():
+                return None
+            return tree_entries(roots[0])
         except (tarfile.TarError, OSError, EOFError, ValueError):
             return None
-        roots = list(destination.iterdir())
-        if len(roots) != 1 or roots[0].name != prefix or not roots[0].is_dir():
-            return None
-        return tree_entries(roots[0])
 
 
 def tag_tree(release: Release) -> dict[str, tuple[str, str]] | None:
@@ -779,10 +815,14 @@ def require_archive_matches_tag(release: Release, *, dry_run: bool) -> None:
     Both read the bytes `archive_facts` hashed, so the digest pinned into the
     formula is the digest of the tree that was checked.
 
-    This is therefore the release's binding, and it trusts CI for none of it.
-    The attested `source.sha256` that `fetch_bottle` checks is corroboration
-    on top -- "CI saw these bytes" -- not the thing being relied on (operator
-    decision, 2026-10-23; see the comment there).
+    This binds *the source the formula will pin* to the tag, locally,
+    trusting CI for none of it. It does NOT bind the source the runner
+    compiled: the bottle job fetches the archive itself, by URL, with its
+    own curl (`sudo-release.yml:177`). Tying those two together is the
+    `source.sha256` comparison in `fetch_bottle`, and nothing else does it.
+    Both checks are load-bearing and neither subsumes the other; only on
+    `--build-from-source`, where there is no bottle and `fetch_bottle` never
+    runs, is this one the whole binding (adversary F1, 2026-10-23).
     """
     if dry_run:
         log(f"[dry-run] bind {release.archive_url} to {release.tag}")
@@ -819,8 +859,9 @@ def require_archive_matches_tag(release: Release, *, dry_run: bool) -> None:
         archive is not None,
         f"{release.archive_url} is not a single `{release.archive_prefix}/` "
         "directory of ordinary files, or carries a member the tar data filter "
-        f"refuses (an absolute path, `..`, a special file, a setuid bit, or an "
-        f"escaping symlink). {RESUME_BY_HAND_HINT}",
+        "refuses (an absolute path, `..`, a special file, or an escaping "
+        "symlink or hardlink), or could not be fingerprinted. "
+        f"{RESUME_BY_HAND_HINT}",
     )
     expected_tree = tag_tree(release)
     _require(
@@ -1213,12 +1254,21 @@ def fetch_bottle(release: Release, dest: Path, *, dry_run: bool) -> list[Path]:
         # step, so a process the build left behind could still rewrite this
         # file and have it signed (adversary F3.1, 2026-10-20).
         #
-        # So this check is belt-and-braces, not the binding. The binding is
-        # `require_archive_matches_tag`: it compares the published archive's
-        # whole tree against `git archive` of the tag, locally, trusting CI
-        # for none of it (adversary 1b, implemented 2026-10-20). What is left
-        # here is corroboration -- "CI saw these bytes" -- which is worth
-        # having and is not evidence of anything stronger.
+        # It is nevertheless LOAD-BEARING, and an earlier version of this
+        # comment was wrong to call it belt-and-braces (adversary F1,
+        # 2026-10-23). `require_archive_matches_tag` binds the source the
+        # formula pins to the tag, but it only ever sees the operator's own
+        # download; the bottle job curls the archive itself
+        # (`sudo-release.yml:177`) and compiles whatever it got. The bottle's
+        # attestation says "sudo-release.yml at this tag produced these
+        # bytes" and carries no statement about the source behind them. So
+        # the comparison below is the only thing in the whole release tying
+        # the shipped, attested binary to the tree that was verified against
+        # the tag. Serve codeload's two fetches different bytes -- cache
+        # poisoning, a hostile resolver on the runner's egress, or GitHub
+        # simply regenerating the archive in between, which this repo already
+        # records as possible (N6b, `archive_facts`) -- and every other check
+        # still passes. Do not remove it, and do not weaken it to a warning.
         #
         # The review's escalation of F3.1 -- move the digest into a job that
         # runs no cargo and no brew and verify *that job's* attestation --
@@ -1630,3 +1680,10 @@ if __name__ == "__main__":
         raise SystemExit(str(error)) from error
     except subprocess.CalledProcessError as error:
         raise SystemExit(describe(error)) from error
+    except OSError as error:
+        # Last resort, so no failure on the post-publication path can reach
+        # the operator as a bare traceback. Everything reachable is supposed
+        # to be a ReleaseError carrying RESUME_BY_HAND_HINT; this catches the
+        # one nobody enumerated, which is the defect class every review of
+        # this file has found (adversary F5, 2026-10-23).
+        raise SystemExit(f"{error}. {RESUME_BY_HAND_HINT}") from error

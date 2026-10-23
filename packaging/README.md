@@ -109,22 +109,43 @@ real thing -- GitHub's v0.19.1-sudo.28 archive and `git archive` of its tag
 fingerprint to 601 identical entries, zero differences (adversary 1b,
 2026-10-20).
 
-Extraction uses `filter="data"`, explicitly: this is the one place release.py
-writes untrusted bytes to disk, and on Python 3.13, which `sudo-release.yml`
-pins, the `extractall` default still escapes the destination with only a
-DeprecationWarning. Both checks read the memoised download, so the digest
-pinned into the formula is the digest of the tree that was checked.
+Extraction uses `filter="data"`, explicitly, because this is the one place
+release.py writes untrusted bytes to disk and the `extractall` default is one
+that changes under you: 3.13 still writes an escaping member outside the
+destination with only a DeprecationWarning, 3.14 refuses. (The release driver
+runs under `#!/usr/bin/env python3`, whatever that resolves to; 3.13 is what
+`sudo-release.yml`'s packaging job pins for the *tests*, which is a different
+thing.) Note what the filter does and does not do: it **refuses** absolute
+paths, `..`, special files and escaping symlinks and hardlinks, but it
+silently **normalises** setuid, setgid, sticky and group/other write bits, and
+directory modes altogether -- so the fingerprint compares post-filter modes.
+That is harmless only because git cannot express those bits either. Both
+checks read the memoised download, so the digest pinned into the formula is
+the digest of the tree that was checked.
 
-The artifact must hold exactly one bottle JSON, and `source.sha256` is
-attested like the tarball and the JSON and verified before it is read. Its
-bytes are written from a step output recorded before `brew install
---build-bottle` runs, so the on-disk file a `build.rs` can reach is no longer
-what gets copied. That check is **belt-and-braces, not the binding**: an
-attestation proves only "this workflow produced these bytes", never "these
-bytes predate the third-party code", and the bottle job's filesystem stays
-writable between the build step and the attest step (F3.1). The tree
-comparison above is what the release relies on, and it trusts CI for none of
-it; all `source.sha256` adds on top is "CI saw these bytes".
+**What the tree comparison does not cover.** It checks *the operator's* copy
+of the published archive against *the operator's* `git archive` of the tag. It
+says nothing about which source bytes the runner compiled: the bottle job
+fetches the archive itself, by URL, with its own curl
+(`sudo-release.yml:177`), and `brew install --build-bottle` compiles exactly
+those bytes. The bottle's attestation proves "`sudo-release.yml` at this tag
+produced these bytes" and carries no statement about the source behind them.
+
+So the artifact must hold exactly one bottle JSON, and `source.sha256` -- also
+attested, and verified before it is read -- is compared against the digest of
+the archive release.py downloaded. That comparison is **load-bearing**: it is
+the only thing in the release tying the shipped, attested binary to the tree
+that was checked against the tag. Serve codeload's two fetches different bytes
+(cache poisoning, a hostile resolver on the runner's egress, or GitHub simply
+regenerating the archive in between, which this repo already treats as
+possible) and every other check still passes. Its bytes are written from a
+step output recorded before `brew install --build-bottle` runs, so the on-disk
+file a `build.rs` can reach is not what gets copied; the residual weakness is
+that an attestation proves only "this workflow produced these bytes", never
+"these bytes predate the third-party code", and the bottle job's filesystem
+stays writable between the build step and the attest step (**F3.1**, accepted
+as a residual by design). Only on `--build-from-source`, where there is no
+bottle and this check never runs, is the tree comparison the whole binding.
 
 F3.1's escalation -- compute the digest in a job that runs no cargo and no
 brew, and verify *that job's* attestation -- is deliberately not implemented,
@@ -132,13 +153,13 @@ because a verifier cannot express it. The only identity `gh attestation
 verify` can pin is the certificate identity, and that names the workflow
 **file**, not the job. In the real v0.19.1-sudo.28 predicate, `builder.id`,
 the workflow `externalParameters` and the certificate's SAN all read
-`sudo-release.yml` and nothing finer, while `invocationId` names the run,
-which two jobs share, so a second job would mint attestations
-indistinguishable from the bottle job's. A separate workflow file would have
-a distinct identity; the operator chose to make the tree comparison the real
-check instead (2026-10-23).
+`sudo-release.yml` and nothing finer, while `invocationId` names the run and
+attempt, which every job of the run shares, so a second job would mint
+attestations indistinguishable from the bottle job's. A **separate workflow
+file** would have a distinct identity, so the escalation remains buildable as
+a file and never as a job (2026-10-23).
 
-Before the tap is pushed it
+Before the tap is pushed, release.py
 downloads each asset from the GitHub Release into its own directory, requires
 exactly that one file name to land (`--pattern` is a glob) and compares its
 sha256 too. Then it runs

@@ -212,8 +212,12 @@ The downstream release driver (`packaging/release.py`) is Python, not Rust, and
 its tests need an interpreter that the bare `python3` on `PATH` may not be:
 
 ```bash
-uv run --python 3.13 --with pytest python -m pytest tests/sudo_packaging/ -q
+~/ops/site-private/bin/bg uv run --python 3.13 --with pytest python \
+  -m pytest tests/sudo_packaging/test_release.py -q
 ```
+
+No `--` after `bg`: it takes the command directly and refuses a lone `--` with
+exit 2, which reads exactly like the tests failing.
 
 Pin 3.13 because that is what `.github/workflows/sudo-release.yml` pins, and
 because the suite is interpreter-sensitive: `tarfile.extractall(filter=...)`

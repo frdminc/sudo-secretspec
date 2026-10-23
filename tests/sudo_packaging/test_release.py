@@ -901,17 +901,30 @@ def test_the_archive_must_be_one_prefixed_directory(release, cut, tmp_path):
     assert release.extracted_tree(tmp_path / "junk.tar.gz", prefix="x") is None
 
 
-def test_a_traversing_member_is_refused_not_written(release, tmp_path):
-    """This is the one place release.py writes bytes it does not trust to the
-    filesystem, and its premise is that the archive may not be the tag's tree.
+def test_a_traversing_member_is_refused_not_written(release, tmp_path, monkeypatch):
+    """`filter="data"` is the only thing stopping a `..` member from being
+    written outside the destination, and this test is what has to prove the
+    argument is load-bearing rather than decorative.
 
-    On Python 3.14 the `extractall` default is already `data`, so this test
-    cannot distinguish the explicit `filter="data"` from the default and
-    removing the argument does not fail it. It still pins the behaviour the
-    binding depends on, and the argument is what carries that behaviour to
-    3.13, which `sudo-release.yml` pins and where an unfiltered extractall
-    escapes with only a DeprecationWarning (probed 2026-10-20).
+    Two earlier versions of this test proved nothing. Both asserted that
+    `extracted_tree` returns None and that nothing new appeared under
+    `tmp_path`, and both are TRUE DURING A REAL ESCAPE: `extracted_tree`
+    extracts into a `tempfile.TemporaryDirectory()` under the system TMPDIR,
+    so `../../escaped.txt` lands outside `tmp_path` entirely, and the
+    destination is then empty -- which makes the single-root check return None
+    for a reason that has nothing to do with any refusal. Removing
+    `filter="data"` left the suite green while the write happened (adversary
+    F2, 2026-10-23, mutation M2: 1 passed).
+
+    Pointing `tempfile.tempdir` at a directory nested two levels under
+    `tmp_path` is what closes it: `../../` from the destination now lands
+    where the test is looking, so an escape is visible and the mutation
+    fails.
     """
+    nest = tmp_path / "dest" / "a" / "b"
+    nest.mkdir(parents=True)
+    monkeypatch.setattr(release.tempfile, "tempdir", str(nest))
+
     evil = tmp_path / "evil.tar.gz"
     with tarfile.open(evil, "w:gz") as tf:
         member = tarfile.TarInfo("../../escaped.txt")
@@ -921,12 +934,55 @@ def test_a_traversing_member_is_refused_not_written(release, tmp_path):
 
     before = set(tmp_path.rglob("*"))
     assert release.extracted_tree(evil, prefix="anything") is None
-    # Nothing new anywhere under tmp_path, and the extraction destination is a
-    # TemporaryDirectory that is gone either way -- so check the tree the test
-    # owns rather than one guessed path two levels up, which is where an
-    # earlier version of this assertion looked and would have passed on a
-    # real escape.
     assert set(tmp_path.rglob("*")) == before
+
+
+def test_an_unlistable_directory_is_refused_not_silently_skipped(release, tmp_path):
+    """`os.walk`'s default silently discards a directory it cannot list, and
+    `tree_entries` records no directories -- so without `onerror` an
+    unlistable directory and everything under it would vanish from the
+    fingerprint, and a forged archive could hide a payload there. A `.cargo/`
+    directory at mode 0o111 holding a `config.toml` with `rustc-wrapper` is
+    build-time code execution that cargo reaches by exact name, with no
+    visible `build.rs`.
+
+    The archive path happens to be covered today only because the data filter
+    normalises directory modes to 0o755, so the walk descends and the extra
+    path is reported -- a CPython implementation detail, not a guarantee. This
+    pins the walk itself (adversary F4, 2026-10-23).
+    """
+    root = tmp_path / "tree"
+    (root / "hidden").mkdir(parents=True)
+    (root / "hidden" / "config.toml").write_bytes(b'[build]\nrustc-wrapper = "x"\n')
+    (root / "plain.txt").write_bytes(b"plain\n")
+    (root / "hidden").chmod(0o111)
+    try:
+        with pytest.raises(OSError):
+            release.tree_entries(root)
+    finally:
+        # Restore before tmp_path cleanup, which cannot remove it otherwise.
+        (root / "hidden").chmod(0o755)
+
+
+def test_a_tree_that_cannot_be_fingerprinted_fails_closed(
+    release, cut, tmp_path, monkeypatch
+):
+    """`iterdir`, `is_dir` and `tree_entries` are inside `extracted_tree`'s
+    `try`, not just `extractall`. They stat, readlink and read files, and
+    `tree_entries` now raises on an unlistable directory by design, so an
+    OSError from any of them would otherwise propagate out of `tag_tree`, out
+    of `require_archive_matches_tag`, and reach the operator as a bare
+    traceback with no resume path -- after the tag and the Release are public.
+    That is the exact shape of the defect 9e1312e was written to fix
+    (adversary F5, 2026-10-23).
+    """
+
+    def boom(_root):
+        raise OSError("cannot stat")
+
+    monkeypatch.setattr(release, "tree_entries", boom)
+    archive = _tag_archive(tmp_path / "a.tar.gz", "a" * 40, release=cut)
+    assert release.extracted_tree(archive, prefix=cut.archive_prefix) is None
 
 
 def test_tree_entries_records_what_git_tracks_and_nothing_else(release, tmp_path):
