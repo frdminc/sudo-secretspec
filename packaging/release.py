@@ -222,7 +222,7 @@ class ReleaseError(RuntimeError):
     and names its own recovery route, so the two wrapping handlers re-raise it
     untouched instead of appending a second, conflicting one. Set it at every
     raise site whose message carries one of the hints above; the test
-    `test_every_hint_carrying_raise_site_declares_itself_self_sufficient`
+    `test_self_sufficient_is_declared_exactly_where_a_hint_is_carried`
     walks this file's AST and fails on one that forgets.
     """
 
