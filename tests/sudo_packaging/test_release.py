@@ -2195,6 +2195,115 @@ def test_build_from_source_compiles_through_bg_from_home(monkeypatch, release):
     assert kwargs["env"]["HOMEBREW_MAKE_JOBS"] == "1"
 
 
+@pytest.mark.parametrize("where", ["preflight", "inside_the_guarded_block"])
+def test_a_pre_publication_failure_does_not_claim_the_release_is_published(
+    monkeypatch, release, cut, where
+):
+    """RESUME_BY_HAND_HINT is a factual claim and a directive -- "the tag and
+    Release are already published, do not re-run `just release`". The justfile's
+    RESUME RULES make the pre- and post-publication cases opposite: before the
+    tag, "fix, then re-run"; after it, "do NOT re-run".
+
+    A blanket `except OSError` in `__main__` appended the hint to everything,
+    so `git`, `cargo` or `gh` missing from PATH in preflight -- or a mistyped
+    `--notes-file` -- told the operator not to re-run when re-running was the
+    only correct action. Reproduced verbatim by the reviewer against a copy of
+    the script under an empty PATH (adversary F1, 2026-10-23).
+    """
+
+    def missing_git(*_a, **_k):
+        raise FileNotFoundError(2, "No such file or directory", "git")
+
+    monkeypatch.setattr(release, "run", lambda argv, **kwargs: completed(argv))
+    if where == "preflight":
+        # The reported scenario: PATH without git/cargo/gh, nothing published.
+        monkeypatch.setattr(release, "preflight", missing_git)
+    else:
+        # The case that actually pins the guard: inside the block `main`
+        # wraps, but before the push sets `state.tag_pushed`. Without this
+        # case the test passes even with the scoping removed, because
+        # `preflight` runs outside the guarded block entirely -- a test true
+        # for the wrong reason, which is the trap this whole review chain
+        # keeps finding (mutation M9, 2026-10-23).
+        monkeypatch.setattr(release, "preflight", lambda _release, **kwargs: None)
+        monkeypatch.setattr(release, "create_tag_and_release", missing_git)
+
+    with pytest.raises(FileNotFoundError) as caught:
+        release.main(["--version", cut.version, "--skip-tests"])
+    assert release.RESUME_BY_HAND_HINT not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        OSError("disk gone"),
+        ValueError("Expecting value: line 1 column 1 (char 0)"),
+        RuntimeError("nobody enumerated this one"),
+    ],
+    ids=["oserror", "valueerror", "runtimeerror"],
+)
+def test_any_post_publication_failure_names_the_resume_path(
+    monkeypatch, release, cut, error
+):
+    """Once the tag is pushed the release cannot be re-run, so every failure
+    from there on has to carry the resume path -- whatever its type.
+
+    The ValueError case is not hypothetical: `verify_readback` calls
+    `json.loads` three times with no handler on the stack, and a `gh` that
+    exits 0 with non-JSON raises `JSONDecodeError`, a ValueError. The handler
+    this replaced caught only OSError while its comment claimed to catch
+    everything nobody enumerated (adversary F3, 2026-10-23).
+    """
+
+    def publish(_release, _notes, state, **_kwargs):
+        # The one fact this test needs: the tag is pushed, so nothing after it
+        # may tell the operator to re-run.
+        state.tag_pushed = True
+
+    monkeypatch.setattr(release, "preflight", lambda _release, **kwargs: None)
+    monkeypatch.setattr(release, "run", lambda argv, **kwargs: completed(argv))
+    monkeypatch.setattr(release, "create_tag_and_release", publish)
+    monkeypatch.setattr(release, "fetch_bottle", lambda *a, **k: [])
+    monkeypatch.setattr(release, "update_formula_commit", lambda *a, **k: None)
+    monkeypatch.setattr(release, "sync_tap", lambda *a, **k: None)
+    monkeypatch.setattr(release, "merge_bottle", lambda *a, **k: None)
+    monkeypatch.setattr(release, "brew_refresh", lambda *a, **k: Path("/tap"))
+
+    def boom(**_kwargs):
+        raise error
+
+    monkeypatch.setattr(release, "brew_install_and_test", boom)
+    with pytest.raises(release.ReleaseError) as caught:
+        release.main(["--version", cut.version, "--skip-tests"])
+    assert release.RESUME_BY_HAND_HINT in str(caught.value)
+    assert str(error) in str(caught.value)
+
+
+def test_a_special_file_member_is_refused_so_the_filter_choice_is_pinned(
+    release, tmp_path
+):
+    """`filter="data"` and `filter="tar"` both refuse `..`, so the traversal
+    test cannot tell them apart -- swapping `data` for `tar` was an undetected
+    one-token mutation (adversary F4, 2026-10-23).
+
+    A special file is the difference the docstring and the operator-facing
+    message both claim: `tar` extracts a FIFO happily, and since
+    `tree_entries` records neither FIFOs nor directories it would be invisible
+    in the fingerprint. `data` raises SpecialFileError.
+    """
+    evil = tmp_path / "fifo.tar.gz"
+    with tarfile.open(evil, "w:gz") as tf:
+        member = tarfile.TarInfo("root/pipe")
+        member.type = tarfile.FIFOTYPE
+        tf.addfile(member)
+        body = b"ordinary\n"
+        plain = tarfile.TarInfo("root/plain.txt")
+        plain.size = len(body)
+        tf.addfile(plain, io.BytesIO(body))
+
+    assert release.extracted_tree(evil, prefix="root") is None
+
+
 @pytest.mark.parametrize("flags", [[], ["--build-from-source"]])
 def test_main_pours_the_bottle_unless_told_to_build_from_source(
     monkeypatch, release, cut, flags

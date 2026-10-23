@@ -127,8 +127,11 @@ the digest of the tree that was checked.
 of the published archive against *the operator's* `git archive` of the tag. It
 says nothing about which source bytes the runner compiled: the bottle job
 fetches the archive itself, by URL, with its own curl
-(`sudo-release.yml:177`), and `brew install --build-bottle` compiles exactly
-those bytes. The bottle's attestation proves "`sudo-release.yml` at this tag
+(`sudo-release.yml:177`), hashes that download, and restamps the throwaway
+tap's formula with the digest -- so `brew install --build-bottle` compiles
+bytes *pinned to that digest* (brew re-fetches the URL into its own cache and
+verifies it against the formula, which means two independent fetches must
+agree). The bottle's attestation proves "`sudo-release.yml` at this tag
 produced these bytes" and carries no statement about the source behind them.
 
 So the artifact must hold exactly one bottle JSON, and `source.sha256` -- also

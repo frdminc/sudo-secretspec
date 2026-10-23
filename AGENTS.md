@@ -216,11 +216,22 @@ its tests need an interpreter that the bare `python3` on `PATH` may not be:
   -m pytest tests/sudo_packaging/test_release.py -q
 ```
 
+Name the **file**, not the directory. This repo is CI-first to `bg`, which
+refuses a whole-directory run here with **exit 3** ("runs full suites and
+builds on CI, never on this Mac") and admits only a targeted run -- a test
+file, a `path::test` id, or `-k`. The whole directory is CI's job
+(`sudo-release.yml`'s `packaging` job runs `pytest tests/sudo_packaging -q`),
+or run it yourself with `scripts/github-ci-run --no-wait origin/sudo-main`.
+If a second test file is added, name both or use `-k`.
+
 No `--` after `bg`: it takes the command directly and refuses a lone `--` with
 exit 2, which reads exactly like the tests failing.
 
-Pin 3.13 because that is what `.github/workflows/sudo-release.yml` pins, and
-because the suite is interpreter-sensitive: `tarfile.extractall(filter=...)`
+Pin 3.13 because that is what the workflow's `packaging` job pins **for the
+tests** -- a release itself runs under `#!/usr/bin/env python3`, whatever that
+resolves to, and the `bottle` job executes `release.py` under its image's bare
+`python3` with no `setup-python` at all. Pin it here because the suite is
+interpreter-sensitive: `tarfile.extractall(filter=...)`
 does not exist before 3.12, and its *default* changed to `data` in 3.14. On this
 Mac (2026-10-20) `python3` resolves to 3.15 with no pytest installed, and
 `/usr/bin/python3` is Xcode's 3.9.6, which has pytest and reports 9 spurious

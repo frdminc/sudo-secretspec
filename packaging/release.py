@@ -667,7 +667,17 @@ def extracted_tree(tarball: Path, *, prefix: str) -> dict[str, tuple[str, str]] 
             if len(roots) != 1 or roots[0].name != prefix or not roots[0].is_dir():
                 return None
             return tree_entries(roots[0])
-        except (tarfile.TarError, OSError, EOFError, ValueError):
+        except (tarfile.TarError, OSError, EOFError, ValueError) as error:
+            # Logged, because the caller's `_require` can only say "not a
+            # single prefixed directory, or a refused member, or could not be
+            # fingerprinted" -- three causes, attack first and accident last.
+            # On a post-publication failure the operator has to choose between
+            # finishing by hand and opening a compromise investigation, and an
+            # ENOSPC that reads as "carries a member the tar data filter
+            # refuses" sends them the wrong way. v0.19.1-sudo.15 ran out of
+            # disk after publishing; that is why `preflight_disk` exists
+            # (adversary F2, 2026-10-23).
+            log(f"cannot fingerprint {tarball}: {error!r}")
             return None
 
 
@@ -1633,6 +1643,48 @@ def main(argv: list[str] | None = None) -> int:
         else default_notes()
     )
     state = CleanupState()
+    try:
+        _release_body(release, args, notes, state)
+    except Exception as error:
+        # The real last resort for the post-publication path: anything nobody
+        # enumerated, including a ValueError such as `verify_readback`'s
+        # `json.loads` on a `gh` that exits 0 with non-JSON (adversary F3,
+        # 2026-10-23 -- the previous version of this handler caught only
+        # OSError while its comment claimed to catch everything).
+        #
+        # Scoped to `state.tag_pushed`, because RESUME_BY_HAND_HINT is a
+        # factual CLAIM -- "the tag and Release are already published" -- and
+        # a directive not to re-run, not a generic apology. Appended to a
+        # PRE-publication failure (`git`, `cargo` or `gh` missing from PATH in
+        # preflight, a mistyped `--notes-file`) it tells the operator not to
+        # re-run when re-running is exactly right, and the justfile's RESUME
+        # RULES make those two cases opposite. That is what the first version
+        # of this guard did, unconditionally, from `__main__` (adversary F1,
+        # 2026-10-23). Before the tag is pushed, the error is re-raised
+        # untouched.
+        if not state.tag_pushed:
+            raise
+        if isinstance(error, ReleaseError) and RESUME_BY_HAND_HINT in str(error):
+            raise
+        detail = (
+            describe(error)
+            if isinstance(error, subprocess.CalledProcessError)
+            else str(error)
+        )
+        raise ReleaseError(f"{detail}. {RESUME_BY_HAND_HINT}") from error
+    log(f"done: {release.title} ({release.tag})")
+    return 0
+
+
+def _release_body(
+    release: Release, args: argparse.Namespace, notes: str, state: CleanupState
+) -> None:
+    """Everything from the tag push onward, so `main` can wrap it in one place.
+
+    Split out only so the publication-state guard in `main` has a single
+    statement to wrap; `preflight` and the notes read stay outside it, where
+    nothing can yet be published.
+    """
     with interrupt_cleanup(release, state):
         create_tag_and_release(release, notes, state, dry_run=args.dry_run)
         if not args.skip_homebrew:
@@ -1654,8 +1706,6 @@ def main(argv: list[str] | None = None) -> int:
                 )
             if not args.dry_run:
                 verify_readback(release, prefix)
-    log(f"done: {release.title} ({release.tag})")
-    return 0
 
 
 def describe(error: subprocess.CalledProcessError) -> str:
@@ -1680,10 +1730,3 @@ if __name__ == "__main__":
         raise SystemExit(str(error)) from error
     except subprocess.CalledProcessError as error:
         raise SystemExit(describe(error)) from error
-    except OSError as error:
-        # Last resort, so no failure on the post-publication path can reach
-        # the operator as a bare traceback. Everything reachable is supposed
-        # to be a ReleaseError carrying RESUME_BY_HAND_HINT; this catches the
-        # one nobody enumerated, which is the defect class every review of
-        # this file has found (adversary F5, 2026-10-23).
-        raise SystemExit(f"{error}. {RESUME_BY_HAND_HINT}") from error
