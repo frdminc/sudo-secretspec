@@ -10,16 +10,28 @@
 # RESUME RULES after a failure:
 # - Failed before or during tests: fix, then re-run `just release <version>`.
 #   Stamping and the stamp commit are idempotent no-ops the second time.
-# - Failed AFTER "git push origin <tag>" but with NO GitHub Release yet (the
-#   tag push and `gh release create` are two steps, and release.py says so:
-#   "release.py did not see `gh release create` succeed"): do NOT re-run —
-#   preflight will refuse the published serial. Check `gh release view <tag>
-#   --repo frdminc/sudo-secretspec` first, because a signal or a dropped
-#   connection can leave the Release in place while release.py never saw it
-#   return. If it is missing, `gh release create <tag> --repo
-#   frdminc/sudo-secretspec --title <title> --notes-file <notes>`, then follow
-#   the rule below. The rule below does NOT cover this state on its own: its
-#   `brew reinstall` would pour the previous release's bottle.
+# - Failed AFTER "git push origin <tag>" and release.py says "The tag is pushed,
+#   but release.py did not see `gh release create` succeed" (the 'no formula
+#   commit yet' rule): do NOT re-run -- preflight will refuse the published
+#   serial. The tag, and possibly the Release, are public; the formula commit,
+#   tap sync and bottle merge have NOT happened, and release.py has no resume
+#   mode for them. The rule below does NOT cover this state: its `brew
+#   reinstall` would pour the PREVIOUS release's bottle. In order:
+#   1. `gh release view <tag> --repo frdminc/sudo-secretspec`. A Release can
+#      exist although release.py never saw it return. "release not found"
+#      names no repository, so check the --repo before believing it.
+#   2. If it is missing: `gh release create <tag> --repo
+#      frdminc/sudo-secretspec --title "$(git tag -l
+#      --format='%(contents:subject)' <tag>)" --notes-file <notes>` (the title
+#      is the annotated tag's subject; <notes> is the file passed to `just
+#      release`, else default_notes() in release.py).
+#   3. `publish-bottle` waits only about ten minutes for the Release and then
+#      fails without --clobber. If it failed, re-run it once the bottle job is
+#      green: `gh run rerun <run-id> --failed --repo frdminc/sudo-secretspec`.
+#   4. Do what update_formula_commit, sync_tap and merge_bottle do (formula url
+#      and sha256, commit, tap push, `brew bottle --merge --write` with the CI
+#      bottle JSON); read them first, they are the only description.
+#   5. Then follow the rule below.
 # - Failed AFTER "git push origin <tag>" (tag/Release/formula/tap already
 #   public): do NOT re-run — release.py preflight will refuse the published
 #   serial. Finish by hand: `brew update --force && brew reinstall
