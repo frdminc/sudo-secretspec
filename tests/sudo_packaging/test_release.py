@@ -2410,6 +2410,15 @@ def _release_error_aliases():
                 names_watched(arg) for arg in node.args
             ):
                 lines.append(node.lineno)
+            # The flag keyword belongs to a DIRECT `ReleaseError(`/`_require(`
+            # call, which the call scan audits; on any other callee
+            # (`type(error)(...)`, an aliased partial, an IfExp, a re-run
+            # `__init__`) it flags an error nobody audits (adversary F1,
+            # fourteenth review).
+            if any(k.arg == "self_sufficient" for k in node.keywords) and not (
+                isinstance(node.func, ast.Name) and node.func.id in watched
+            ):
+                lines.append(node.lineno)
     # The flag is read at catch time by the guards, so setting it after
     # construction is a false flag the constructor audit never sees (X1).
     # Syntax-matching the forms of a write (`x.f = ...`, a tuple target, a
@@ -2929,9 +2938,12 @@ def _every_release_error_built_by_release_py_agrees_with_its_hint(release):
     # The guards read the flag when they CATCH the error, not when it is built,
     # so audit every instance again with the flag it has now: this sees a write
     # in any syntax (adversary X1 and V1-W5, twelfth and thirteenth reviews).
+    # Both halves are read now: the message too, since `error.args = ...` can
+    # drop the hint after construction.
     for error, message in built:
-        if not _audit_error(hints, message, error.self_sufficient):
-            problems.append((message[-80:], error.self_sufficient))
+        current = str(error.args[0]) if error.args else message
+        if not _audit_error(hints, current, error.self_sufficient):
+            problems.append((current[-80:], error.self_sufficient))
     assert problems == [], f"flag and message disagree: {problems}"
 
 
@@ -2993,11 +3005,16 @@ def test_the_tag_only_hint_and_the_justfile_rule_it_points_at_stay_together(rele
     # Every command the operator copies names the fork explicitly. Only the
     # bare mention of the command the sentence quotes is exempt, by exact text:
     # no word-count or prefix exemption (K3, K4, K13).
-    commands = re.findall(r"`(gh [^`]+)`", bullet)
+    # Pair the backticks first and look inside every span, so a command that
+    # does not START with `gh ` (an env prefix, `git fetch && gh ...`) is seen
+    # (adversary B1, B2, fourteenth review).
+    spans = re.findall(r"`([^`]*)`", bullet)
+    commands = [span for span in spans if re.search(r"\bgh ", span)]
     assert len(commands) >= 4, commands
     for command in commands:
         if command == "gh release create":
             continue
+        assert command.startswith(("gh ", "title=")), command
         assert f"--repo {fork}" in command, command
         assert "{owner}" not in command and "cachix" not in command, command
         assert not command.startswith(("gh release upload", "gh api")), command
@@ -3009,7 +3026,9 @@ def test_the_tag_only_hint_and_the_justfile_rule_it_points_at_stay_together(rele
         '"$title" && gh release create <tag> --verify-tag --repo '
         f'{fork} --title "$title" --notes-file <notes>'
     )
-    assert chain in step2, step2
+    # The whole span, not a substring of it: a fallback appended inside the
+    # same backticks would run exactly when the guard fires (adversary B3).
+    assert f"`{chain}`" in step2, step2
     assert "|| echo" not in step2
     # Nothing tells the operator to upload assets by hand.
     assert "Never upload assets by hand" in step3
