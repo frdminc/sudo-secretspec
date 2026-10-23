@@ -2941,7 +2941,7 @@ def _every_release_error_built_by_release_py_agrees_with_its_hint(release):
     # Both halves are read now: the message too, since `error.args = ...` can
     # drop the hint after construction.
     for error, message in built:
-        current = str(error.args[0]) if error.args else message
+        current = str(error)  # what __main__ prints: SystemExit(str(error))
         if not _audit_error(hints, current, error.self_sufficient):
             problems.append((current[-80:], error.self_sufficient))
     assert problems == [], f"flag and message disagree: {problems}"
@@ -3008,14 +3008,27 @@ def test_the_tag_only_hint_and_the_justfile_rule_it_points_at_stay_together(rele
     # Pair the backticks first and look inside every span, so a command that
     # does not START with `gh ` (an env prefix, `git fetch && gh ...`) is seen
     # (adversary B1, B2, fourteenth review).
-    spans = re.findall(r"`([^`]*)`", bullet)
-    commands = [span for span in spans if re.search(r"\bgh ", span)]
-    assert len(commands) >= 4, commands
+    # A run of backticks is ONE delimiter (a ``double`` span is markdown
+    # too), and each shell segment of a span is a command of its own.
+    segments = [
+        segment.strip()
+        for span in re.split(r"`+", bullet)[1::2]
+        for segment in re.split(r"&&|\|\||[;|]|\$\(", span)
+    ]
+    commands = [s for s in segments if re.search(r"\bgh\b", s, re.IGNORECASE)]
+    bare = "gh release create"
+    assert len([c for c in commands if c != bare]) >= 4, commands
+    # Every gh in the bullet is in a checked segment, bar step 4's prose name.
+    assert len(re.findall(r"\bgh\b", bullet, re.IGNORECASE)) == len(
+        commands
+    ) + bullet.count("(gh attestation verify "), commands
     for command in commands:
-        if command == "gh release create":
+        if command == bare:
             continue
-        assert command.startswith(("gh ", "title=")), command
+        assert command.startswith("gh "), command
         assert f"--repo {fork}" in command, command
+        if command.startswith("gh release create"):
+            assert "--verify-tag" in command, command
         assert "{owner}" not in command and "cachix" not in command, command
         assert not command.startswith(("gh release upload", "gh api")), command
     # The title is read and checked in ONE chain with the create, so an empty
