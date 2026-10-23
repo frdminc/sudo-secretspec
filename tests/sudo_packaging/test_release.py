@@ -2391,8 +2391,17 @@ def _release_error_aliases():
             # (`sys.modules[__name__].ReleaseError`: adversary X11).
             if any(names_watched(base) for base in node.bases):
                 lines.append(node.lineno)
-        elif isinstance(node, ast.Assign | ast.AnnAssign) and names_watched(node.value):
-            lines.append(node.lineno)  # `_Fail = ReleaseError`, `_Fail: type = ...`
+        elif (
+            isinstance(node, ast.Assign | ast.AnnAssign)
+            and names_watched(node.value)
+            and not (
+                isinstance(node.value, ast.Call)
+                and getattr(node.value.func, "id", "") in watched
+            )
+        ):
+            # `_Fail = ReleaseError`, `_Fail: type = ...`; binding the RESULT of
+            # `ReleaseError(...)` to a local is not an alias (adversary W8).
+            lines.append(node.lineno)
         elif isinstance(node, ast.Call):
             callee = getattr(node.func, "id", getattr(node.func, "attr", ""))
             # `partial(ReleaseError, ...)` and `type("X", (ReleaseError,), {})`
@@ -2403,26 +2412,38 @@ def _release_error_aliases():
                 lines.append(node.lineno)
     # The flag is read at catch time by the guards, so setting it after
     # construction is a false flag the constructor audit never sees (X1).
-    # The constructor itself is the one place allowed to set it.
-    own_body = {
-        id(inner)
-        for cls in ast.walk(tree)
-        if isinstance(cls, ast.ClassDef) and cls.name == "ReleaseError"
-        for inner in ast.walk(cls)
-    }
+    # Syntax-matching the forms of a write (`x.f = ...`, a tuple target, a
+    # `for` target, `setattr`, `__dict__`, `vars()`, a method on the class)
+    # lost to a new form in each of two rounds, so the rule is closed instead:
+    # ReleaseError holds a docstring and `__init__` and nothing else, only
+    # `__init__` may mention the flag by name, and no reflective write exists.
+    # The runtime fixture re-audits every instance built under test as well.
+    init_body = set()
+    for cls in ast.walk(tree):
+        if isinstance(cls, ast.ClassDef) and cls.name == "ReleaseError":
+            for member in cls.body:
+                is_doc = isinstance(member, ast.Expr) and isinstance(
+                    member.value, ast.Constant
+                )
+                if isinstance(member, ast.FunctionDef) and member.name == "__init__":
+                    init_body.update(id(inner) for inner in ast.walk(member))
+                elif not is_doc:
+                    lines.append(member.lineno)  # a method, classmethod, attribute
+    reflective = {"setattr", "vars", "__setattr__", "__dict__"}
     for node in ast.walk(tree):
-        if id(node) in own_body:
+        if id(node) in init_body:
             continue
-        targets = (
-            node.targets
-            if isinstance(node, ast.Assign)
-            else [node.target]
-            if isinstance(node, ast.AnnAssign | ast.AugAssign)
-            else []
+        stores_flag = (
+            isinstance(node, ast.Attribute)
+            and node.attr == "self_sufficient"
+            and not isinstance(node.ctx, ast.Load)
         )
-        for target in targets:
-            if isinstance(target, ast.Attribute) and target.attr == "self_sufficient":
-                lines.append(node.lineno)
+        reflective_use = (
+            isinstance(node, ast.Attribute) and node.attr in reflective
+        ) or (isinstance(node, ast.Name) and node.id in reflective)
+        names_flag = isinstance(node, ast.Constant) and node.value == "self_sufficient"
+        if stores_flag or reflective_use or names_flag:
+            lines.append(node.lineno)
     return sorted(set(lines))
 
 
@@ -2893,19 +2914,24 @@ def _every_release_error_built_by_release_py_agrees_with_its_hint(release):
     hints = [getattr(module, name) for name in dir(module) if name.endswith("_HINT")]
     real_init = module.ReleaseError.__init__
     problems = []
+    built = []
 
     def checked(self, *args, **kwargs):
         real_init(self, *args, **kwargs)
         caller = sys._getframe(1).f_code.co_filename
-        if (
-            caller == str(RELEASE_PY)
-            and args
-            and not _audit_error(hints, str(args[0]), self.self_sufficient)
-        ):
-            problems.append((str(args[0])[-80:], self.self_sufficient))
+        if caller == str(RELEASE_PY) and args:
+            built.append((self, str(args[0])))
+            if not _audit_error(hints, str(args[0]), self.self_sufficient):
+                problems.append((str(args[0])[-80:], self.self_sufficient))
 
     module.ReleaseError.__init__ = checked
     yield
+    # The guards read the flag when they CATCH the error, not when it is built,
+    # so audit every instance again with the flag it has now: this sees a write
+    # in any syntax (adversary X1 and V1-W5, twelfth and thirteenth reviews).
+    for error, message in built:
+        if not _audit_error(hints, message, error.self_sufficient):
+            problems.append((message[-80:], error.self_sufficient))
     assert problems == [], f"flag and message disagree: {problems}"
 
 
@@ -2933,37 +2959,63 @@ def test_the_tag_only_hint_and_the_justfile_rule_it_points_at_stay_together(rele
     )
     assert sentence in hint
     # The justfile wraps its comment lines, so compare with the comment
-    # markers and line breaks removed -- and only inside THIS bullet, up to the
-    # next one, so a phrase cannot migrate to the post-publication bullet and
-    # still satisfy the pin (adversary F4b, twelfth review, 2026-10-23).
-    flattened = " ".join(
-        line.removeprefix("#").strip() for line in justfile.splitlines()
-    )
-    assert flattened.count(sentence) == 1
-    start = flattened.index(sentence)
-    end = flattened.index("- Failed AFTER", start)
-    bullet = flattened[start:end]
+    # markers and line breaks removed -- and only inside THIS bullet, which
+    # ends at the next `# - ` line of the raw file, so a phrase cannot migrate
+    # to a neighbouring bullet and still satisfy the pin (adversary F4b and K8).
+    raw = justfile.splitlines()
+    starts = [i for i, line in enumerate(raw) if line.startswith("# - ")]
+    bounds = [
+        *starts[1:],
+        next(
+            i
+            for i, line in enumerate(raw)
+            if not line.startswith("#") and i > starts[0]
+        ),
+    ]
+    bullets = [
+        " ".join(line.removeprefix("#").strip() for line in raw[a:b])
+        for a, b in zip(starts, bounds, strict=False)
+    ]
+    holding = [b for b in bullets if sentence in b]
+    assert len(holding) == 1, len(holding)
+    bullet = holding[0]
     assert "no formula commit yet" in bullet
     # Steps in order; the operator reads them top to bottom.
-    steps = [f" {n}. " for n in range(1, 6)]
-    positions = [bullet.index(step) for step in steps]
-    assert positions == sorted(positions), positions
-    # Every command the operator copies names the fork explicitly, and none
-    # names the upstream repository (the silent case returns `[]`).
+    marks = [bullet.index(f" {n}. ") for n in range(1, 6)]
+    assert marks == sorted(marks), marks
+    end = len(bullet)
+    step1, step2, step3, step4, step5 = (
+        bullet[marks[i] : marks[i + 1] if i < 4 else end] for i in range(5)
+    )
+    fork = release.FORK_REPO
+    # Step 1 is the command the hint promises the rule starts with.
+    assert f"`gh release view <tag> --repo {fork}`" in step1
+    # Every command the operator copies names the fork explicitly. Only the
+    # bare mention of the command the sentence quotes is exempt, by exact text:
+    # no word-count or prefix exemption (K3, K4, K13).
     commands = re.findall(r"`(gh [^`]+)`", bullet)
     assert len(commands) >= 4, commands
     for command in commands:
-        assert "cachix" not in command, command
-        # A bare mention (`gh release create`) names a command; only a full
-        # invocation carries arguments that must name the fork.
-        if len(command.split()) > 3 and command.startswith(("gh run ", "gh release ")):
-            assert f"--repo {release.FORK_REPO}" in command, command
-    assert any(c.startswith("gh release create <tag> --verify-tag") for c in commands)
-    # The title is read and checked BEFORE the Release is created.
-    assert bullet.index("test -n") < bullet.index("gh release create <tag>")
+        if command == "gh release create":
+            continue
+        assert f"--repo {fork}" in command, command
+        assert "{owner}" not in command and "cachix" not in command, command
+        assert not command.startswith(("gh release upload", "gh api")), command
+    # The title is read and checked in ONE chain with the create, so an empty
+    # title stops it (an `|| echo` guard returns 0 and the create still runs:
+    # adversary F4, thirteenth review).
+    chain = (
+        "title=$(git tag -l --format='%(contents:subject)' <tag>) && test -n "
+        '"$title" && gh release create <tag> --verify-tag --repo '
+        f'{fork} --title "$title" --notes-file <notes>'
+    )
+    assert chain in step2, step2
+    assert "|| echo" not in step2
+    # Nothing tells the operator to upload assets by hand.
+    assert "Never upload assets by hand" in step3
+    assert "gh release upload" not in bullet
     # Step 4 names the checks the hand route has to reproduce, in order, and
     # the one-download condition they depend on.
-    step4 = bullet[positions[3] : positions[4]]
     names = [
         "fetch_bottle",
         "update_formula_commit",
@@ -2971,14 +3023,15 @@ def test_the_tag_only_hint_and_the_justfile_rule_it_points_at_stay_together(rele
         "sync_tap",
         "merge_bottle",
         "verify_release_assets",
-        "verify_readback",
     ]
     at = [step4.index(name) for name in names]
     assert at == sorted(at), dict(zip(names, at))
+    assert "In `_release_body` order" in step4
     assert "ONE download" in step4
     assert "gh attestation verify" in step4
-    # Nothing in the bullet tells the operator to upload assets by hand.
-    assert "Never upload assets by hand" in bullet
+    # `verify_readback` requires the NEW engine installed, so it comes after the
+    # install in step 5, never in step 4 (adversary F3).
+    assert "verify_readback" in step5 and "verify_readback" not in step4
 
 
 def test_a_bottle_json_quoting_a_hint_still_gets_the_bottle_route(

@@ -23,21 +23,21 @@
 #   2. If it is missing, write the notes file (the one passed to `just
 #      release`, else `python3 -B -c 'import sys; sys.path.insert(0,
 #      "packaging"); import release; sys.stdout.write(release.default_notes())'
-#      > <notes>`, from the repo root) and read the title FIRST:
-#      `title=$(git tag -l --format='%(contents:subject)' <tag>); test -n
-#      "$title" || echo "tag not in this clone: git fetch --tags origin"`. An
-#      empty title means the tag is not in THIS clone; `gh release create`
-#      would accept `--title ""`. Then create it, with --verify-tag so a
-#      mistyped <tag> aborts instead of creating a NEW public tag at the
-#      branch head: `gh release create <tag> --verify-tag --repo
-#      frdminc/sudo-secretspec --title "$title" --notes-file <notes>`.
+#      > <notes>`, from the repo root), then read the title and create the
+#      Release in ONE chain, so an empty title stops it: `title=$(git tag -l
+#      --format='%(contents:subject)' <tag>) && test -n "$title" && gh release
+#      create <tag> --verify-tag --repo frdminc/sudo-secretspec --title
+#      "$title" --notes-file <notes>`. An empty title means the tag is not in
+#      THIS clone (run `git fetch --tags origin` and repeat), and `gh release
+#      create` would accept `--title ""`. --verify-tag makes a mistyped <tag>
+#      abort instead of creating a NEW public tag at the branch head.
 #   3. `publish-bottle` polls only about ten minutes for the Release, then
 #      fails; its upload has no --clobber. If it failed for want of the
 #      Release, find the tag's run with `gh run list --repo
 #      frdminc/sudo-secretspec --branch <tag>` (always --repo), and once the
 #      bottle job is green re-run it: `gh run rerun <run-id> --failed --repo
 #      frdminc/sudo-secretspec`. Never upload assets by hand: step 4's
-#      verify_release_assets expects exactly the job's files. If a partial
+#      verify_release_assets hashes the job's files by name. If a partial
 #      upload is on the Release, remove those assets (`gh release delete-asset
 #      <tag> <name> --repo frdminc/sudo-secretspec`) before the re-run.
 #   4. This is the step release.py cannot do for you, and a hand version is
@@ -52,10 +52,11 @@
 #      (`archive_facts` memoises it for exactly that reason); a fresh download
 #      per step lets the three disagree unseen. The source.sha256 comparison is
 #      the only check tying the shipped binary to the verified tree, so it is
-#      not optional. Finish with `verify_readback`, which step 5's rule does
-#      not do. The next slice is a `--resume-after-release` mode so this is
-#      code, not prose.
-#   5. Then follow the rule below.
+#      not optional. The next slice is a `--resume-after-release` mode so
+#      this is code, not prose.
+#   5. Then follow the rule below, and finish with `verify_readback`: it
+#      checks the NEW engine version is installed, so in `_release_body` it
+#      comes after the install, never before.
 # - Failed AFTER "git push origin <tag>" (tag/Release/formula/tap already
 #   public): do NOT re-run — release.py preflight will refuse the published
 #   serial. Finish by hand: `brew update --force && brew reinstall
