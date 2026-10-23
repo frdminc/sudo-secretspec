@@ -13,6 +13,20 @@ on:
       - ".github/workflows/sudo-release.yml"
       - "CHANGELOG.md"
   push:
+    # A push to the working branch runs the `packaging` job and nothing else:
+    # `bottle` is gated on `ref_type == 'tag' || workflow_dispatch` and
+    # `publish-bottle` on a tag push, so neither fires here. Before this, a
+    # push to sudo-main triggered NO workflow at all -- the branch had only
+    # ever been checked by hand through `scripts/github-ci-run`, so a commit
+    # could sit on it unverified (2026-10-23).
+    #
+    # Deliberately no `paths` filter on this block: GitHub ANDs `paths` with
+    # `branches` AND with `tags` ("the workflow will only run when both
+    # filters are satisfied"), so adding one here would gate the release-tag
+    # leg below on a changed-file comparison -- the same silent-skip class as
+    # the pinned-literal bug recorded in the comment under `tags:`.
+    branches:
+      - sudo-main
     tags:
       # Every downstream release tag, not one literal. This was pinned to
       # "v0.19.1-djbclark.1" and so fired exactly once, in the entire history

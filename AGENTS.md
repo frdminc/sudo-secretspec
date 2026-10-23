@@ -224,6 +224,16 @@ file, a `path::test` id, or `-k`. The whole directory is CI's job
 or run it yourself with `scripts/github-ci-run --no-wait origin/sudo-main`.
 If a second test file is added, name both or use `-k`.
 
+Since 2026-10-23 a **push to `sudo-main` runs that `packaging` job by itself**:
+`sudo-release.yml`'s `push` block now lists the branch as well as the release
+tags. Only that job fires -- `bottle` is gated on `ref_type == 'tag' ||
+workflow_dispatch` and `publish-bottle` on a tag push -- so a branch push costs
+one short macOS job and never builds a bottle. Before that the branch triggered
+**no workflow at all** and a commit could sit on it unverified; `0c19acb` did,
+until it was dispatched by hand. Note that block carries no `paths` filter on
+purpose: GitHub ANDs `paths` with both `branches` and `tags`, so adding one
+would gate the release-tag leg on a changed-file comparison.
+
 No `--` after `bg`: it takes the command directly and refuses a lone `--` with
 exit 2, which reads exactly like the tests failing.
 
