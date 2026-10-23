@@ -3010,26 +3010,29 @@ def test_the_tag_only_hint_and_the_justfile_rule_it_points_at_stay_together(rele
     # (adversary B1, B2, fourteenth review).
     # A run of backticks is ONE delimiter (a ``double`` span is markdown
     # too), and each shell segment of a span is a command of its own.
+    gh = re.compile(r"\bgh\b", re.IGNORECASE)
+    pieces = re.split(r"`+", bullet)
+    spans, prose = pieces[1::2], " ".join(pieces[0::2])
+    bare = "gh release create"
+    # The exemption is the whole span, as before: never a segment of one.
+    checked = [span for span in spans if gh.search(span) and span != bare]
+    for span in checked:
+        assert "{owner}" not in span and "cachix" not in span, span
     segments = [
         segment.strip()
-        for span in re.split(r"`+", bullet)[1::2]
+        for span in checked
         for segment in re.split(r"&&|\|\||[;|]|\$\(", span)
     ]
-    commands = [s for s in segments if re.search(r"\bgh\b", s, re.IGNORECASE)]
-    bare = "gh release create"
-    assert len([c for c in commands if c != bare]) >= 4, commands
-    # Every gh in the bullet is in a checked segment, bar step 4's prose name.
-    assert len(re.findall(r"\bgh\b", bullet, re.IGNORECASE)) == len(
-        commands
-    ) + bullet.count("(gh attestation verify "), commands
+    commands = [s for s in segments if gh.search(s)]
+    assert len(commands) >= 4, commands
+    # One gh per checked command, and none in the prose but step 4's name.
+    assert all(len(gh.findall(c)) == 1 for c in commands), commands
+    assert len(gh.findall(prose)) == prose.count("(gh attestation verify "), prose
     for command in commands:
-        if command == bare:
-            continue
         assert command.startswith("gh "), command
         assert f"--repo {fork}" in command, command
         if command.startswith("gh release create"):
             assert "--verify-tag" in command, command
-        assert "{owner}" not in command and "cachix" not in command, command
         assert not command.startswith(("gh release upload", "gh api")), command
     # The title is read and checked in ONE chain with the create, so an empty
     # title stops it (an `|| echo` guard returns 0 and the create still runs:
