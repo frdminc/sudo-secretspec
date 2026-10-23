@@ -2310,9 +2310,11 @@ def _release_error_calls(release):
     (line, message expressions, declares self-sufficient, inside _require,
     is a _require call)."""
     tree = ast.parse(RELEASE_PY.read_text(encoding="utf-8"))
+    # Only the module-level `_require` is exempt: a nested `def _require` must
+    # not exempt itself (adversary N10, eleventh review, 2026-10-23).
     inside_require = {
         inner.lineno
-        for fn in ast.walk(tree)
+        for fn in tree.body
         if isinstance(fn, ast.FunctionDef) and fn.name == "_require"
         for inner in ast.walk(fn)
         # `ast.arguments` and similar helper nodes carry no position.
@@ -2336,12 +2338,21 @@ def _release_error_calls(release):
             for keyword in node.keywords
             if keyword.arg != "self_sufficient"
         ]
-        declares = any(
-            keyword.arg == "self_sufficient"
-            and isinstance(keyword.value, ast.Constant)
-            and keyword.value.value is True
-            for keyword in node.keywords
-        )
+        # Anything but the literal `False` declares: a computed flag
+        # (`bool(1)`, a module constant) is a false flag the count cannot see
+        # (adversary B1/B2). `**kwargs` can smuggle the flag in unseen (B3).
+        declares = False
+        odd = []
+        for keyword in node.keywords:
+            if keyword.arg is None:
+                odd.append("**kwargs")
+            elif keyword.arg == "self_sufficient":
+                literal = isinstance(keyword.value, ast.Constant) and isinstance(
+                    keyword.value.value, bool
+                )
+                if not literal:
+                    odd.append("computed self_sufficient")
+                declares = declares or not (literal and keyword.value.value is False)
         calls.append(
             (
                 node.lineno,
@@ -2349,9 +2360,30 @@ def _release_error_calls(release):
                 declares,
                 node.lineno in inside_require,
                 called == "_require",
+                odd,
             )
         )
     return calls
+
+
+def _release_error_aliases():
+    """Lines where `ReleaseError` or `_require` is subclassed or aliased: a
+    subclass defaulting the flag to True, or `_Fail = ReleaseError`, builds
+    errors the call scan never sees (adversary B5/N6/N7)."""
+    tree = ast.parse(RELEASE_PY.read_text(encoding="utf-8"))
+    watched = {"ReleaseError", "_require"}
+    lines = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef):
+            if any(isinstance(b, ast.Name) and b.id in watched for b in node.bases):
+                lines.append(node.lineno)
+        elif (
+            isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Name)
+            and node.value.id in watched
+        ):
+            lines.append(node.lineno)
+    return lines
 
 
 def test_self_sufficient_is_declared_exactly_where_a_hint_is_carried(release):
@@ -2385,12 +2417,18 @@ def test_self_sufficient_is_declared_exactly_where_a_hint_is_carried(release):
             for inner in ast.walk(expression)
         )
 
-    disagree, hidden, flagged = [], [], 0
-    for line, expressions, declares, in_require, called_require in _release_error_calls(
-        release
-    ):
+    disagree, hidden, flagged, unseen = [], [], 0, []
+    for (
+        line,
+        expressions,
+        declares,
+        in_require,
+        called_require,
+        odd,
+    ) in _release_error_calls(release):
         if in_require:
             continue
+        unseen += [(line, kind) for kind in odd]
         flagged += declares
         if carries(expressions) != declares:
             disagree.append(
@@ -2402,6 +2440,8 @@ def test_self_sufficient_is_declared_exactly_where_a_hint_is_carried(release):
         message = expressions[1] if called_require else expressions[0]
         if isinstance(message, ast.Name) and message.id not in carriers:
             hidden.append(line)
+    assert unseen == [], f"forms this check cannot read, at release.py lines: {unseen}"
+    assert _release_error_aliases() == [], "ReleaseError/_require subclassed or aliased"
     assert disagree == [], f"flag and hint disagree at release.py lines: {disagree}"
     assert hidden == [], f"message hidden in a local at release.py lines: {hidden}"
     assert flagged == SELF_SUFFICIENT_SITES, flagged
@@ -2773,6 +2813,62 @@ def test_the_real_archive_download_failing_is_not_given_the_bottle_route(
     assert "no usable macOS bottle" not in message
 
 
+def _hint_tail(hint):
+    """The literal text a hint ends with: after the last `{placeholder}` of one
+    that is used with `.format`, else the whole of it."""
+    return hint.rsplit("}", 1)[-1] if "}" in hint else hint
+
+
+def _audit_error(hints, message, flagged):
+    """True when the flag agrees with the message: a self-sufficient error ENDS
+    in one of the hints (they are always appended last), and one that does not
+    is not flagged. An error that merely QUOTES a hint mid-message, as
+    `bottle_entry` does when it echoes a rejected field, is not a carrier."""
+    ends = any(message.endswith(_hint_tail(hint)) for hint in hints)
+    return flagged == ends
+
+
+def test_the_error_audit_rejects_both_disagreements_and_accepts_a_quote():
+    hints = ["do not re-run -- finish by hand.", "build locally {keg} (see caveats)."]
+    assert _audit_error(hints, "boom. do not re-run -- finish by hand.", True)
+    assert _audit_error(hints, "boom. build locally X (see caveats).", True)
+    assert _audit_error(hints, "boom", False)
+    # A false flag: silence, no route.
+    assert not _audit_error(hints, "boom", True)
+    # A hint with no flag: a second, conflicting hint is appended later.
+    assert not _audit_error(hints, "boom. do not re-run -- finish by hand.", False)
+    # The hint quoted inside a rejected value is not a hint carried.
+    assert _audit_error(
+        hints, "bad path 'do not re-run -- finish by hand.' here", False
+    )
+
+
+@pytest.fixture(autouse=True)
+def _every_release_error_built_by_release_py_agrees_with_its_hint(release):
+    """Behavioural twin of the AST test. Syntax can be dodged (a hint built in a
+    helper, an alias constant, a subclass, a computed flag: sixteen such edits
+    passed 145 tests in the eleventh review, 2026-10-23); this asks what each
+    error release.py actually constructs while a test runs says and declares."""
+    module = release
+    hints = [getattr(module, name) for name in dir(module) if name.endswith("_HINT")]
+    real_init = module.ReleaseError.__init__
+    problems = []
+
+    def checked(self, *args, **kwargs):
+        real_init(self, *args, **kwargs)
+        caller = sys._getframe(1).f_code.co_filename
+        if (
+            caller == str(RELEASE_PY)
+            and args
+            and not _audit_error(hints, str(args[0]), self.self_sufficient)
+        ):
+            problems.append((str(args[0])[-80:], self.self_sufficient))
+
+    module.ReleaseError.__init__ = checked
+    yield
+    assert problems == [], f"flag and message disagree: {problems}"
+
+
 def test_the_tag_only_hint_and_the_justfile_rule_it_points_at_stay_together(release):
     """`RESUME_TAG_ONLY_HINT` sends the operator to a rule in the justfile, and
     that rule is keyed on a sentence release.py prints. If either drifts the
@@ -2786,6 +2882,9 @@ def test_the_tag_only_hint_and_the_justfile_rule_it_points_at_stay_together(rele
     assert "gh release view" in hint
     assert f"--repo {release.FORK_REPO}" in hint
     assert "do not re-run `just release`" in hint
+    # The rule it names, not the post-publication one that pours the previous
+    # bottle (adversary J3, eleventh review, 2026-10-23).
+    assert "'no formula commit yet' rule" in hint
     # Not the post-publication wording, which claims the Release exists.
     assert "Release are already published" not in hint
     justfile = (ROOT / "justfile").read_text(encoding="utf-8")
@@ -2802,6 +2901,17 @@ def test_the_tag_only_hint_and_the_justfile_rule_it_points_at_stay_together(rele
     assert "no formula commit yet" in flattened
     assert f"gh release view <tag> --repo {release.FORK_REPO}" in flattened
     assert "publish-bottle" in flattened
+    # The commands the operator will copy: the right repository, a tag that
+    # must already exist (J2, F2), and the verification step that
+    # `release.py` does in fetch_bottle (F1).
+    assert (
+        f"gh release create <tag> --verify-tag --repo {release.FORK_REPO}" in flattened
+    )
+    assert (
+        "Do what fetch_bottle, update_formula_commit, sync_tap and merge_bottle"
+        in flattened
+    )
+    assert "gh attestation verify" in flattened
 
 
 def test_a_bottle_json_quoting_a_hint_still_gets_the_bottle_route(

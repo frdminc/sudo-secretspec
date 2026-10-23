@@ -20,17 +20,30 @@
 #   1. `gh release view <tag> --repo frdminc/sudo-secretspec`. A Release can
 #      exist although release.py never saw it return. "release not found"
 #      names no repository, so check the --repo before believing it.
-#   2. If it is missing: `gh release create <tag> --repo
-#      frdminc/sudo-secretspec --title "$(git tag -l
+#   2. If it is missing, write the notes file (the one passed to `just
+#      release`, else `python3 -c 'import sys; sys.path.insert(0, "packaging");
+#      import release; sys.stdout.write(release.default_notes())' > <notes>`)
+#      and create it, with --verify-tag so a mistyped <tag> aborts instead of
+#      creating a NEW public tag at the branch head: `gh release create <tag>
+#      --verify-tag --repo frdminc/sudo-secretspec --title "$(git tag -l
 #      --format='%(contents:subject)' <tag>)" --notes-file <notes>` (the title
-#      is the annotated tag's subject; <notes> is the file passed to `just
-#      release`, else default_notes() in release.py).
-#   3. `publish-bottle` waits only about ten minutes for the Release and then
-#      fails without --clobber. If it failed, re-run it once the bottle job is
-#      green: `gh run rerun <run-id> --failed --repo frdminc/sudo-secretspec`.
-#   4. Do what update_formula_commit, sync_tap and merge_bottle do (formula url
-#      and sha256, commit, tap push, `brew bottle --merge --write` with the CI
-#      bottle JSON); read them first, they are the only description.
+#      is the annotated tag's subject; an empty title means <tag> is wrong).
+#   3. `publish-bottle` polls only about ten minutes for the Release, then
+#      fails; its upload has no --clobber. If it failed for want of the
+#      Release, find the tag's run with `gh run list --repo
+#      frdminc/sudo-secretspec --branch <tag>` (always --repo), and once the
+#      bottle job is green re-run it: `gh run rerun <run-id> --failed --repo
+#      frdminc/sudo-secretspec`. If a partial upload is already on the Release,
+#      upload the missing assets by hand with `gh release upload --clobber`.
+#   4. Do what fetch_bottle, update_formula_commit, sync_tap and merge_bottle
+#      do, IN THAT ORDER and without skipping the first: fetch_bottle runs
+#      `gh attestation verify` on the bottle JSON, every tarball and
+#      source.sha256, validates each JSON field, and checks source.sha256
+#      against the digest of the tag's archive -- the only check tying the
+#      shipped binary to the verified tree. Then the formula url and sha256,
+#      commit, tap push, and `brew bottle --merge --write` with the VERIFIED
+#      bottle JSON. Read those four functions first; they are the only
+#      description, and release.py has no mode that runs them for you.
 #   5. Then follow the rule below.
 # - Failed AFTER "git push origin <tag>" (tag/Release/formula/tap already
 #   public): do NOT re-run — release.py preflight will refuse the published

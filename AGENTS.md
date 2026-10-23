@@ -244,9 +244,13 @@ otherwise.** The repo has two remotes -- `origin` (the fork) and `upstream`
 (`cachix/secretspec`) -- and with no `gh-resolved` set, `gh` picks **upstream**.
 Run `gh repo set-default frdminc/sudo-secretspec` once (it writes
 `remote.origin.gh-resolved`) and every unflagged command answers about the
-fork. `--repo frdminc/sudo-secretspec` is still right to pass explicitly: it
-works in any clone, and a plain clone of the fork has only `origin`, so the
-trap appears once `upstream` has been added and `set-default` has not been run.
+fork. `--repo frdminc/sudo-secretspec` is still right to pass explicitly to
+`gh run`, `gh release`, `gh pr` and `gh attestation`: it works in any clone, and
+a plain clone of the fork has only `origin`, so the trap appears once `upstream`
+has been added and `set-default` has not been run. Two commands take **no**
+`--repo` (`unknown flag`): `gh api` (write the literal
+`repos/frdminc/sudo-secretspec/...` path, or set `GH_REPO=frdminc/sudo-secretspec`)
+and `gh repo view` (pass the repository as the argument).
 
 Which way it fails matters, because the dangerous direction is the quiet one:
 
