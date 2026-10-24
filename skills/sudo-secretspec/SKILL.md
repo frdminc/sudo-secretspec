@@ -1,7 +1,7 @@
 ---
 name: sudo-secretspec
 description: Use managed credentials through the privilege-separated sudo-secretspec client instead of touching a secret store directly. Use when a task needs an API key, token, or password; when a credential must be declared, set, rotated, read, deleted, or injected into a child process; or when the boundary, drift checker, or audit ledger reports an error. Also covers what is deliberately NOT exposed and must be asked of the operator.
-version: 0.7.0
+version: 0.8.0
 author: Dan Clark (djbclark), Hermes Agent
 license: Apache-2.0
 platforms: macos
@@ -83,6 +83,36 @@ sudo-secretspec schema --reason "generate typed accessors"
 sudo-secretspec audit-verify
 ```
 
+### Supplying a value without a terminal (verified 2026-10-24, client `0.19.1-sudo.30`)
+
+`set` reads the value from **stdin when stdin is not a terminal**, so an agent
+that must store a secret the operator has put on the clipboard (or in a pipe)
+never needs a TTY and the value never enters argv, a transcript or shell
+history:
+
+```bash
+export LC_CTYPE=en_US.UTF-8     # pbpaste mangles non-ASCII without it
+pbpaste | sudo-secretspec set NAME --reason "purpose"     # prints: Secret 'NAME' saved to sqlite
+printf 'cleared' | ~/ops/site-private/bin/clip             # then overwrite the clipboard
+```
+
+Check it landed with `sudo-secretspec run --reason R -- sh -c 'echo ${#NAME}'`
+(a length, never the value). Do not ask the operator to type `set` themselves
+and do not `get` the value back to compare.
+
+### Giving a consumer a secret it reads itself
+
+A daemon that needs a value in-process (a router, a proxy) does not need the
+value in its LaunchAgent plist or environment. Give it the **name** (for
+example `FIRECRAWL_ROUTER_GITHUB_SECRET: FIRECRAWL_GITHUB_PUBLIC_TOKEN` in the
+Ansible role's env block, a non-secret string) and let it run
+`sudo-secretspec get NAME --reason ...` once, holding the result in memory
+(`bin/firecrawl-router` `read_secret` is the model: argv list, stdin
+`DEVNULL`, stdout captured, nothing logged). The client works from a launchd
+job with no `sudo` and no Touch ID (probed 2026-10-24 with `launchctl submit`
+running `sudo-secretspec run`). A name selected this way must be declared
+first (`add`), or `get` fails as "not defined in profile".
+
 ## Declaration lifecycle
 
 Tracked Git content contains declarations only. Two routes exist, and the right
@@ -92,7 +122,11 @@ one depends on whether the name is meant to persist:
   through review and release. This is the durable path.
 - **Runtime declaration:** `add` writes the runtime manifest immediately, so the
   manifest goes ahead of the tracked declarations and `template-check` reports
-  drift until you either mirror it through release or undo it.
+  drift until you either mirror it through release or undo it. **On a host with
+  no tracked declarations source, `template-check` prints `no tracked declaration
+  source configured` and there is nothing to mirror: the `add` output's drift
+  warning does not apply there. Run `template-check` before promising a mirror
+  step.**
 
 ```bash
 sudo-secretspec add NAME --description "what it is" --reason "purpose"
@@ -292,6 +326,37 @@ explicit `unknown` terminal state if restoration cannot be proven.
 - `install`, `uninstall`, and `rollback` are not available through the NOPASSWD
   broker path. Never run `uninstall` to work around a failed check, and never
   pass `--purge-vault` or `--remove-service-user`.
+
+## Recipe: a new scoped credential, end to end
+
+Worked example, GitHub (2026-10-24, `FIRECRAWL_GITHUB_PUBLIC_TOKEN`): a fine-grained
+token limited to public repositories, so a daemon with an unauthenticated
+listener cannot reach private data through it.
+
+1. **Mint (operator only; open the page for them in the default browser with `open <url>`).**
+   GitHub fine-grained token: `https://github.com/settings/personal-access-tokens/new`;
+   Resource owner = the account, Repository access = **Public repositories (read-only)**, no permissions,
+   an expiry you write down. A fine-grained token is `github_pat_` plus 82 characters (93 in all).
+2. **Declare:** `sudo-secretspec add NAME --description "..." --optional --reason "..."`
+   (`--optional` so `check` stays green on hosts that never set it).
+3. **Store:** the clipboard route above; then overwrite the clipboard.
+4. **Prove its reach without printing it.** Run a throwaway script under `run` that prints only
+   the length, the prefix and HTTP statuses, then delete the script:
+   ```bash
+   sudo-secretspec run --reason "verify the token's scope" -- python3 -I /tmp/probe.py
+   ```
+   For a public-only GitHub token the expected answers were: `/user` 200, a private repo 404,
+   `search/code` on that private repo `total_count` 0, `search/issues` on it 422 ("cannot be
+   searched ... do not exist or you do not have permission"), and public searches 200. A classic
+   `repo`-scope PAT answers the private queries with real results: that is the difference you
+   are testing for. `x-oauth-scopes` is a classic-token header and is absent on fine-grained ones.
+5. **Wire the consumer by name** (previous section), apply the role, restart through its
+   launchd job, and repeat the end-to-end call.
+
+Where each consumer runs matters before you wire anything: grep the deploy repo
+(`rg -l <consumer> ~/ops/site-djbclark`) and the role's host list (`shared_mcp_hosts`
+defaults to `mac`). The Hyades microVMs run Firecrawl itself, not `firecrawl-router`,
+so a router-side secret is not needed (or stored) there.
 
 ## Verification
 
