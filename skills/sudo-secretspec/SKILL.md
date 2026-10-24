@@ -1,7 +1,7 @@
 ---
 name: sudo-secretspec
 description: Use managed credentials through the privilege-separated sudo-secretspec client instead of touching a secret store directly. Use when a task needs an API key, token, or password; when a credential must be declared, set, rotated, read, deleted, or injected into a child process; or when the boundary, drift checker, or audit ledger reports an error. Also covers what is deliberately NOT exposed and must be asked of the operator.
-version: 0.8.0
+version: 0.8.1
 author: Dan Clark (djbclark), Hermes Agent
 license: Apache-2.0
 platforms: macos
@@ -222,6 +222,13 @@ explicit `unknown` terminal state if restoration cannot be proven.
 
 ## Pitfalls
 
+- **`run` puts EVERY declared secret in the child's environment, so never list that environment.** `run -- env`, `printenv`,
+  `env | cut -d= -f1`, `set` and `/proc/*/environ` all print values or pieces of them: a multi-line value (an age identity,
+  a PEM) has lines with no `=`, and `cut` passes those through whole. To find what `run` adds, test for ONE name you
+  already know (`sh -c 'test -n "$NAME"'`) or compare `len(os.environ)` before and after in a script that prints a count.
+  Conversely, a long-lived consumer you start under `run` (a watcher, a daemon) hands that whole environment to every
+  child it spawns (`ssh`, notifiers, helper CLIs): read the one value it needs, then delete the rest from `os.environ`
+  (keep `PATH`, `HOME`, `SSH_AUTH_SOCK` and your own config names) before starting any subprocess.
 - **`get` and `export` stream values straight to your stdout.** `export` writes
   a JSON object of every declared name→value pair. Never print either into a
   transcript, log, or tool output — parse and assert on keys. The client
