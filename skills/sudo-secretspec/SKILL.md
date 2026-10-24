@@ -113,6 +113,16 @@ copy again. Ask them for the first/last couple of characters of what they
 copied so a re-copy can be corroborated (startswith/endswith under `run`)
 without printing the value.
 
+Race hazard: classifying in one command and piping `pbpaste | set` in a later
+one leaves a window where the operator's *next* copy is what gets stored. Same
+day, same key: between the two commands the operator copied the section title
+"Private API keys / Server-side API access" (to tell the agent where they
+were), and `set` stored that text. Do the classify and the forward in **one**
+process: pipe `pbpaste` into a short script that buffers stdin, validates the
+expected shape, and only on success invokes `sudo-secretspec set` itself with
+the buffered value on stdin. A mismatch then refuses the store instead of
+storing whatever arrived.
+
 ### Giving a consumer a secret it reads itself
 
 A daemon that needs a value in-process (a router, a proxy) does not need the
