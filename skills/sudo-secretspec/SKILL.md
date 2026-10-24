@@ -100,6 +100,19 @@ Check it landed with `sudo-secretspec run --reason R -- sh -c 'echo ${#NAME}'`
 (a length, never the value). Do not ask the operator to type `set` themselves
 and do not `get` the value back to compare.
 
+A length alone can pass on garbage. When the value came from a clipboard, also
+assert its **shape** under `run` before building on it: character-class counts
+and the longest alphanumeric run, compared against the provider's documented
+key format (UUID, `sk-…`, 64-hex, …). Real case (2026-10-24, vapi.ai private
+key): `set` succeeded, the length check passed at 224, and the value was a
+masked UI rendering — 92 box-drawing characters around column text, longest
+alphanumeric run 10, no key anywhere in it. A shape check fails that loudly; a
+real key passes without being printed. If the shape is wrong, do not try to
+parse the key out of the rendering: `delete` the value and have the operator
+copy again. Ask them for the first/last couple of characters of what they
+copied so a re-copy can be corroborated (startswith/endswith under `run`)
+without printing the value.
+
 ### Giving a consumer a secret it reads itself
 
 A daemon that needs a value in-process (a router, a proxy) does not need the
