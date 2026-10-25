@@ -123,6 +123,49 @@ expected shape, and only on success invokes `sudo-secretspec set` itself with
 the buffered value on stdin. A mismatch then refuses the store instead of
 storing whatever arrived.
 
+### The operator types them: `scripts/secrets-collect.py` (built 2026-10-25)
+
+**Use this whenever a human has to hand over one or more values.** Do not ask
+them to paste a key into the chat — that puts it in a transcript, which is the
+one thing this whole boundary exists to prevent. This is the general form of the
+one-process rule above, and it needs nothing from the agent's side:
+
+```bash
+S=~/src/sudo-secretspec/skills/sudo-secretspec/scripts/secrets-collect.py
+
+# three values, with expected lengths (a mismatch warns, never blocks)
+python3 $S \
+  --secret 'OVH_APPLICATION_KEY=Application Key (AK):16' \
+  --secret 'OVH_APPLICATION_SECRET=Application Secret (AS):32' \
+  --secret 'OVH_CONSUMER_KEY=Consumer Key (CK):32' \
+  --notify-to dann
+
+python3 $S --secret 'FOO_API_KEY=the API key'      # one value
+python3 $S --secret 'OVH_ENDPOINT=API endpoint' --literal   # not a key: skip the alnum check
+python3 $S --secret 'NAME=desc:8' --dry-run        # validate only, store nothing
+python3 $S --secret 'NAME=desc' --clipboard        # read from pbpaste instead of typing
+```
+
+1. **It prompts for each value with the input hidden** (`getpass`), so nothing is
+   echoed — not into the scrollback, not into shell history, not into the
+   process table (values reach `set` on stdin, never in argv).
+2. **All-or-nothing:** nothing is stored until every value is collected and the
+   operator confirms the summary, so Ctrl-C or a closed stdin leaves the store
+   exactly as it was. Verified 2026-10-25.
+3. **It refuses a value that cannot be a key.** Alphanumeric-plus-`_`/`-` by
+   default, with the offending characters named — which is what catches the
+   masked-UI-rendering case above *before* it is stored. `--literal` for
+   endpoints and URLs.
+4. **It prints names and lengths only**, and the `--notify-to ROLE` message
+   carries names and lengths only.
+5. **EOF is "no", never a crash** — safe under a pipe or a closed stdin.
+
+The declaring agent still declares the names first (`add --optional`), and still
+proves the result with `run` (a length), never `get`. This script replaces the
+"ask the human, then pipe" dance; it does not replace the declaration or the
+verification.
+
+
 ### Giving a consumer a secret it reads itself
 
 A daemon that needs a value in-process (a router, a proxy) does not need the
