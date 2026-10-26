@@ -142,16 +142,19 @@ python3 $S \
 
 python3 $S --secret 'FOO_API_KEY=the API key'      # one value
 python3 $S --secret 'OVH_ENDPOINT=API endpoint' --literal   # not a key: skip the alnum check
-python3 $S --secret 'NAME=desc:8' --dry-run        # validate only, store nothing
+python3 $S --secret 'NAME=desc:8' --dry-run        # validate only, store nothing (with --clipboard --yes it still consumes and clears the copy)
 python3 $S --secret 'NAME=desc' --clipboard        # read from pbpaste instead of typing
 ```
 
 1. **It prompts for each value with the input hidden** (`getpass`), so nothing is
    echoed — not into the scrollback, not into shell history, not into the
    process table (values reach `set` on stdin, never in argv).
-2. **All-or-nothing:** nothing is stored until every value is collected and the
-   operator confirms the summary, so Ctrl-C or a closed stdin leaves the store
-   exactly as it was. Verified 2026-10-25.
+2. **Nothing is stored until every value is collected, checked and (without
+   `--yes`) confirmed**, so Ctrl-C or a closed stdin before that leaves the store
+   exactly as it was. The store loop itself is **not** atomic: a failure or
+   Ctrl-C part-way prints `stored=[...] not_stored=[...]` (and `unknown=[...]`
+   for the value in flight) and exits non-zero. Nothing is rolled back, because
+   an overwritten old value is gone — re-run for the names listed as not stored.
 3. **It refuses a value that cannot be a key.** Alphanumeric-plus-`_`/`-` by
    default, with the offending characters named — which is what catches the
    masked-UI-rendering case above *before* it is stored. `--literal` for
@@ -159,11 +162,84 @@ python3 $S --secret 'NAME=desc' --clipboard        # read from pbpaste instead o
 4. **It prints names and lengths only**, and the `--notify-to ROLE` message
    carries names and lengths only.
 5. **EOF is "no", never a crash** — safe under a pipe or a closed stdin.
+6. **Typed mode needs a terminal.** The hidden prompt is `getpass`: with no
+   terminal at all it falls back to reading stdin, so a value piped in (without
+   `--clipboard`) is accepted today, but only by that accident, and it went through
+   the caller's command line. Do not do it; `--yes` without `--clipboard` and with a
+   non-tty stdin is refused (exit 2) for exactly that reason.
 
 The declaring agent still declares the names first (`add --optional`), and still
 proves the result with `run` (a length), never `get`. This script replaces the
 "ask the human, then pipe" dance; it does not replace the declaration or the
 verification.
+
+**An agent with no terminal** cannot answer the final prompt or press Enter, so
+use `--clipboard --yes`. Every rule below applies to **any** `--clipboard --yes`
+run, on a pty or not:
+
+1. **Run it only after the operator says the value is copied.** It reads and
+   then overwrites whatever is on the clipboard; run too early and it consumes
+   (and clears) something unrelated, and prints that content's length and
+   character classes into your transcript. `--dry-run` consumes and clears the
+   copy too, so it is not a free rehearsal.
+2. **ONE secret per run, and never two runs at once: issue the commands
+   sequentially, each after a fresh copy, never as parallel tool calls.** The
+   clipboard cannot change between secrets (more than one `--secret` exits 2). A
+   per-user lock (`~/Library/Caches/secrets-collect.lock`, not under `$TMPDIR`, so
+   two harnesses share it) is held from before `pbpaste` until after the clear. A
+   second run waits about 10 s for it, then exits 1 ("another secrets-collect run
+   holds the clipboard lock"); one that gets in after the clear reads the sentinel,
+   which names the run that consumed the copy (`... cleared by the run for NAME at
+   HH:MM:SS ...`), and exits 1. **A parallel loser is not harmless:** the winner may
+   have taken a copy meant for the loser's name, so **both names must be
+   re-collected, one at a time**, each after a fresh copy. Re-running only the
+   loser leaves the winner holding the wrong value (its length would still pass).
+3. **The spec MUST carry the expected length** (`NAME=desc:32`), else exit 2. A
+   regex does not count: the spec cannot carry both, and a regex can match
+   stale prose (`.+`); if you need a pattern, pin the length in it and use it
+   interactively. With no human at the prompt the length is the only freshness
+   check, so a mismatch aborts **without prompting** (nothing stored). The
+   alphanumeric shape check applies (a regex does not waive it; only
+   `--literal` does), and `cleared` and the script's own sentinel are refused.
+4. **`--clipboard` with a non-tty stdin and no `--yes` exits 2** ("a non-tty
+   stdin is not the operator"): piped Enter/`y` answers never stand in for the
+   operator. `--yes` without `--clipboard` and with a non-tty stdin also exits 2.
+
+`--yes` skips the "Store these?" prompt and the Enter wait; every check and
+stdin-only delivery are unchanged. It reads `pbpaste` once, aborts (exit 1,
+nothing stored) on an empty, non-UTF-8, bad-shape or wrong-length value rather
+than retrying, and **overwrites the clipboard itself right after the read**
+(in a `finally`, so a stored, rejected or interrupted run clears it; SIGINT,
+SIGTERM and SIGHUP are blocked while the overwrite runs, so one that arrives
+then is delivered after it. A SIGKILL or power loss between the read and the
+clear cannot be caught, and neither can a `pbcopy` that fails). The
+next run sees a fresh copy or the sentinel, never the previous secret. A failed
+overwrite prints `WARNING: ... NOT cleared`. The rejection text gives a count
+and character classes, never the characters. A clipboard that was stale
+**before the first run** and has the same shape and length cannot be detected:
+have the operator copy, say so in chat, then run. SIGTERM/SIGHUP mid-store gets
+the same `PARTIAL STORE` report as Ctrl-C.
+
+Do **not** use `--literal` for a key: it removes the shape check. It is for
+endpoints and URLs (and then still give `:LEN`). **One exception:** a key whose
+alphabet includes `/`, `+` or `=` (AWS secret access keys, Azure keys, other
+base64 material) is rejected by the alphanumeric check and has no other route,
+since a regex does not waive it. For those, and only those, use `--literal` with
+`:LEN` still required (LEN is then the only check), and verify the shape under
+`run` afterwards as above.
+
+```bash
+python3 $S --secret 'NAME=desc:32' --clipboard --yes
+printf 'cleared' | ~/ops/site-private/bin/clip     # regardless of the exit status: `;`, never `&&`
+sudo-secretspec run -- sh -c 'echo ${#NAME}'
+```
+
+The script clears the clipboard itself; the second line is the belt for the
+runs where it died before the read (or printed the WARNING). Run it whether or
+not the first line succeeded, so a secret never stays on the pasteboard (clipboard
+managers, Universal Clipboard).
+
+Verified 2026-10-26 (stub `sudo-secretspec`/`pbpaste`/`pbcopy`; no live vault).
 
 
 ### Giving a consumer a secret it reads itself

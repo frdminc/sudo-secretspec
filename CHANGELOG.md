@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `skills/sudo-secretspec/scripts/secrets-collect.py` gained `--yes` for agents
+  without a terminal: with `--clipboard` it takes one secret per run from the
+  clipboard, requires an exact length, refuses stale or already-consumed
+  copies (the sentinel names the run that consumed it), clears the clipboard
+  right after the read under a per-user lock so parallel runs cannot store one
+  copy twice, reports partial stores, and never prints value characters.
+  Piped answers without `--yes` and `--yes` without `--clipboard` are refused.
+
 ### Fixed
 
 - Concurrent opens of a history-enabled sqlite vault no longer fail with
