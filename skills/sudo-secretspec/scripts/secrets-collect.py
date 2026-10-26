@@ -21,6 +21,7 @@ Any agent, any provider. The operator runs it; the agent reads the result from t
 
     # no terminal (an agent): ONE secret per run, no prompts, LEN REQUIRED. Run it only after the
     # operator says the value is copied, and never two at once (a lock makes a second one fail)
+    # (keys with `/+=` in the alphabet, e.g. AWS secret keys: add --literal, :LEN still required)
     secrets-collect.py --secret 'NAME=desc:32' --clipboard --yes
 
 Why this exists: an agent that needs values from a human must never ask the human to paste them
@@ -42,14 +43,19 @@ Properties, each deliberate:
   6. EOF is treated as "no", never a crash.
   7. --clipboard --yes (tty or not) cannot tell a fresh copy from a stale clipboard by looking
      at it, so it (a) requires an expected LEN in the spec (a regex does not count) and aborts on
-     a mismatch without prompting, (b) refuses the sentinels `cleared` and CLEARED_MARK, (c)
-     overwrites the clipboard with CLEARED_MARK itself, in a `finally` right after the read
-     (stored, rejected, or interrupted by an exception or SIGINT/SIGTERM/SIGHUP), and (d) holds an
-     exclusive per-user lock from before pbpaste until after that overwrite, so two parallel runs
-     cannot both read one copy: the second reads the sentinel and fails. A SIGKILL or power loss
-     between the read and the clear still leaves the value on the pasteboard. A clipboard that was
-     stale before the FIRST run and happens to have the same shape and length is not detectable;
-     --dry-run reads and clears too, so it consumes the operator's copy.
+     a mismatch without prompting, (b) refuses the sentinels `cleared` and anything starting
+     CLEARED_PREFIX, (c) overwrites the clipboard with a sentinel naming this run's NAME, in a
+     `finally` right after the read (stored, rejected, or an exception or SIGINT/SIGTERM/SIGHUP
+     during the read or later; those three signals are blocked while pbcopy runs, so one that
+     arrives then is delivered after the clear), and (d) holds an exclusive per-user lock
+     (~/Library/Caches/secrets-collect.lock, not under TMPDIR) from before pbpaste until after
+     that overwrite. A second run waits about 10 s, then exits 1; one that gets in after the
+     clear reads the sentinel and fails, naming the run that consumed the copy: that run may have
+     taken a copy meant for the loser's name, so BOTH names must be re-collected. A SIGKILL or
+     power loss between the read and the clear, or a failing pbcopy (a WARNING is printed), leaves
+     the value on the pasteboard. A clipboard that was stale before the FIRST run and happens to
+     have the same shape and length is not detectable; --dry-run reads and clears too, so it
+     consumes the operator's copy.
      --clipboard with a non-tty stdin and no --yes is refused: piped answers are not the operator.
   8. A clipboard value identical to one already collected in the same run is refused (the
      clipboard did not change between secrets), so a pty cannot read one value into N names.
@@ -61,15 +67,40 @@ import contextlib
 import fcntl
 import getpass
 import os
+import pwd
 import re
 import signal
 import subprocess
 import sys
-import tempfile
+import time
 import unicodedata
 
-CLEARED_MARK = "secrets-collect: clipboard cleared, copy the value again"
-SENTINELS = {"cleared", CLEARED_MARK}
+_CANCEL_SIGNALS = {signal.SIGINT, signal.SIGTERM, signal.SIGHUP}
+
+CLEARED_PREFIX = "secrets-collect: clipboard cleared"  # every sentinel this script ever wrote
+CLEARED_WORD = "cleared"
+LOCK_WAIT = 10.0  # seconds a second run waits for the clipboard lock before giving up
+_CONSUMER = re.compile(r"cleared by the run for (\S+) at (\d\d:\d\d:\d\d)")
+
+
+def is_sentinel(value: str) -> bool:
+    return value == CLEARED_WORD or value.startswith(CLEARED_PREFIX)
+
+
+def sentinel_error(value: str, name: str) -> str:
+    """Why a sentinel was read. A run that lost the lock race read the winner's sentinel, and the
+    winner may have taken a copy meant for THIS name, so say who consumed it."""
+    m = _CONSUMER.search(value)
+    if not m:
+        return ("the clipboard holds a cleared-clipboard sentinel: no fresh copy was made since "
+                "the last clear")
+    who, at = m.groups()
+    if who == name:
+        return (f"the clipboard holds a cleared-clipboard sentinel: an earlier run for {name} "
+                f"consumed the copy at {at}; copy the value again")
+    return (f"the clipboard holds a cleared-clipboard sentinel: the run for {who} consumed this "
+            f"copy at {at}; if the copy was for {name}, {who} now holds that value: "
+            f"re-collect {who} too")
 
 
 class StoreError(Exception):
@@ -116,45 +147,102 @@ def _pb_env() -> dict[str, str]:
     return dict(os.environ, LC_CTYPE="UTF-8")
 
 
-def clear_clipboard() -> None:
-    """Overwrite the pasteboard with CLEARED_MARK so a later run cannot read this secret again."""
+def _ignore_cancel_signals() -> None:
+    """SIG_IGN for SIGINT/SIGTERM/SIGHUP. A signal that already arrived is still tripped and
+    would raise inside this very loop, so retry: once all three are ignored it is dropped."""
+    for sig in sorted(_CANCEL_SIGNALS):
+        while True:
+            try:
+                signal.signal(sig, signal.SIG_IGN)
+                break
+            except KeyboardInterrupt:
+                continue
+
+
+def _not_cleared(e: BaseException) -> None:
+    print(f"  WARNING: the clipboard was NOT cleared ({type(e).__name__}); "
+          "overwrite it yourself", file=sys.stderr)
+
+
+def clear_clipboard(name: str) -> None:
+    """Overwrite the pasteboard with a sentinel naming the run that consumed the copy, so a later
+    run cannot read this secret again and a loser of a lock race can say whom to re-collect."""
+    mark = (f"{CLEARED_PREFIX} by the run for {name} at {time.strftime('%H:%M:%S')}, "
+            "copy the value again")
     try:
-        subprocess.run(["pbcopy"], input=CLEARED_MARK, text=True, check=True,
-                       capture_output=True, env=_pb_env())
+        subprocess.run(["pbcopy"], input=mark, text=True, check=True,
+                       capture_output=True, env=_pb_env(), timeout=15)
     except Exception as e:  # noqa: BLE001
-        print(f"  WARNING: the clipboard was NOT cleared ({type(e).__name__}); "
-              "overwrite it yourself", file=sys.stderr)
+        _not_cleared(e)
+    except BaseException as e:  # an interrupt that got through: still say so, then let it go on
+        _not_cleared(e)
+        raise
+
+
+def lock_path() -> str:
+    """Per user, not per TMPDIR: the pasteboard is shared by every process of the login session,
+    so two harnesses with different TMPDIRs must still meet at one lock. SECRETS_COLLECT_LOCK_DIR
+    exists for the tests; nothing else sets it."""
+    d = os.environ.get("SECRETS_COLLECT_LOCK_DIR") or os.path.join(
+        pwd.getpwuid(os.getuid()).pw_dir, "Library", "Caches")
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    return os.path.join(d, "secrets-collect.lock")
 
 
 @contextlib.contextmanager
 def clipboard_lock():
     """Per-user exclusive lock held from before pbpaste until after the clear, so two parallel
-    no-terminal runs cannot both read the same copy: the loser reads CLEARED_MARK and fails."""
-    path = os.path.join(tempfile.gettempdir(), f"secrets-collect-{os.getuid()}.lock")
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    no-terminal runs cannot both read the same copy. Taken with LOCK_NB and retried for LOCK_WAIT
+    seconds; a second run that cannot get it exits 1 rather than block without a word."""
+    path = "(unknown)"
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        path = lock_path()
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as e:
+        print(f"  could not open the lock file {path}: {type(e).__name__}", file=sys.stderr)
+        raise SystemExit(1)
+    try:
+        deadline = time.monotonic() + LOCK_WAIT
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    print("  another secrets-collect run holds the clipboard lock; "
+                          "wait for it to finish and run this one again", file=sys.stderr)
+                    raise SystemExit(1)
+                time.sleep(0.05)
         yield
     finally:
         os.close(fd)  # closing releases the flock
 
 
-def read_and_clear() -> bytes:
+def read_and_clear(name: str) -> bytes:
     """pbpaste, then overwrite the clipboard in a finally, so an interrupt right after the read
-    still clears. A pbpaste that failed read nothing, so it leaves the clipboard alone."""
-    failed = False
+    still clears. A pbpaste that failed read nothing, and a sentinel holds nothing secret (and
+    names the run that really consumed the copy), so both leave the clipboard alone. SIGINT,
+    SIGTERM and SIGHUP are blocked (pbcopy inherits the mask, so a group signal cannot kill it
+    either) while the overwrite runs; a signal that arrived meanwhile is delivered right after."""
+    leave = False
     try:
-        return subprocess.run(["pbpaste"], capture_output=True, check=True,
+        data = subprocess.run(["pbpaste"], capture_output=True, check=True,
                               env=_pb_env()).stdout
+        leave = is_sentinel(data.decode("utf-8", "replace").strip())
+        return data
     except (subprocess.CalledProcessError, OSError):
-        failed = True
+        leave = True
         raise
     finally:
-        if not failed:
-            clear_clipboard()
+        if not leave:
+            old = signal.pthread_sigmask(signal.SIG_BLOCK, _CANCEL_SIGNALS)
+            try:
+                clear_clipboard(name)
+            finally:
+                signal.pthread_sigmask(signal.SIG_SETMASK, old)
 
 
-def read_value(label: str, from_clipboard: bool, no_wait: bool = False) -> str:
+def read_value(label: str, from_clipboard: bool, no_wait: bool = False, name: str = "?") -> str:
     """One value, hidden if from the terminal. Retries on an empty read.
 
     no_wait (clipboard, no terminal): read pbpaste once, no Enter wait, no retry -- the
@@ -166,7 +254,7 @@ def read_value(label: str, from_clipboard: bool, no_wait: bool = False) -> str:
                 if no_wait:
                     print(f"  Reading {label} from the clipboard (no terminal, no wait).")
                     with clipboard_lock():
-                        data = read_and_clear()
+                        data = read_and_clear(name)
                 else:
                     print(f"  Copy {label} to the clipboard, then press Enter.")
                     input("  [Enter when copied] ")
@@ -299,7 +387,8 @@ def main() -> int:
                     help="tell this peer-role when done (names and lengths only)")
     ap.add_argument("--literal", action="store_true",
                     help="values are not API keys (no alphanumeric check) — endpoints, URLs only; "
-                         "an agent must not use it for a key")
+                         "an agent must not use it for a key, except one whose alphabet includes "
+                         "/+= (AWS secret keys, Azure keys), with :LEN still required")
     ap.add_argument("--dry-run", action="store_true",
                     help="validate but store nothing and notify nobody")
     ap.add_argument("--clipboard", action="store_true",
@@ -358,10 +447,10 @@ def main() -> int:
         for i, (name, desc, length, pattern) in enumerate(specs, 1):
             print(f"[{i}/{len(specs)}] {name}")
             while True:
-                value = read_value(desc, a.clipboard, no_wait)
+                value = read_value(desc, a.clipboard, no_wait, name)
                 err = None
-                if a.clipboard and value in SENTINELS:
-                    err = "the clipboard holds the cleared-clipboard sentinel — nothing was copied"
+                if a.clipboard and is_sentinel(value):
+                    err = sentinel_error(value, name)
                 elif a.clipboard and any(value == v for _, v in collected):
                     err = "identical to a value already collected — the clipboard did not change"
                 else:
@@ -405,14 +494,20 @@ def main() -> int:
         print("\nDone.")
         return 0
     except KeyboardInterrupt:
-        if notifying:
-            print("\nInterrupted while notifying; every value IS stored.", file=sys.stderr)
-        elif storing:
-            print("\nInterrupted while storing.", file=sys.stderr)
-            report_partial(stored, [n for n, _ in collected if n not in stored and n != inflight],
-                           inflight)
-        else:
-            print("\nAborted — nothing was stored.", file=sys.stderr)
+        # a second signal, or a SIGHUP whose terminal is gone, must not cut the report short
+        _ignore_cancel_signals()
+        try:
+            if notifying:
+                print("\nInterrupted while notifying; every value IS stored.", file=sys.stderr)
+            elif storing:
+                print("\nInterrupted while storing.", file=sys.stderr)
+                report_partial(stored,
+                               [n for n, _ in collected if n not in stored and n != inflight],
+                               inflight)
+            else:
+                print("\nAborted — nothing was stored.", file=sys.stderr)
+        except OSError:
+            pass
         return 130
 
 

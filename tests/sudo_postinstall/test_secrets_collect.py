@@ -5,10 +5,12 @@ Every subprocess has a hard timeout: a mutant that loops must fail, not hang CI.
 import importlib.util
 import os
 import pty
+import re
 import signal
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -16,7 +18,9 @@ import pytest
 SCRIPT = Path(__file__).resolve().parents[2] / "skills/sudo-secretspec/scripts/secrets-collect.py"
 VALUE = "s3cretVALUE0123"
 LEN = len(VALUE)
-MARK = "secrets-collect: clipboard cleared, copy the value again"
+OLD_MARK = "secrets-collect: clipboard cleared, copy the value again"  # round 1/2 sentinel
+CLEARED = re.compile(r"secrets-collect: clipboard cleared by the run for (\w+) at "
+                     r"\d\d:\d\d:\d\d, copy the value again")
 TIMEOUT = 10
 
 
@@ -38,13 +42,15 @@ def env(tmp_path):
          f'if [ "$2" = "$FAIL_NAME" ]; then echo boom >&2; exit 1; fi\n'
          f'if [ "$2" = "$INT_NAME" ]; then kill -INT $PPID; sleep 5; fi\n'
          f'if [ "$2" = "$TERM_NAME" ]; then kill -TERM $PPID; sleep 5; fi\n'
+         f'if [ "$2" = "$BURST_NAME" ]; then kill -INT $PPID; kill -TERM $PPID; '
+         f'kill -HUP $PPID; sleep 5; fi\n'
          f'cat >> {log}\necho >> {log}\n')
     stub("pbpaste", f"cat {clip}\n")
     stub("pbcopy", f"cat > {clip}\n")
-    e = dict(os.environ, PATH=f"{bindir}:{os.environ['PATH']}", TMPDIR=str(tmp_path))
-    e.pop("FAIL_NAME", None)
-    e.pop("INT_NAME", None)
-    e.pop("TERM_NAME", None)
+    e = dict(os.environ, PATH=f"{bindir}:{os.environ['PATH']}", TMPDIR=str(tmp_path),
+             SECRETS_COLLECT_LOCK_DIR=str(tmp_path / "lock"))
+    for k in ("FAIL_NAME", "INT_NAME", "TERM_NAME", "BURST_NAME"):
+        e.pop(k, None)
     return e, log, clip, bindir
 
 
@@ -52,10 +58,18 @@ def _sigint_default():
     signal.signal(signal.SIGINT, signal.SIG_DFL)  # so python installs its KeyboardInterrupt handler
 
 
+def cleared_by(text):
+    """The NAME the clipboard's sentinel says consumed the copy, or None if it is not one."""
+    m = CLEARED.fullmatch(text)
+    return m.group(1) if m else None
+
+
 def run(env, args, stdin="", extra_env=None):
     e = dict(env[0], **(extra_env or {}))
+    # own session: no controlling tty, so getpass reads the piped stdin even under a terminal
     return subprocess.run([sys.executable, str(SCRIPT), *args], input=stdin, text=True,
-                          capture_output=True, env=e, timeout=TIMEOUT, preexec_fn=_sigint_default)
+                          capture_output=True, env=e, timeout=TIMEOUT, preexec_fn=_sigint_default,
+                          start_new_session=True)
 
 
 def calls(log):
@@ -112,22 +126,38 @@ def test_literal_with_matching_length_stores(env):
 def test_clipboard_is_cleared_after_a_successful_read(env):
     _, _, clip, _ = env
     assert run(env, yes_args()).returncode == 0
-    assert clip.read_text() == MARK
+    assert cleared_by(clip.read_text()) == "A"
     # cleared BEFORE the store, not after: the store's own view of the clipboard is the sentinel
-    assert (clip.parent / "clip_at_store").read_text() == MARK
+    assert cleared_by((clip.parent / "clip_at_store").read_text()) == "A"
 
 
 def test_second_run_without_a_fresh_copy_stores_nothing(env):
     _, log, clip, _ = env
     assert run(env, yes_args("A=a:%d" % LEN)).returncode == 0
     log.unlink()
-    r = run(env, yes_args("B=b:%d" % len(MARK), "--literal"))  # even a spec that fits the sentinel
+    # even a spec that fits the sentinel
+    r = run(env, yes_args("B=b:%d" % len(clip.read_text()), "--literal"))
     assert r.returncode == 1
     assert calls(log) == ""
     assert "sentinel" in out(r)
+    # it names the run that consumed the copy, since that run may have taken B's value
+    assert re.search(r"the run for A consumed this copy at \d\d:\d\d:\d\d", out(r))
+    assert "re-collect A too" in out(r)
+    assert "nothing was copied" not in out(r)
 
 
-@pytest.mark.parametrize("stale", ["cleared", MARK])
+def test_second_run_for_the_same_name_says_so(env):
+    _, log, clip, _ = env
+    assert run(env, yes_args("A=a:%d" % LEN)).returncode == 0
+    r = run(env, yes_args("A=a:%d" % len(clip.read_text()), "--literal"))
+    assert r.returncode == 1
+    assert "an earlier run for A consumed the copy at" in out(r)
+    assert "re-collect" not in out(r)
+
+
+@pytest.mark.parametrize("stale", [
+    "cleared", OLD_MARK,
+    "secrets-collect: clipboard cleared by the run for Z at 01:02:03, copy the value again"])
 def test_sentinels_refused_even_when_length_and_literal_fit(env, stale):
     _, log, clip, _ = env
     clip.write_text(stale)
@@ -162,11 +192,15 @@ def test_malformed_regex_fails_before_the_clipboard_is_read(env):
     assert calls(log) == ""
 
 
-def _check_fn():
+def _load_module():
     spec = importlib.util.spec_from_file_location("secrets_collect_under_test", SCRIPT)
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
-    return m.check
+    return m
+
+
+def _check_fn():
+    return _load_module().check
 
 
 def test_regex_must_match_the_whole_value_and_keeps_the_shape_check():
@@ -184,14 +218,14 @@ def test_clipboard_cleared_on_every_failure_path_after_the_read(env):
     _, log, clip, _ = env
     clip.write_text("not alnum !!")
     assert run(env, yes_args("A=a:12")).returncode == 1
-    assert clip.read_text() == MARK
+    assert cleared_by(clip.read_text()) == "A"
     clip.write_text(VALUE)
     assert run(env, yes_args("A=a:99")).returncode == 1  # length mismatch
-    assert clip.read_text() == MARK
+    assert cleared_by(clip.read_text()) == "A"
     clip.write_text(VALUE)
     r = run(env, yes_args(), extra_env={"FAIL_NAME": "A"})  # store failure
     assert r.returncode == 1
-    assert clip.read_text() == MARK
+    assert cleared_by(clip.read_text()) == "A"
 
 
 def test_pbcopy_failure_is_loud(env):
@@ -233,7 +267,7 @@ def test_yes_on_a_pty_gets_the_no_terminal_protections(env):
     r, so, se = run_pty(env, yes_args(), b"")
     assert r == 0, se
     assert VALUE in calls(log)
-    assert clip.read_text() == MARK
+    assert cleared_by(clip.read_text()) == "A"
     # a second run on the pty fails closed on the sentinel instead of waiting for input forever
     log.unlink()
     r, so, se = run_pty(env, yes_args("B=b:%d" % LEN), b"")
@@ -241,14 +275,24 @@ def test_yes_on_a_pty_gets_the_no_terminal_protections(env):
     assert calls(log) == ""
 
 
-def test_parallel_runs_store_the_copy_at_most_once(env):
+@pytest.mark.parametrize("own_tmpdirs", [False, True])
+def test_parallel_runs_store_the_copy_at_most_once(env, tmp_path, own_tmpdirs):
     _, log, clip, bindir = env
-    # a slow pbpaste holds the first run between its read and its clear
+    # a slow pbpaste holds the first run between its read and its clear, and a slow pbcopy
+    # makes the clear itself long enough that a clear outside the lock lets run 2 read the value
     (bindir / "pbpaste").write_text(f"#!/bin/sh\ncat {clip}\nsleep 1\n")
-    procs = [subprocess.Popen([sys.executable, str(SCRIPT), *yes_args(f"{n}=x:{LEN}")],
-                              stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE, text=True, env=env[0],
-                              preexec_fn=_sigint_default) for n in ("A", "B")]
+    (bindir / "pbcopy").write_text(f"#!/bin/sh\nsleep 1\ncat > {clip}\n")
+    names = ("A", "B")
+    procs = []
+    for n in names:
+        e = dict(env[0])
+        if own_tmpdirs:  # two harnesses with their own TMPDIR still share one pasteboard
+            (tmp_path / f"tmp{n}").mkdir()
+            e["TMPDIR"] = str(tmp_path / f"tmp{n}")
+        procs.append(subprocess.Popen(
+            [sys.executable, str(SCRIPT), *yes_args(f"{n}=x:{LEN}")], stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e,
+            preexec_fn=_sigint_default, start_new_session=True))
     try:
         res = [(p.communicate(timeout=TIMEOUT), p.returncode) for p in procs]
     finally:
@@ -258,7 +302,74 @@ def test_parallel_runs_store_the_copy_at_most_once(env):
     rcs = sorted(rc for _, rc in res)
     assert rcs == [0, 1], res
     assert calls(log).count("ARGV: set") == 1
-    assert clip.read_text() == MARK
+    winner = names[[rc for _, rc in res].index(0)]
+    loser_out = res[1 - names.index(winner)][0]
+    assert cleared_by(clip.read_text()) == winner
+    assert f"the run for {winner} consumed this copy" in "".join(loser_out)
+    assert f"re-collect {winner} too" in "".join(loser_out)
+
+
+def test_group_signal_during_the_clear_cannot_leave_the_secret(env, tmp_path):
+    _, log, clip, bindir = env
+    started = tmp_path / "pbcopy_started"
+    (bindir / "pbcopy").write_text(f"#!/bin/sh\ntouch {started}\nsleep 1\ncat > {clip}\n")
+    p = subprocess.Popen([sys.executable, str(SCRIPT), *yes_args()], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env[0],
+                         preexec_fn=_sigint_default, start_new_session=True)
+    try:
+        deadline = time.monotonic() + 5
+        while not started.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert started.exists()
+        os.killpg(p.pid, signal.SIGTERM)  # a harness cancel, or Ctrl-C, hits pbcopy too
+        so, se = p.communicate(timeout=TIMEOUT)
+    finally:
+        if p.poll() is None:
+            p.kill()
+    assert p.returncode == 130, se
+    assert cleared_by(clip.read_text()) == "A"  # pbcopy finished: the signal waited for it
+    assert "NOT cleared" not in se
+    assert calls(log) == ""  # and the run still stops: the signal is delivered after the clear
+
+
+@pytest.mark.parametrize("sig", ["TERM", "HUP"])
+def test_signal_between_the_read_and_the_clear_still_clears(env, sig):
+    _, log, clip, bindir = env
+    (bindir / "pbpaste").write_text(f"#!/bin/sh\ncat {clip}\nkill -{sig} $PPID\nsleep 1\n")
+    r = run(env, yes_args())
+    assert r.returncode == 130, out(r)
+    assert cleared_by(clip.read_text()) == "A"
+    assert calls(log) == ""
+
+
+def test_lock_contention_exits_with_a_message_after_the_wait(tmp_path, monkeypatch, capsys):
+    m = _load_module()
+    monkeypatch.setenv("SECRETS_COLLECT_LOCK_DIR", str(tmp_path))
+    monkeypatch.setattr(m, "LOCK_WAIT", 0.3)
+    with m.clipboard_lock():
+        t0 = time.monotonic()
+        with pytest.raises(SystemExit) as ei:
+            with m.clipboard_lock():
+                pytest.fail("got a lock that another holder has")
+        assert ei.value.code == 1
+        assert time.monotonic() - t0 >= 0.3  # it retried, it did not give up at once
+    assert "another secrets-collect run holds the clipboard lock" in capsys.readouterr().err
+    with m.clipboard_lock():  # and the lock is released when the holder leaves
+        pass
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root opens a mode-000 file")
+def test_unopenable_lock_file_is_reported_as_the_lock(env, tmp_path):
+    _, log, clip, _ = env
+    (tmp_path / "lock").mkdir()
+    f = tmp_path / "lock" / "secrets-collect.lock"
+    f.write_text("")
+    f.chmod(0)
+    r = run(env, yes_args())
+    assert r.returncode == 1
+    assert f"could not open the lock file {f}" in r.stderr
+    assert "could not read the clipboard" not in r.stderr
+    assert clip.read_text() == VALUE and calls(log) == ""
 
 
 # --- findings 3, 4: partial stores ---------------------------------------------------------
@@ -294,6 +405,13 @@ def test_ctrl_c_during_store_is_not_reported_as_nothing_stored(env):
 def test_sigterm_during_store_gets_the_partial_report(env):
     r = run(env, TWO + ["--secret", "C=c"], stdin="v1\nv2\nv3\ny\n", extra_env={"TERM_NAME": "B"})
     assert r.returncode == 130
+    assert "stored=[A] not_stored=[C] unknown=[B]" in r.stderr
+
+
+def test_a_burst_of_signals_does_not_cut_the_partial_report_short(env):
+    r = run(env, TWO + ["--secret", "C=c"], stdin="v1\nv2\nv3\ny\n", extra_env={"BURST_NAME": "B"})
+    assert r.returncode == 130
+    assert "Traceback" not in r.stderr
     assert "stored=[A] not_stored=[C] unknown=[B]" in r.stderr
 
 
@@ -337,7 +455,7 @@ def test_non_utf8_clipboard_aborts_without_the_byte(env):
     o = out(r)
     assert "0xe9" not in o and "position" not in o
     assert "ab" not in o and "\\xe9" not in o and "cd" not in o
-    assert clip.read_text() == MARK  # the decode-failure path cleared it too
+    assert cleared_by(clip.read_text()) == "A"  # the decode-failure path cleared it too
 
 
 def test_pbpaste_gets_the_utf8_locale_like_pbcopy(env):
@@ -423,11 +541,12 @@ def test_empty_clipboard_aborts_not_loops(env):
 
 
 def test_pbpaste_failure_aborts(env):
-    _, log, _, bindir = env
+    _, log, clip, bindir = env
     (bindir / "pbpaste").write_text("#!/bin/sh\nexit 1\n")
     r = run(env, yes_args())
     assert r.returncode == 1
     assert calls(log) == ""
+    assert clip.read_text() == VALUE  # nothing was read, so nothing is overwritten
 
 
 def test_multi_secret_clipboard_without_tty_refused_with_and_without_yes(env):
