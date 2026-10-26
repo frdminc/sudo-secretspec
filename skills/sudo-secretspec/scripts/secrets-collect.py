@@ -50,12 +50,17 @@ Properties, each deliberate:
      arrives then is delivered after the clear), and (d) holds an exclusive per-user lock
      (~/Library/Caches/secrets-collect.lock, not under TMPDIR) from before pbpaste until after
      that overwrite. A second run waits about 10 s, then exits 1; one that gets in after the
-     clear reads the sentinel and fails, naming the run that consumed the copy: that run may have
-     taken a copy meant for the loser's name, so BOTH names must be re-collected. A SIGKILL or
-     power loss between the read and the clear, or a failing pbcopy (a WARNING is printed), leaves
-     the value on the pasteboard. A clipboard that was stale before the FIRST run and happens to
-     have the same shape and length is not detectable; --dry-run reads and clears too, so it
-     consumes the operator's copy.
+     clear reads the sentinel (it carries the date, time and zone; the error adds the age) and
+     fails, naming the run that consumed the copy. The age never proves that run is unrelated:
+     a copy made after the stamp would have replaced it, so if the operator copied the value for
+     this name at all, that run may have taken it and BOTH names must be re-collected, one at a
+     time; only if the operator had not copied yet: copy the value again; unsure: both. A same-name sentinel only needs a new copy. A SIGKILL or power
+     loss between the read and the clear leaves the value on the
+     pasteboard. A failing pbcopy prints a WARNING and the run (still storing and notifying, also
+     under --dry-run) exits 3 instead of 0, its last line saying the clipboard was NOT cleared;
+     a run that fails otherwise keeps its own code (1, 2, 130). A clipboard that was stale
+     before the FIRST run and happens to have the same shape and length is not detectable;
+     --dry-run reads and clears too, so it consumes the operator's copy.
      --clipboard with a non-tty stdin and no --yes is refused: piped answers are not the operator.
   8. A clipboard value identical to one already collected in the same run is refused (the
      clipboard did not change between secrets), so a pty cannot read one value into N names.
@@ -64,6 +69,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import datetime
 import fcntl
 import getpass
 import os
@@ -80,27 +86,46 @@ _CANCEL_SIGNALS = {signal.SIGINT, signal.SIGTERM, signal.SIGHUP}
 CLEARED_PREFIX = "secrets-collect: clipboard cleared"  # every sentinel this script ever wrote
 CLEARED_WORD = "cleared"
 LOCK_WAIT = 10.0  # seconds a second run waits for the clipboard lock before giving up
-_CONSUMER = re.compile(r"cleared by the run for (\S+) at (\d\d:\d\d:\d\d)")
+AGE_IN_MINUTES_FROM = 60  # seconds: the age is shown as "N s ago" below this, "N min ago" from it
+_CONSUMER = re.compile(r"cleared by the run for (\S+) at "
+                       r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d{4}|\d\d:\d\d:\d\d)")  # 2nd: old form
+_clear_failed = False  # set by clear_clipboard when pbcopy failed; main() resets it and exits 3
 
 
 def is_sentinel(value: str) -> bool:
     return value == CLEARED_WORD or value.startswith(CLEARED_PREFIX)
 
 
+def _sentinel_age(at: str) -> float | None:
+    """Seconds since the sentinel's stamp, or None when it has no date (the old HH:MM:SS form),
+    cannot be parsed or lies in the future."""
+    try:
+        age = time.time() - datetime.datetime.strptime(at, "%Y-%m-%dT%H:%M:%S%z").timestamp()
+    except ValueError:
+        return None
+    return age if age >= 0 else None
+
+
 def sentinel_error(value: str, name: str) -> str:
-    """Why a sentinel was read. A run that lost the lock race read the winner's sentinel, and the
-    winner may have taken a copy meant for THIS name, so say who consumed it."""
+    """Why a sentinel was read. Another name's sentinel is ALWAYS conditional, whatever its age:
+    the run that consumed the copy may have taken a copy meant for THIS name, and the age cannot
+    say whether the operator copied for this name before that run read the clipboard."""
     m = _CONSUMER.search(value)
     if not m:
         return ("the clipboard holds a cleared-clipboard sentinel: no fresh copy was made since "
                 "the last clear")
     who, at = m.groups()
+    age = _sentinel_age(at)
+    ago = ""
+    if age is not None:
+        ago = (f" ({int(age)} s ago)" if age < AGE_IN_MINUTES_FROM
+               else f" ({int(age // 60)} min ago)")
     if who == name:
         return (f"the clipboard holds a cleared-clipboard sentinel: an earlier run for {name} "
-                f"consumed the copy at {at}; copy the value again")
-    return (f"the clipboard holds a cleared-clipboard sentinel: the run for {who} consumed this "
-            f"copy at {at}; if the copy was for {name}, {who} now holds that value: "
-            f"re-collect {who} too")
+                f"consumed the copy at {at}{ago}; copy the value again")
+    return (f"the clipboard holds a cleared-clipboard sentinel: the run for {who} consumed a copy "
+            f"at {at}{ago}; if the operator copied the value for {name} before {at}, {who} now "
+            f"holds it: re-collect {who} too; if nothing was copied since, only copy again")
 
 
 class StoreError(Exception):
@@ -160,6 +185,8 @@ def _ignore_cancel_signals() -> None:
 
 
 def _not_cleared(e: BaseException) -> None:
+    global _clear_failed
+    _clear_failed = True
     print(f"  WARNING: the clipboard was NOT cleared ({type(e).__name__}); "
           "overwrite it yourself", file=sys.stderr)
 
@@ -167,8 +194,8 @@ def _not_cleared(e: BaseException) -> None:
 def clear_clipboard(name: str) -> None:
     """Overwrite the pasteboard with a sentinel naming the run that consumed the copy, so a later
     run cannot read this secret again and a loser of a lock race can say whom to re-collect."""
-    mark = (f"{CLEARED_PREFIX} by the run for {name} at {time.strftime('%H:%M:%S')}, "
-            "copy the value again")
+    mark = (f"{CLEARED_PREFIX} by the run for {name} at "
+            f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')}, copy the value again")
     try:
         subprocess.run(["pbcopy"], input=mark, text=True, check=True,
                        capture_output=True, env=_pb_env(), timeout=15)
@@ -377,6 +404,8 @@ def notify(role: str, names: list[tuple[str, int]], reason: str) -> None:
 
 
 def main() -> int:
+    global _clear_failed
+    _clear_failed = False  # in-process callers (tests) run main more than once
     ap = argparse.ArgumentParser(description="Collect and store secret values (see the module docstring).")
     ap.add_argument("--secret", action="append", required=True, metavar="NAME=DESC[:LEN]",
                     help="repeatable; LEN is an expected character count (warns on mismatch; "
@@ -396,11 +425,25 @@ def main() -> int:
     ap.add_argument("--yes", action="store_true",
                     help="skip the final 'Store these?' prompt. With --clipboard it also skips the "
                          "Enter wait (tty or not): ONE secret per run, LEN required, the clipboard is "
-                         "cleared after the read, and a lock stops two runs at once. Needed for any "
-                         "--clipboard run with a non-tty stdin. Without --clipboard it needs a "
-                         "terminal (hidden prompt)")
+                         "cleared after the read, and a lock stops two runs at once. A run that "
+                         "finds another name's sentinel prints its date, time, zone and age: compare "
+                         "the stamp with when the value for your name was copied (before it: "
+                         "re-collect both names one at a time; nothing copied since: copy again). "
+                         "Exit 3 = done, but the clipboard could not be cleared: overwrite it "
+                         "yourself. Needed for any --clipboard run with a non-tty stdin. Without "
+                         "--clipboard it needs a terminal (hidden prompt)")
     a = ap.parse_args()
 
+    rc = _run(a)
+    if rc == 0 and _clear_failed:
+        what = "dry run, nothing stored" if a.dry_run else "stored"
+        print(f"{what}, but the clipboard was NOT cleared: overwrite it yourself, exit 3",
+              flush=True)
+        return 3
+    return rc
+
+
+def _run(a: argparse.Namespace) -> int:
     tty = sys.stdin.isatty()
     if a.yes and not a.clipboard and not tty:
         print("refusing: --yes without --clipboard needs a terminal; a value piped on stdin "
