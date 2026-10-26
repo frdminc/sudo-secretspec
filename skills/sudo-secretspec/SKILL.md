@@ -189,11 +189,14 @@ run, on a pty or not:
    two harnesses share it) is held from before `pbpaste` until after the clear. A
    second run waits about 10 s for it, then exits 1 ("another secrets-collect run
    holds the clipboard lock"); one that gets in after the clear reads the sentinel,
-   which names the run that consumed the copy (`... cleared by the run for NAME at
-   HH:MM:SS ...`), and exits 1. **A parallel loser is not harmless:** the winner may
+   which names the run that consumed the copy and when (`... cleared by the run for
+   NAME at 2026-10-26T01:40:59-0400 ...`) and says how long ago ("N s ago"), and
+   exits 1. **Within 60 s that is a lock race and the loser is not harmless:** the winner may
    have taken a copy meant for the loser's name, so **both names must be
    re-collected, one at a time**, each after a fresh copy. Re-running only the
    loser leaves the winner holding the wrong value (its length would still pass).
+   **Older than 60 s it says "a leftover from an earlier run, not a race"**: no other run
+   is involved, only copy the value again; do not re-collect the named run.
 3. **The spec MUST carry the expected length** (`NAME=desc:32`), else exit 2. A
    regex does not count: the spec cannot carry both, and a regex can match
    stale prose (`.+`); if you need a pattern, pin the length in it and use it
@@ -213,8 +216,12 @@ than retrying, and **overwrites the clipboard itself right after the read**
 SIGTERM and SIGHUP are blocked while the overwrite runs, so one that arrives
 then is delivered after it. A SIGKILL or power loss between the read and the
 clear cannot be caught, and neither can a `pbcopy` that fails). The
-next run sees a fresh copy or the sentinel, never the previous secret. A failed
-overwrite prints `WARNING: ... NOT cleared`. The rejection text gives a count
+next run sees a fresh copy or the sentinel, never the previous secret. **A failed
+overwrite prints `WARNING: ... NOT cleared` and the run exits 3 instead of 0** (still
+stored and notified, `--dry-run` included; its last line says "...the clipboard was NOT
+cleared: overwrite it yourself, exit 3"): treat 3 as "done, but the secret may still be on the
+pasteboard", never as a clean success. A run that fails otherwise keeps its code (1, 2, 130).
+The rejection text gives a count
 and character classes, never the characters. A clipboard that was stale
 **before the first run** and has the same shape and length cannot be detected:
 have the operator copy, say so in chat, then run. SIGTERM/SIGHUP mid-store gets
@@ -230,14 +237,16 @@ since a regex does not waive it. For those, and only those, use `--literal` with
 
 ```bash
 python3 $S --secret 'NAME=desc:32' --clipboard --yes
-printf 'cleared' | ~/ops/site-private/bin/clip     # regardless of the exit status: `;`, never `&&`
+# ONLY if it exited 3, its output says `NOT cleared`, or it gave no report at all (killed or
+# timed out: exit 124/137, or no output); after a run that cleared, do NOT run this line:
+printf 'cleared' | ~/ops/site-private/bin/clip
 sudo-secretspec run -- sh -c 'echo ${#NAME}'
 ```
 
-The script clears the clipboard itself; the second line is the belt for the
-runs where it died before the read (or printed the WARNING). Run it whether or
-not the first line succeeded, so a secret never stays on the pasteboard (clipboard
-managers, Universal Clipboard).
+The script clears the clipboard itself, so the `printf` line is only for the runs where
+the value can still be on the pasteboard (a failed clear, or a run that died before it reported).
+After a run that cleared it would overwrite the sentinel, which names the run that consumed the
+copy, and the next run could no longer tell whose copy it was.
 
 Verified 2026-10-26 (stub `sudo-secretspec`/`pbpaste`/`pbcopy`; no live vault).
 
@@ -488,7 +497,9 @@ listener cannot reach private data through it.
    an expiry you write down. A fine-grained token is `github_pat_` plus 82 characters (93 in all).
 2. **Declare:** `sudo-secretspec add NAME --description "..." --optional --reason "..."`
    (`--optional` so `check` stays green on hosts that never set it).
-3. **Store:** the clipboard route above; then overwrite the clipboard.
+3. **Store:** the clipboard route above. With `secrets-collect.py` the script clears the clipboard
+   itself; overwrite it by hand only on exit 3, `NOT cleared` in the output, or no report at all
+   (the rule under "An agent with no terminal"); otherwise you would erase the sentinel's consumer name.
 4. **Prove its reach without printing it.** Run a throwaway script under `run` that prints only
    the length, the prefix and HTTP statuses, then delete the script:
    ```bash

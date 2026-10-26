@@ -2,6 +2,7 @@
 
 Every subprocess has a hard timeout: a mutant that loops must fail, not hang CI.
 """
+import calendar
 import importlib.util
 import os
 import pty
@@ -11,6 +12,7 @@ import stat
 import subprocess
 import sys
 import time
+import types
 from pathlib import Path
 
 import pytest
@@ -20,7 +22,7 @@ VALUE = "s3cretVALUE0123"
 LEN = len(VALUE)
 OLD_MARK = "secrets-collect: clipboard cleared, copy the value again"  # round 1/2 sentinel
 CLEARED = re.compile(r"secrets-collect: clipboard cleared by the run for (\w+) at "
-                     r"\d\d:\d\d:\d\d, copy the value again")
+                     r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d{4}, copy the value again")
 TIMEOUT = 10
 
 
@@ -141,8 +143,10 @@ def test_second_run_without_a_fresh_copy_stores_nothing(env):
     assert calls(log) == ""
     assert "sentinel" in out(r)
     # it names the run that consumed the copy, since that run may have taken B's value
-    assert re.search(r"the run for A consumed this copy at \d\d:\d\d:\d\d", out(r))
+    assert re.search(r"the run for A consumed this copy at "
+                     r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d{4} \(\d+ s ago\)", out(r))
     assert "re-collect A too" in out(r)
+    assert "leftover" not in out(r)
     assert "nothing was copied" not in out(r)
 
 
@@ -157,7 +161,9 @@ def test_second_run_for_the_same_name_says_so(env):
 
 @pytest.mark.parametrize("stale", [
     "cleared", OLD_MARK,
-    "secrets-collect: clipboard cleared by the run for Z at 01:02:03, copy the value again"])
+    "secrets-collect: clipboard cleared by the run for Z at 01:02:03, copy the value again",
+    "secrets-collect: clipboard cleared by the run for Z at 2020-01-02T03:04:05+0000, "
+    "copy the value again"])
 def test_sentinels_refused_even_when_length_and_literal_fit(env, stale):
     _, log, clip, _ = env
     clip.write_text(stale)
@@ -234,6 +240,118 @@ def test_pbcopy_failure_is_loud(env):
     r = run(env, yes_args())
     assert "NOT cleared" in r.stderr
     assert clip.read_text() == VALUE
+
+
+# --- the sentinel carries a date: a race and a leftover read differently -------------------------
+
+def _stamp(epoch):
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(epoch))
+
+
+def _mark(who, stamp):
+    return f"secrets-collect: clipboard cleared by the run for {who} at {stamp}, copy the value again"
+
+
+@pytest.mark.parametrize("who", ["A", "Z"])
+def test_an_old_sentinel_is_a_leftover_not_a_race(env, who):
+    _, log, clip, _ = env
+    mark = _mark(who, _stamp(time.time() - 600))
+    clip.write_text(mark)
+    r = run(env, yes_args(f"A=a:{len(mark)}", "--literal"))
+    o = out(r)
+    assert r.returncode == 1 and calls(log) == ""
+    assert "10 min ago" in o
+    assert "a leftover from an earlier run, not a race" in o and "no other run is involved" in o
+    assert "re-collect Z too" not in o and "re-collect A too" not in o
+    assert "Traceback" not in o
+
+
+def test_sentinel_error_threshold_and_fallbacks(monkeypatch):
+    m = _load_module()
+    base = calendar.timegm((2026, 10, 26, 12, 0, 0))
+
+    def err(stamp, delta, name="A"):
+        monkeypatch.setattr(m, "time", types.SimpleNamespace(time=lambda: base + delta))
+        return m.sentinel_error(_mark("Z", stamp), name)
+
+    dated = "2026-10-26T12:00:00+0000"
+    e = err(dated, 59)
+    assert "(59 s ago)" in e and "re-collect Z too" in e and "leftover" not in e
+    e = err(dated, 60)  # exactly STALE_AFTER is still a race
+    assert "(1 min ago)" in e and "re-collect Z too" in e and "leftover" not in e
+    e = err(dated, 61)
+    assert "(1 min ago)" in e and "a leftover from an earlier run, not a race" in e
+    assert "re-collect Z too" not in e
+    e = err(dated, 7200)
+    assert "(120 min ago)" in e and "leftover" in e
+    e = err(dated, 7200, name="Z")  # the same name: leftover too, never "an earlier run for Z"
+    assert "leftover" in e and "an earlier run for Z" not in e
+    e = err(dated, 30, name="Z")
+    assert "an earlier run for Z consumed the copy at" in e and "(30 s ago)" in e
+    # not usable as an age: the old wording, no crash
+    for stamp, delta in [(dated, -30), ("2026-13-45T99:99:99+0000", 100), ("01:02:03", 100000)]:
+        e = err(stamp, delta)
+        assert "re-collect Z too" in e and "ago" not in e and "leftover" not in e, stamp
+
+
+# --- a failed clear is loud: exit 3 --------------------------------------------------------
+
+def _break_pbcopy(bindir):
+    (bindir / "pbcopy").write_text("#!/bin/sh\nexit 1\n")
+
+
+def test_failed_clear_after_a_store_exits_3_and_says_so(env):
+    _, log, clip, bindir = env
+    _break_pbcopy(bindir)
+    r = run(env, yes_args())
+    assert r.returncode == 3, out(r)
+    assert VALUE in calls(log)  # stored all the same
+    assert "NOT cleared" in r.stderr
+    assert r.stdout.splitlines()[-1] == ("stored, but the clipboard was NOT cleared: "
+                                         "overwrite it yourself, exit 3")
+    assert clip.read_text() == VALUE
+
+
+def test_failed_clear_on_a_dry_run_exits_3_with_nothing_stored(env):
+    _, log, clip, bindir = env
+    _break_pbcopy(bindir)
+    r = run(env, yes_args(f"A=a:{LEN}", "--dry-run"))
+    assert r.returncode == 3, out(r)
+    assert calls(log) == ""
+    assert r.stdout.splitlines()[-1] == ("dry run, nothing stored, but the clipboard was NOT "
+                                         "cleared: overwrite it yourself, exit 3")
+
+
+@pytest.mark.parametrize("spec, extra_env", [(f"A=a:{LEN + 1}", None), (f"A=a:{LEN}", {"FAIL_NAME": "A"})])
+def test_failed_clear_does_not_change_another_failures_code(env, spec, extra_env):
+    _, log, _, bindir = env
+    _break_pbcopy(bindir)
+    r = run(env, yes_args(spec), extra_env=extra_env)  # a rejected value / a failed store
+    assert r.returncode == 1, out(r)
+    assert "NOT cleared" in r.stderr and "exit 3" not in out(r)
+
+
+def test_a_working_clear_exits_0_and_the_failed_flag_does_not_leak_between_calls(
+        env, monkeypatch, capsys):
+    e, log, clip, bindir = env
+    m = _load_module()
+    for k in ("PATH", "TMPDIR", "SECRETS_COLLECT_LOCK_DIR"):
+        monkeypatch.setenv(k, e[k])
+    monkeypatch.setattr(sys, "argv", ["secrets-collect", *yes_args()])
+    # main() installs SIGTERM/SIGHUP handlers on the pytest process: put them back afterwards
+    old = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGHUP)}
+    try:
+        good = (bindir / "pbcopy").read_text()
+        _break_pbcopy(bindir)
+        assert m.main() == 3
+        (bindir / "pbcopy").write_text(good)
+        clip.write_text(VALUE)
+        assert m.main() == 0  # a fresh call starts clean
+        assert cleared_by(clip.read_text()) == "A"
+    finally:
+        for sig, h in old.items():
+            signal.signal(sig, h)
+    capsys.readouterr()
 
 
 # --- findings 2/12a/3: piped answers are not the operator ------------------------------------
@@ -370,6 +488,20 @@ def test_unopenable_lock_file_is_reported_as_the_lock(env, tmp_path):
     assert f"could not open the lock file {f}" in r.stderr
     assert "could not read the clipboard" not in r.stderr
     assert clip.read_text() == VALUE and calls(log) == ""
+
+
+def test_default_lock_path_is_under_the_users_home_not_tmpdir(tmp_path, monkeypatch):
+    m = _load_module()
+    other = tmp_path / "other_tmpdir"
+    other.mkdir()
+    monkeypatch.delenv("SECRETS_COLLECT_LOCK_DIR", raising=False)
+    monkeypatch.setenv("TMPDIR", str(other))
+    monkeypatch.setattr(m, "pwd", types.SimpleNamespace(
+        getpwuid=lambda uid: types.SimpleNamespace(pw_dir=str(tmp_path))))
+    caches = tmp_path / "Library" / "Caches"
+    assert m.lock_path() == str(caches / "secrets-collect.lock")
+    assert stat.S_IMODE(caches.stat().st_mode) == 0o700
+    assert list(other.iterdir()) == []  # nothing went under TMPDIR
 
 
 # --- findings 3, 4: partial stores ---------------------------------------------------------
