@@ -266,6 +266,13 @@ def test_length_mismatch_aborts_without_reading_stdin(env):
     assert "expected length is 32" in r.stdout
 
 
+def test_literal_does_not_waive_the_length_in_no_terminal_mode(env):
+    _, log, _, _ = env
+    r = run(env, ["--secret", "A=a:32", "--literal", "--clipboard", "--yes"], stdin="y\n")
+    assert r.returncode == 1
+    assert calls(log) == ""
+
+
 def test_interactive_length_mismatch_still_asks(env):
     _, log, _, _ = env
     r = run(env, ["--secret", "A=a:32", "--clipboard"], stdin="\ny\ny\n")
