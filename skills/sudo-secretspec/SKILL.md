@@ -149,9 +149,12 @@ python3 $S --secret 'NAME=desc' --clipboard        # read from pbpaste instead o
 1. **It prompts for each value with the input hidden** (`getpass`), so nothing is
    echoed — not into the scrollback, not into shell history, not into the
    process table (values reach `set` on stdin, never in argv).
-2. **All-or-nothing:** nothing is stored until every value is collected and the
-   operator confirms the summary, so Ctrl-C or a closed stdin leaves the store
-   exactly as it was. Verified 2026-10-25.
+2. **Nothing is stored until every value is collected, checked and (without
+   `--yes`) confirmed**, so Ctrl-C or a closed stdin before that leaves the store
+   exactly as it was. The store loop itself is **not** atomic: a failure or
+   Ctrl-C part-way prints `stored=[...] not_stored=[...]` (and `unknown=[...]`
+   for the value in flight) and exits non-zero. Nothing is rolled back, because
+   an overwritten old value is gone — re-run for the names listed as not stored.
 3. **It refuses a value that cannot be a key.** Alphanumeric-plus-`_`/`-` by
    default, with the offending characters named — which is what catches the
    masked-UI-rendering case above *before* it is stored. `--literal` for
@@ -168,20 +171,39 @@ verification.
 **An agent with no terminal** cannot answer the final prompt or press Enter, so
 use `--clipboard --yes` — **ONE secret per run** (the clipboard cannot change
 between secrets; more than one `--secret` with `--clipboard` and a non-tty stdin
-exits 2). `--yes` skips only the "Store these?" prompt; every check, the
-all-or-nothing rule, and stdin-only delivery are unchanged. With a non-tty stdin
-it also reads `pbpaste` once, immediately, and aborts (exit 1, nothing stored) on
-an empty or bad-shape value rather than retrying. Without `--yes`, EOF at the
-prompt is still "no". Then overwrite the clipboard and prove the result with a
-length, never `get`:
+exits 2), and **the spec MUST carry the expected length** (`NAME=desc:32`) or a
+regex, else exit 2. Reason: with no human at the prompt nothing else shows the
+clipboard is fresh, and the length is that check. In this mode a length mismatch
+aborts **without prompting** (nothing stored), the shape check still applies, and
+`cleared` and the script's own sentinel are refused. `--yes` skips only the
+"Store these?" prompt; every check and stdin-only delivery are unchanged. It
+reads `pbpaste` once, immediately, aborts (exit 1, nothing stored) on an empty,
+bad-shape or wrong-length value rather than retrying, and **overwrites the
+clipboard itself right after the read, on every path** (stored, rejected,
+interrupted), so the next run sees a fresh copy or the sentinel, never the
+previous secret. A failed overwrite prints `WARNING: ... NOT cleared`. The
+rejection text gives a count and character classes, never the characters. A
+clipboard that was stale **before the first run** and has the same shape and
+length cannot be detected: have the operator copy, say so in chat, then run.
+`--yes` without `--clipboard` and with a non-tty stdin is refused (exit 2): a
+value piped in went through your own command line. Without `--yes`, EOF at the
+prompt is still "no".
+
+Do **not** use `--literal` for a key: it removes the shape check. It is for
+endpoints and URLs (and then still give `:LEN` or a regex).
 
 ```bash
-python3 $S --secret 'NAME=desc' --literal --clipboard --yes
-printf 'cleared' | ~/ops/site-private/bin/clip
+python3 $S --secret 'NAME=desc:32' --clipboard --yes
+printf 'cleared' | ~/ops/site-private/bin/clip     # regardless of the exit status: `;`, never `&&`
 sudo-secretspec run -- sh -c 'echo ${#NAME}'
 ```
 
-Verified 2026-10-26 (stub `sudo-secretspec`/`pbpaste`; no live vault).
+The script clears the clipboard itself; the second line is the belt for the
+runs where it died before the read (or printed the WARNING). Run it whether or
+not the first line succeeded, so a secret never stays on the pasteboard (clipboard
+managers, Universal Clipboard).
+
+Verified 2026-10-26 (stub `sudo-secretspec`/`pbpaste`/`pbcopy`; no live vault).
 
 
 ### Giving a consumer a secret it reads itself

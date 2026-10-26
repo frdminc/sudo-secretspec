@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Collect several secret values interactively, validate each, store them all-or-nothing.
+"""Collect several secret values interactively, validate each, store them in one pass.
 
 Any agent, any provider. The operator runs it; the agent reads the result from the store.
 
@@ -18,7 +18,9 @@ Any agent, any provider. The operator runs it; the agent reads the result from t
 
     secrets-collect.py ... --dry-run      # validate only; store nothing, notify nobody
     secrets-collect.py ... --clipboard    # read each value from pbpaste instead of typing
-    secrets-collect.py ... --clipboard --yes   # no terminal (agent): one secret per run, no prompts
+
+    # no terminal (an agent): ONE secret per run, no prompts, LEN (or a regex) REQUIRED
+    secrets-collect.py --secret 'NAME=desc:32' --clipboard --yes
 
 Why this exists: an agent that needs values from a human must never ask the human to paste them
 into a chat. That puts the value in a transcript, which is the one thing the house rules forbid.
@@ -27,12 +29,25 @@ the secret store, and the agent is told only the NAMES and LENGTHS.
 
 Properties, each deliberate:
   1. Input is hidden (getpass) — not echoed, so not in the scrollback, and not in shell history.
-  2. All-or-nothing — nothing is stored until every value is collected and confirmed, so an
-     abort (Ctrl-C, closed stdin) leaves the store exactly as it was, never half-populated.
+  2. Nothing is stored until every value is collected and checked (and, without --yes, confirmed),
+     so an abort (Ctrl-C, closed stdin) before that leaves the store exactly as it was. Once the
+     store loop starts it is NOT atomic: a failure or Ctrl-C mid-loop prints
+     `stored=[...] not_stored=[...]` (and `unknown=[...]` for the one in flight), exit non-zero.
+     Nothing is rolled back, because an overwritten old value is gone.
   3. Values reach sudo-secretspec on stdin, never in argv (so not in the process table).
-  4. Only names and lengths are ever printed.
+  4. Only names and lengths are ever printed. In the no-terminal mode (an agent's transcript) a
+     rejected value is described by a count and character classes, never the characters.
   5. The notification message carries names and lengths, never values.
   6. EOF is treated as "no", never a crash.
+  7. No-terminal mode (--clipboard --yes, stdin not a tty) cannot tell a fresh copy from a stale
+     clipboard by looking at it, so it (a) requires an expected LEN or a regex in the spec and
+     aborts on a mismatch without prompting, (b) refuses the sentinels `cleared` and
+     CLEARED_MARK, and (c) overwrites the clipboard with CLEARED_MARK itself, immediately after
+     reading it, on every path (stored, rejected, interrupted). The next run therefore sees a
+     fresh copy or the sentinel, never the previous secret. A clipboard that was stale before
+     the FIRST run and happens to have the same shape and length is not detectable.
+  8. A clipboard value identical to one already collected in the same run is refused (the
+     clipboard did not change between secrets), so a pty cannot read one value into N names.
 """
 from __future__ import annotations
 
@@ -42,6 +57,14 @@ import os
 import re
 import subprocess
 import sys
+import unicodedata
+
+CLEARED_MARK = "secrets-collect: clipboard cleared, copy the value again"
+SENTINELS = {"cleared", CLEARED_MARK}
+
+
+class StoreError(Exception):
+    pass
 
 
 def ask(prompt: str, default: bool = False) -> bool:
@@ -74,11 +97,22 @@ def parse_spec(spec: str) -> tuple[str, str, int | None, str | None]:
     return name, desc.strip() or name, length, pattern
 
 
+def clear_clipboard() -> None:
+    """Overwrite the pasteboard with CLEARED_MARK so a later run cannot read this secret again."""
+    try:
+        subprocess.run(["pbcopy"], input=CLEARED_MARK, text=True, check=True,
+                       capture_output=True, env=dict(os.environ, LC_CTYPE="UTF-8"))
+    except Exception as e:  # noqa: BLE001
+        print(f"  WARNING: the clipboard was NOT cleared ({type(e).__name__}); "
+              "overwrite it yourself", file=sys.stderr)
+
+
 def read_value(label: str, from_clipboard: bool, no_wait: bool = False) -> str:
     """One value, hidden if from the terminal. Retries on an empty read.
 
     no_wait (clipboard, no terminal): read pbpaste once, no Enter wait, no retry -- the
-    clipboard cannot change, so an empty read or a retry would only loop forever."""
+    clipboard cannot change, so an empty read or a retry would only loop forever -- and
+    overwrite the clipboard at once. Error text never carries clipboard bytes."""
     while True:
         if from_clipboard:
             try:
@@ -87,12 +121,23 @@ def read_value(label: str, from_clipboard: bool, no_wait: bool = False) -> str:
                 else:
                     print(f"  Copy {label} to the clipboard, then press Enter.")
                     input("  [Enter when copied] ")
-                raw = subprocess.run(["pbpaste"], capture_output=True, text=True, check=True).stdout
+                proc = subprocess.run(["pbpaste"], capture_output=True, check=True)
+                try:
+                    raw = proc.stdout.decode("utf-8")
+                except UnicodeDecodeError:
+                    if no_wait:
+                        clear_clipboard()
+                    print("  the clipboard is not valid UTF-8 text", file=sys.stderr)
+                    if no_wait:
+                        raise SystemExit(1)
+                    continue
+                if no_wait:
+                    clear_clipboard()
             except EOFError:
                 print("  no input available — aborting rather than guessing", file=sys.stderr)
                 raise SystemExit(1)
             except Exception as e:  # noqa: BLE001
-                print(f"  could not read the clipboard: {e}", file=sys.stderr)
+                print(f"  could not read the clipboard: {type(e).__name__}", file=sys.stderr)
                 if no_wait:
                     raise SystemExit(1)
                 continue
@@ -108,21 +153,44 @@ def read_value(label: str, from_clipboard: bool, no_wait: bool = False) -> str:
         if no_wait:
             print("  the clipboard is empty — aborting, nothing stored", file=sys.stderr)
             raise SystemExit(1)
+        print("  empty — try again (Ctrl-C to abort)")
 
 
-def check(value: str, length: int | None, pattern: str | None, literal: bool) -> str | None:
-    """Return an error string, or None if acceptable. A length mismatch warns, not blocks."""
+def _classes(bad: set[str]) -> str:
+    out = set()
+    for c in bad:
+        if c.isspace():
+            out.add("whitespace")
+        elif ord(c) > 127:
+            out.add("non-ASCII")
+        elif unicodedata.category(c).startswith("C"):
+            out.add("control")
+        else:
+            out.add("punctuation")
+    return ", ".join(sorted(out))
+
+
+def check(value: str, length: int | None, pattern: str | None, literal: bool,
+          no_wait: bool = False) -> str | None:
+    """Return an error string, or None if acceptable.
+
+    A length mismatch warns (asks) interactively; with no_wait there is nobody to ask and the
+    length is the freshness check, so it blocks."""
     if pattern and not re.fullmatch(pattern, value):
         return f"does not match the required pattern {pattern!r}"
-    if literal or pattern:
-        return None
-    # API keys are alphanumeric (plus - and _); punctuation is the signature of a mis-copied
-    # UI rendering — a masked box or a copied label — which passes a length check and is not a key.
-    if not re.fullmatch(r"[A-Za-z0-9_\-]+", value):
-        bad = sorted({c for c in value if not re.match(r"[A-Za-z0-9_\-]", c)})
-        return (f"contains characters {bad!r} that API keys do not have — that is usually a "
-                f"mis-copied UI rendering (a masked box, a label), not a key")
+    if not (literal or pattern):
+        # API keys are alphanumeric (plus - and _); punctuation is the signature of a mis-copied
+        # UI rendering — a masked box or a copied label — which passes a length check and is not a key.
+        if not re.fullmatch(r"[A-Za-z0-9_\-]+", value):
+            bad = {c for c in value if not re.match(r"[A-Za-z0-9_\-]", c)}
+            if no_wait:
+                return (f"{len(bad)} distinct character(s) of class [{_classes(bad)}] that API keys "
+                        f"do not have — usually a mis-copied UI rendering or a stale clipboard")
+            return (f"contains characters {sorted(bad)!r} that API keys do not have — that is usually "
+                    f"a mis-copied UI rendering (a masked box, a label), not a key")
     if length is not None and len(value) != length:
+        if no_wait:
+            return f"{len(value)} characters; the expected length is {length} (stale clipboard?)"
         print(f"  ⚠ {len(value)} characters; the expected length is {length}.")
         print("    Not necessarily wrong, but check you copied the whole value.")
         if not ask("    Use it anyway? [y/N] "):
@@ -132,12 +200,24 @@ def check(value: str, length: int | None, pattern: str | None, literal: bool) ->
 
 def store(name: str, value: str, reason: str) -> None:
     """Store one value via sudo-secretspec, on stdin, never argv."""
-    proc = subprocess.run(
-        ["sudo-secretspec", "set", name, "--reason", reason],
-        input=value, text=True, capture_output=True,
-    )
+    try:
+        proc = subprocess.run(
+            ["sudo-secretspec", "set", name, "--reason", reason],
+            input=value, text=True, capture_output=True,
+        )
+    except OSError as e:
+        raise StoreError(f"FAILED to store {name}: {type(e).__name__}") from None
     if proc.returncode != 0:
-        raise SystemExit(f"FAILED to store {name}: {proc.stderr.strip()}")
+        raise StoreError(f"FAILED to store {name}: {proc.stderr.strip()}")
+
+
+def report_partial(stored: list[str], rest: list[str], unknown: str | None = None) -> None:
+    """The store loop is not atomic; say exactly what was and was not stored."""
+    msg = f"stored=[{', '.join(stored)}] not_stored=[{', '.join(rest)}]"
+    if unknown:
+        msg += f" unknown=[{unknown}] (in flight)"
+    print(f"PARTIAL STORE: {msg}" if stored or unknown else f"nothing was stored: {msg}",
+          file=sys.stderr)
 
 
 def notify(role: str, names: list[tuple[str, int]], reason: str) -> None:
@@ -161,49 +241,74 @@ def notify(role: str, names: list[tuple[str, int]], reason: str) -> None:
         print(f"  could NOT notify {role} ({proc.returncode}): {proc.stderr.strip()}", file=sys.stderr)
         print("  The values ARE stored; tell the agent in the chat instead.", file=sys.stderr)
 
-        print("  empty — try again (Ctrl-C to abort)")
-
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Collect and store secret values, all-or-nothing.")
+    ap = argparse.ArgumentParser(description="Collect and store secret values (see the module docstring).")
     ap.add_argument("--secret", action="append", required=True, metavar="NAME=DESC[:LEN]",
-                    help="repeatable; LEN is an expected character count (warns on mismatch)")
+                    help="repeatable; LEN is an expected character count (warns on mismatch; "
+                         "REQUIRED, with a mismatch aborting, in no-terminal mode)")
     ap.add_argument("--reason", default="store values supplied by the operator",
                     help="the reason recorded in the audit ledger")
     ap.add_argument("--notify-to", metavar="ROLE",
                     help="tell this peer-role when done (names and lengths only)")
     ap.add_argument("--literal", action="store_true",
-                    help="values are not API keys (no alphanumeric check) — endpoints, URLs")
+                    help="values are not API keys (no alphanumeric check) — endpoints, URLs only; "
+                         "an agent must not use it for a key")
     ap.add_argument("--dry-run", action="store_true",
                     help="validate but store nothing and notify nobody")
     ap.add_argument("--clipboard", action="store_true",
                     help="read each value from pbpaste instead of typing it")
     ap.add_argument("--yes", action="store_true",
-                    help="skip only the final 'Store these?' prompt (for an agent with no terminal); "
-                         "with --clipboard and a non-tty stdin, also skip the Enter wait: one secret per run")
+                    help="skip only the final 'Store these?' prompt. With --clipboard and a non-tty "
+                         "stdin (an agent) it also skips the Enter wait: ONE secret per run, LEN or "
+                         "a regex required, and the clipboard is cleared after the read. Without "
+                         "--clipboard it needs a terminal (hidden prompt)")
     a = ap.parse_args()
 
-    no_wait = a.clipboard and a.yes and not sys.stdin.isatty()
-    if a.clipboard and not sys.stdin.isatty() and len(a.secret) > 1:
+    tty = sys.stdin.isatty()
+    if a.yes and not a.clipboard and not tty:
+        print("refusing: --yes without --clipboard needs a terminal; a value piped on stdin "
+              "went through the caller's command line", file=sys.stderr)
+        return 2
+    no_wait = a.clipboard and a.yes and not tty
+    if a.clipboard and not tty and len(a.secret) > 1:
         print("refusing: --clipboard with a non-tty stdin takes ONE --secret per run "
               "(the clipboard cannot change between secrets)", file=sys.stderr)
         return 2
 
     specs = [parse_spec(s) for s in a.secret]
+    if no_wait and any(length is None and pattern is None for _, _, length, pattern in specs):
+        print("refusing: no-terminal mode needs an expected length or a regex in the spec "
+              "(--secret 'NAME=desc:32') — it is the check that the clipboard is fresh",
+              file=sys.stderr)
+        return 2
 
     print(f"{len(specs)} value(s) to collect, stored in sudo-secretspec")
-    print("Input is hidden; nothing is echoed. Nothing is stored until you confirm at the end.")
+    if a.yes:
+        print("Input is hidden; nothing is echoed. --yes: there is no final confirmation; every "
+              "check still applies before anything is stored.")
+    else:
+        print("Input is hidden; nothing is echoed. Nothing is stored until you confirm at the end.")
     if a.dry_run:
         print("\n*** DRY RUN — nothing will be stored and nobody will be notified ***")
     print()
 
     collected: list[tuple[str, str]] = []
+    stored: list[str] = []
+    inflight: str | None = None
+    storing = False
     try:
         for i, (name, desc, length, pattern) in enumerate(specs, 1):
             print(f"[{i}/{len(specs)}] {name}")
             while True:
                 value = read_value(desc, a.clipboard, no_wait)
-                err = check(value, length, pattern, a.literal)
+                err = None
+                if a.clipboard and value in SENTINELS:
+                    err = "the clipboard holds the cleared-clipboard sentinel — nothing was copied"
+                elif a.clipboard and any(value == v for _, v in collected):
+                    err = "identical to a value already collected — the clipboard did not change"
+                else:
+                    err = check(value, length, pattern, a.literal, no_wait)
                 if err is None:
                     break
                 print(f"  ✗ {err}")
@@ -224,8 +329,17 @@ def main() -> int:
             print("\nDRY RUN: skipping the store and the notification.")
             return 0
 
+        storing = True
         for name, value in collected:
-            store(name, value, a.reason)
+            inflight = name
+            try:
+                store(name, value, a.reason)
+            except StoreError as e:
+                print(str(e), file=sys.stderr)
+                report_partial(stored, [n for n, _ in collected if n not in stored])
+                return 1
+            inflight = None
+            stored.append(name)
             print(f"  stored {name}")
 
         if a.notify_to:
@@ -233,10 +347,14 @@ def main() -> int:
         print("\nDone.")
         return 0
     except KeyboardInterrupt:
-        print("\nAborted — nothing was stored.", file=sys.stderr)
+        if storing:
+            print("\nInterrupted while storing.", file=sys.stderr)
+            report_partial(stored, [n for n, _ in collected if n not in stored and n != inflight],
+                           inflight)
+        else:
+            print("\nAborted — nothing was stored.", file=sys.stderr)
         return 130
 
 
 if __name__ == "__main__":
     sys.exit(main())
-
