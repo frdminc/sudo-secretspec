@@ -143,11 +143,11 @@ def test_second_run_without_a_fresh_copy_stores_nothing(env):
     assert calls(log) == ""
     assert "sentinel" in out(r)
     # it names the run that consumed the copy, since that run may have taken B's value
-    assert re.search(r"the run for A consumed this copy at "
+    assert re.search(r"the run for A consumed a copy at "
                      r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d{4} \(\d+ s ago\)", out(r))
     assert "re-collect A too" in out(r)
+    assert "if nothing was copied since, only copy again" in out(r)
     assert "leftover" not in out(r)
-    assert "nothing was copied" not in out(r)
 
 
 def test_second_run_for_the_same_name_says_so(env):
@@ -253,20 +253,32 @@ def _mark(who, stamp):
 
 
 @pytest.mark.parametrize("who", ["A", "Z"])
-def test_an_old_sentinel_is_a_leftover_not_a_race(env, who):
+def test_an_old_sentinel_for_another_name_is_still_conditional(env, who):
     _, log, clip, _ = env
     mark = _mark(who, _stamp(time.time() - 600))
     clip.write_text(mark)
-    r = run(env, yes_args(f"A=a:{len(mark)}", "--literal"))
+    r = run(env, yes_args(f"B=b:{len(mark)}", "--literal"))
     o = out(r)
     assert r.returncode == 1 and calls(log) == ""
     assert "10 min ago" in o
-    assert "a leftover from an earlier run, not a race" in o and "no other run is involved" in o
-    assert "re-collect Z too" not in o and "re-collect A too" not in o
+    assert f"re-collect {who} too" in o and "if nothing was copied since, only copy again" in o
+    for verdict in ("no re-collection", "leftover", "not a race", "no other run"):
+        assert verdict not in o
     assert "Traceback" not in o
 
 
-def test_sentinel_error_threshold_and_fallbacks(monkeypatch):
+@pytest.mark.parametrize("tz", ["UTC", "America/New_York"])
+def test_sentinel_error_age_and_fallbacks(monkeypatch, tz):
+    monkeypatch.setenv("TZ", tz)
+    time.tzset()
+    try:
+        _check_sentinel_error_age_and_fallbacks(monkeypatch)
+    finally:
+        monkeypatch.undo()
+        time.tzset()
+
+
+def _check_sentinel_error_age_and_fallbacks(monkeypatch):
     m = _load_module()
     base = calendar.timegm((2026, 10, 26, 12, 0, 0))
 
@@ -274,24 +286,36 @@ def test_sentinel_error_threshold_and_fallbacks(monkeypatch):
         monkeypatch.setattr(m, "time", types.SimpleNamespace(time=lambda: base + delta))
         return m.sentinel_error(_mark("Z", stamp), name)
 
+    def conditional(e):
+        return ("re-collect Z too" in e and "if nothing was copied since, only copy again" in e
+                and "if the operator copied the value for A before" in e
+                and not any(v in e for v in ("no re-collection", "leftover", "not a race",
+                                              "no other run")))
+
     dated = "2026-10-26T12:00:00+0000"
     e = err(dated, 59)
-    assert "(59 s ago)" in e and "re-collect Z too" in e and "leftover" not in e
-    e = err(dated, 60)  # exactly STALE_AFTER is still a race
-    assert "(1 min ago)" in e and "re-collect Z too" in e and "leftover" not in e
+    assert "(59 s ago)" in e and conditional(e)
+    e = err(dated, 60)  # the unit switches at 60 s, nothing else does
+    assert "(1 min ago)" in e and conditional(e)
     e = err(dated, 61)
-    assert "(1 min ago)" in e and "a leftover from an earlier run, not a race" in e
-    assert "re-collect Z too" not in e
+    assert "(1 min ago)" in e and conditional(e)
     e = err(dated, 7200)
-    assert "(120 min ago)" in e and "leftover" in e
-    e = err(dated, 7200, name="Z")  # the same name: leftover too, never "an earlier run for Z"
-    assert "leftover" in e and "an earlier run for Z" not in e
+    assert "(120 min ago)" in e and conditional(e)
+    # a stamp with a non-zero offset is the same instant as 12:00 UTC; a parse that ignores
+    # the zone (reads it as local time) is off by hours at TZ=UTC or New_York alike
+    e = err("2026-10-26T08:00:00-0400", 30)
+    assert "(30 s ago)" in e and conditional(e)
+    e = err("2026-10-26T17:30:00+0530", 90)  # 12:00 UTC
+    assert "(1 min ago)" in e and conditional(e)
+    e = err(dated, 7200, name="Z")  # the same name: only a new copy, never "re-collect"
+    assert "an earlier run for Z consumed the copy at" in e and "(120 min ago)" in e
+    assert "re-collect" not in e
     e = err(dated, 30, name="Z")
     assert "an earlier run for Z consumed the copy at" in e and "(30 s ago)" in e
-    # not usable as an age: the old wording, no crash
+    # not usable as an age: the conditional text without an age, no crash
     for stamp, delta in [(dated, -30), ("2026-13-45T99:99:99+0000", 100), ("01:02:03", 100000)]:
         e = err(stamp, delta)
-        assert "re-collect Z too" in e and "ago" not in e and "leftover" not in e, stamp
+        assert conditional(e) and "ago" not in e, stamp
 
 
 # --- a failed clear is loud: exit 3 --------------------------------------------------------
@@ -423,7 +447,7 @@ def test_parallel_runs_store_the_copy_at_most_once(env, tmp_path, own_tmpdirs):
     winner = names[[rc for _, rc in res].index(0)]
     loser_out = res[1 - names.index(winner)][0]
     assert cleared_by(clip.read_text()) == winner
-    assert f"the run for {winner} consumed this copy" in "".join(loser_out)
+    assert f"the run for {winner} consumed a copy" in "".join(loser_out)
     assert f"re-collect {winner} too" in "".join(loser_out)
 
 

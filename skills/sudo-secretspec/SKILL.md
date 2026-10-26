@@ -189,14 +189,15 @@ run, on a pty or not:
    two harnesses share it) is held from before `pbpaste` until after the clear. A
    second run waits about 10 s for it, then exits 1 ("another secrets-collect run
    holds the clipboard lock"); one that gets in after the clear reads the sentinel,
-   which names the run that consumed the copy and when (`... cleared by the run for
-   NAME at 2026-10-26T01:40:59-0400 ...`) and says how long ago ("N s ago"), and
-   exits 1. **Within 60 s that is a lock race and the loser is not harmless:** the winner may
-   have taken a copy meant for the loser's name, so **both names must be
-   re-collected, one at a time**, each after a fresh copy. Re-running only the
-   loser leaves the winner holding the wrong value (its length would still pass).
-   **Older than 60 s it says "a leftover from an earlier run, not a race"**: no other run
-   is involved, only copy the value again; do not re-collect the named run.
+   which names the run that consumed the copy and carries its date, time, zone and age
+   (`... cleared by the run for NAME at 2026-10-26T01:40:59-0400 ...`, "N s ago"/"N min ago"),
+   and exits 1. **The age never proves the loser is harmless: the message is always
+   conditional.** Compare the stamp with when the operator said the value for the loser's name was
+   copied. **Copied before the stamp:** the named run may have taken that copy, so **both names
+   must be re-collected, one at a time**, each after a fresh copy (re-running only the loser
+   leaves the named run holding the wrong value, and its length would still pass). **Nothing
+   copied since:** only copy the value again. Never read an old sentinel as "no other run is
+   involved".
 3. **The spec MUST carry the expected length** (`NAME=desc:32`), else exit 2. A
    regex does not count: the spec cannot carry both, and a regex can match
    stale prose (`.+`); if you need a pattern, pin the length in it and use it
@@ -237,14 +238,16 @@ since a regex does not waive it. For those, and only those, use `--literal` with
 
 ```bash
 python3 $S --secret 'NAME=desc:32' --clipboard --yes
-# ONLY if it exited 3, its output says `NOT cleared`, or it gave no report at all (killed or
-# timed out: exit 124/137, or no output); after a run that cleared, do NOT run this line:
+# ONLY if it exited 3, its stdout or stderr says `NOT cleared`, or it exited 2, or said
+# `could not read the clipboard`, and you are not re-running it at once, or it gave no report at
+# all (killed or timed out: exit 124/137, or no output); after a run that cleared, do NOT run this line:
 printf 'cleared' | ~/ops/site-private/bin/clip
 sudo-secretspec run -- sh -c 'echo ${#NAME}'
 ```
 
 The script clears the clipboard itself, so the `printf` line is only for the runs where
-the value can still be on the pasteboard (a failed clear, or a run that died before it reported).
+the value can still be on the pasteboard (a failed clear, or a run that died before it reported) or
+where nothing was consumed (exit 2, an unreadable clipboard: clearing erases no consumer name).
 After a run that cleared it would overwrite the sentinel, which names the run that consumed the
 copy, and the next run could no longer tell whose copy it was.
 
@@ -498,7 +501,8 @@ listener cannot reach private data through it.
 2. **Declare:** `sudo-secretspec add NAME --description "..." --optional --reason "..."`
    (`--optional` so `check` stays green on hosts that never set it).
 3. **Store:** the clipboard route above. With `secrets-collect.py` the script clears the clipboard
-   itself; overwrite it by hand only on exit 3, `NOT cleared` in the output, or no report at all
+   itself; overwrite it by hand only on exit 3, `NOT cleared` in stdout or stderr, exit 2, `could not
+   read the clipboard` (when you are not re-running it at once), or no report at all
    (the rule under "An agent with no terminal"); otherwise you would erase the sentinel's consumer name.
 4. **Prove its reach without printing it.** Run a throwaway script under `run` that prints only
    the length, the prefix and HTTP statuses, then delete the script:

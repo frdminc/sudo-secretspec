@@ -50,11 +50,12 @@ Properties, each deliberate:
      arrives then is delivered after the clear), and (d) holds an exclusive per-user lock
      (~/Library/Caches/secrets-collect.lock, not under TMPDIR) from before pbpaste until after
      that overwrite. A second run waits about 10 s, then exits 1; one that gets in after the
-     clear reads the sentinel (it carries the date, time and zone) and fails, naming the run that
-     consumed the copy and how long ago. Within STALE_AFTER (60 s) that is a lock race: the run
-     may have taken a copy meant for the loser's name, so BOTH names must be re-collected. Older
-     than that it is a leftover from an earlier run, no other run is involved: copy the value
-     again. A SIGKILL or power loss between the read and the clear leaves the value on the
+     clear reads the sentinel (it carries the date, time and zone; the error adds the age) and
+     fails, naming the run that consumed the copy. The age never proves that run is unrelated:
+     compare the stamp with when the operator said the value was copied. Copied before the stamp:
+     that run may have taken it, so BOTH names must be re-collected, one at a time; nothing copied
+     since: copy the value again. A same-name sentinel only needs a new copy. A SIGKILL or power
+     loss between the read and the clear leaves the value on the
      pasteboard. A failing pbcopy prints a WARNING and the run (still storing and notifying, also
      under --dry-run) exits 3 instead of 0, its last line saying the clipboard was NOT cleared;
      a run that fails otherwise keeps its own code (1, 2, 130). A clipboard that was stale
@@ -85,7 +86,7 @@ _CANCEL_SIGNALS = {signal.SIGINT, signal.SIGTERM, signal.SIGHUP}
 CLEARED_PREFIX = "secrets-collect: clipboard cleared"  # every sentinel this script ever wrote
 CLEARED_WORD = "cleared"
 LOCK_WAIT = 10.0  # seconds a second run waits for the clipboard lock before giving up
-STALE_AFTER = 60.0  # seconds: a sentinel older than this is a leftover, not a lock-race loser's read
+AGE_IN_MINUTES_FROM = 60  # seconds: the age is shown as "N s ago" below this, "N min ago" from it
 _CONSUMER = re.compile(r"cleared by the run for (\S+) at "
                        r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d{4}|\d\d:\d\d:\d\d)")  # 2nd: old form
 _clear_failed = False  # set by clear_clipboard when pbcopy failed; main() resets it and exits 3
@@ -106,10 +107,9 @@ def _sentinel_age(at: str) -> float | None:
 
 
 def sentinel_error(value: str, name: str) -> str:
-    """Why a sentinel was read. A run that lost the lock race read the winner's sentinel, and the
-    winner may have taken a copy meant for THIS name, so say who consumed it. A sentinel older
-    than STALE_AFTER is not a race (the loser reads it within about LOCK_WAIT of the clear): it
-    is left over from an earlier run, so no other run is involved."""
+    """Why a sentinel was read. Another name's sentinel is ALWAYS conditional, whatever its age:
+    the run that consumed the copy may have taken a copy meant for THIS name, and the age cannot
+    say whether the operator copied for this name before that run read the clipboard."""
     m = _CONSUMER.search(value)
     if not m:
         return ("the clipboard holds a cleared-clipboard sentinel: no fresh copy was made since "
@@ -118,17 +118,14 @@ def sentinel_error(value: str, name: str) -> str:
     age = _sentinel_age(at)
     ago = ""
     if age is not None:
-        ago = f" ({int(age)} s ago)" if age < 60 else f" ({int(age // 60)} min ago)"
-    if age is not None and age > STALE_AFTER:
-        return (f"the clipboard holds a cleared-clipboard sentinel left by the run for {who} at "
-                f"{at}{ago}: a leftover from an earlier run, not a race, and no other run is "
-                f"involved; copy the value again (no re-collection of {who} is needed)")
+        ago = (f" ({int(age)} s ago)" if age < AGE_IN_MINUTES_FROM
+               else f" ({int(age // 60)} min ago)")
     if who == name:
         return (f"the clipboard holds a cleared-clipboard sentinel: an earlier run for {name} "
                 f"consumed the copy at {at}{ago}; copy the value again")
-    return (f"the clipboard holds a cleared-clipboard sentinel: the run for {who} consumed this "
-            f"copy at {at}{ago}; if the copy was for {name}, {who} now holds that value: "
-            f"re-collect {who} too")
+    return (f"the clipboard holds a cleared-clipboard sentinel: the run for {who} consumed a copy "
+            f"at {at}{ago}; if the operator copied the value for {name} before {at}, {who} now "
+            f"holds it: re-collect {who} too; if nothing was copied since, only copy again")
 
 
 class StoreError(Exception):
@@ -428,10 +425,13 @@ def main() -> int:
     ap.add_argument("--yes", action="store_true",
                     help="skip the final 'Store these?' prompt. With --clipboard it also skips the "
                          "Enter wait (tty or not): ONE secret per run, LEN required, the clipboard is "
-                         "cleared after the read, and a lock stops two runs at once. Needed for any "
-                         "--clipboard run with a non-tty stdin. Without --clipboard it needs a "
-                         "terminal (hidden prompt). Exit 3 = done, but the clipboard could not be "
-                         "cleared: overwrite it yourself")
+                         "cleared after the read, and a lock stops two runs at once. A run that "
+                         "finds another name's sentinel prints its date, time, zone and age: compare "
+                         "the stamp with when the value for your name was copied (before it: "
+                         "re-collect both names one at a time; nothing copied since: copy again). "
+                         "Needed for any --clipboard run with a non-tty stdin. Without --clipboard "
+                         "it needs a terminal (hidden prompt). Exit 3 = done, but the clipboard "
+                         "could not be cleared: overwrite it yourself")
     a = ap.parse_args()
 
     rc = _run(a)
