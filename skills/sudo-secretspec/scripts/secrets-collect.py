@@ -18,6 +18,7 @@ Any agent, any provider. The operator runs it; the agent reads the result from t
 
     secrets-collect.py ... --dry-run      # validate only; store nothing, notify nobody
     secrets-collect.py ... --clipboard    # read each value from pbpaste instead of typing
+    secrets-collect.py ... --clipboard --yes   # no terminal (agent): one secret per run, no prompts
 
 Why this exists: an agent that needs values from a human must never ask the human to paste them
 into a chat. That puts the value in a transcript, which is the one thing the house rules forbid.
@@ -73,19 +74,27 @@ def parse_spec(spec: str) -> tuple[str, str, int | None, str | None]:
     return name, desc.strip() or name, length, pattern
 
 
-def read_value(label: str, from_clipboard: bool) -> str:
-    """One value, hidden if from the terminal. Retries on an empty read."""
+def read_value(label: str, from_clipboard: bool, no_wait: bool = False) -> str:
+    """One value, hidden if from the terminal. Retries on an empty read.
+
+    no_wait (clipboard, no terminal): read pbpaste once, no Enter wait, no retry -- the
+    clipboard cannot change, so an empty read or a retry would only loop forever."""
     while True:
         if from_clipboard:
-            print(f"  Copy {label} to the clipboard, then press Enter.")
             try:
-                input("  [Enter when copied] ")
+                if no_wait:
+                    print(f"  Reading {label} from the clipboard (no terminal, no wait).")
+                else:
+                    print(f"  Copy {label} to the clipboard, then press Enter.")
+                    input("  [Enter when copied] ")
                 raw = subprocess.run(["pbpaste"], capture_output=True, text=True, check=True).stdout
             except EOFError:
                 print("  no input available — aborting rather than guessing", file=sys.stderr)
                 raise SystemExit(1)
             except Exception as e:  # noqa: BLE001
                 print(f"  could not read the clipboard: {e}", file=sys.stderr)
+                if no_wait:
+                    raise SystemExit(1)
                 continue
         else:
             try:
@@ -96,6 +105,9 @@ def read_value(label: str, from_clipboard: bool) -> str:
         value = raw.strip()
         if value:
             return value
+        if no_wait:
+            print("  the clipboard is empty — aborting, nothing stored", file=sys.stderr)
+            raise SystemExit(1)
 
 
 def check(value: str, length: int | None, pattern: str | None, literal: bool) -> str | None:
@@ -166,7 +178,16 @@ def main() -> int:
                     help="validate but store nothing and notify nobody")
     ap.add_argument("--clipboard", action="store_true",
                     help="read each value from pbpaste instead of typing it")
+    ap.add_argument("--yes", action="store_true",
+                    help="skip only the final 'Store these?' prompt (for an agent with no terminal); "
+                         "with --clipboard and a non-tty stdin, also skip the Enter wait: one secret per run")
     a = ap.parse_args()
+
+    no_wait = a.clipboard and a.yes and not sys.stdin.isatty()
+    if a.clipboard and not sys.stdin.isatty() and len(a.secret) > 1:
+        print("refusing: --clipboard with a non-tty stdin takes ONE --secret per run "
+              "(the clipboard cannot change between secrets)", file=sys.stderr)
+        return 2
 
     specs = [parse_spec(s) for s in a.secret]
 
@@ -181,18 +202,21 @@ def main() -> int:
         for i, (name, desc, length, pattern) in enumerate(specs, 1):
             print(f"[{i}/{len(specs)}] {name}")
             while True:
-                value = read_value(desc, a.clipboard)
+                value = read_value(desc, a.clipboard, no_wait)
                 err = check(value, length, pattern, a.literal)
                 if err is None:
                     break
                 print(f"  ✗ {err}")
+                if no_wait:
+                    print("Aborted — nothing was stored.", file=sys.stderr)
+                    return 1
             collected.append((name, value))
             print(f"  ✓ {name} accepted ({len(value)} characters)\n")
 
         print("Ready to store:")
         for name, value in collected:
             print(f"  {name}  (len={len(value)})")
-        if not ask("\nStore these? [y/N] "):
+        if not a.yes and not ask("\nStore these? [y/N] "):
             print("Aborted — nothing was stored.")
             return 1
 

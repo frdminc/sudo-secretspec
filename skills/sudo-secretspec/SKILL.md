@@ -165,6 +165,24 @@ proves the result with `run` (a length), never `get`. This script replaces the
 "ask the human, then pipe" dance; it does not replace the declaration or the
 verification.
 
+**An agent with no terminal** cannot answer the final prompt or press Enter, so
+use `--clipboard --yes` — **ONE secret per run** (the clipboard cannot change
+between secrets; more than one `--secret` with `--clipboard` and a non-tty stdin
+exits 2). `--yes` skips only the "Store these?" prompt; every check, the
+all-or-nothing rule, and stdin-only delivery are unchanged. With a non-tty stdin
+it also reads `pbpaste` once, immediately, and aborts (exit 1, nothing stored) on
+an empty or bad-shape value rather than retrying. Without `--yes`, EOF at the
+prompt is still "no". Then overwrite the clipboard and prove the result with a
+length, never `get`:
+
+```bash
+python3 $S --secret 'NAME=desc' --literal --clipboard --yes
+printf 'cleared' | ~/ops/site-private/bin/clip
+sudo-secretspec run -- sh -c 'echo ${#NAME}'
+```
+
+Verified 2026-10-26 (stub `sudo-secretspec`/`pbpaste`; no live vault).
+
 
 ### Giving a consumer a secret it reads itself
 
