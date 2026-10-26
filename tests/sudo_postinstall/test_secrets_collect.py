@@ -242,7 +242,7 @@ def test_pbcopy_failure_is_loud(env):
     assert clip.read_text() == VALUE
 
 
-# --- the sentinel carries a date: a race and a leftover read differently -------------------------
+# --- the sentinel carries a date and an age: the other-name text stays conditional at every age -------------------------
 
 def _stamp(epoch):
     return time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(epoch))

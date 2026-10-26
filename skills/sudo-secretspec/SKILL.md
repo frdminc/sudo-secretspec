@@ -192,12 +192,15 @@ run, on a pty or not:
    which names the run that consumed the copy and carries its date, time, zone and age
    (`... cleared by the run for NAME at 2026-10-26T01:40:59-0400 ...`, "N s ago"/"N min ago"),
    and exits 1. **The age never proves the loser is harmless: the message is always
-   conditional.** Compare the stamp with when the operator said the value for the loser's name was
-   copied. **Copied before the stamp:** the named run may have taken that copy, so **both names
-   must be re-collected, one at a time**, each after a fresh copy (re-running only the loser
-   leaves the named run holding the wrong value, and its length would still pass). **Nothing
-   copied since:** only copy the value again. Never read an old sentinel as "no other run is
-   involved".
+   conditional.** A copy made after the stamp would have replaced the sentinel, so while the
+   sentinel is on the clipboard every copy the operator made was before it. **If the operator told
+   you they copied the value for the loser's name** (whenever they said so: their message
+   arrives after the copy, often after the stamp, so never compare the stamp with the message),
+   the named run may have taken that copy, so **both names must be re-collected, one at a time**,
+   each after a fresh copy (re-running only the loser leaves the named run holding the wrong
+   value, and its length would still pass). **Only if the operator confirms they had not copied
+   yet:** copy the value again. **Unsure: re-collect both.** Never read an old sentinel as "no
+   other run is involved".
 3. **The spec MUST carry the expected length** (`NAME=desc:32`), else exit 2. A
    regex does not count: the spec cannot carry both, and a regex can match
    stale prose (`.+`); if you need a pattern, pin the length in it and use it
@@ -238,16 +241,19 @@ since a regex does not waive it. For those, and only those, use `--literal` with
 
 ```bash
 python3 $S --secret 'NAME=desc:32' --clipboard --yes
-# ONLY if it exited 3, its stdout or stderr says `NOT cleared`, or it exited 2, or said
-# `could not read the clipboard`, and you are not re-running it at once, or it gave no report at
-# all (killed or timed out: exit 124/137, or no output); after a run that cleared, do NOT run this line:
+# ONLY if it exited 3, its stdout or stderr says `NOT cleared`, or it gave no report at all
+# (killed or timed out: exit 124/137, or no output). After a run that cleared, do NOT run this line.
+# A run that never read the clipboard (exit 2, `bad --secret`/`bad secret name`/`bad regex`,
+# `could not open the lock file`, `could not read the clipboard`): fix the call and re-run it,
+# that run reads, clears and reports any sentinel; run this line only if you give up on the name.
 printf 'cleared' | ~/ops/site-private/bin/clip
 sudo-secretspec run -- sh -c 'echo ${#NAME}'
 ```
 
 The script clears the clipboard itself, so the `printf` line is only for the runs where
-the value can still be on the pasteboard (a failed clear, or a run that died before it reported) or
-where nothing was consumed (exit 2, an unreadable clipboard: clearing erases no consumer name).
+the value can still be on the pasteboard (a failed clear, or a run that died before it reported),
+or for giving up on a name after a run that never read the clipboard. Do not run it before
+re-running: such a run never looked at the clipboard, which may hold another run's sentinel.
 After a run that cleared it would overwrite the sentinel, which names the run that consumed the
 copy, and the next run could no longer tell whose copy it was.
 
@@ -501,9 +507,9 @@ listener cannot reach private data through it.
 2. **Declare:** `sudo-secretspec add NAME --description "..." --optional --reason "..."`
    (`--optional` so `check` stays green on hosts that never set it).
 3. **Store:** the clipboard route above. With `secrets-collect.py` the script clears the clipboard
-   itself; overwrite it by hand only on exit 3, `NOT cleared` in stdout or stderr, exit 2, `could not
-   read the clipboard` (when you are not re-running it at once), or no report at all
-   (the rule under "An agent with no terminal"); otherwise you would erase the sentinel's consumer name.
+   itself; overwrite it by hand only on exit 3, `NOT cleared` in stdout or stderr, or no report at all,
+   or to give up on the name after a run that never read the clipboard (the rule under "An agent
+   with no terminal"); otherwise you would erase the sentinel's consumer name.
 4. **Prove its reach without printing it.** Run a throwaway script under `run` that prints only
    the length, the prefix and HTTP statuses, then delete the script:
    ```bash

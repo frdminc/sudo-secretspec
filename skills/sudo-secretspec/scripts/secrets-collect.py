@@ -52,9 +52,9 @@ Properties, each deliberate:
      that overwrite. A second run waits about 10 s, then exits 1; one that gets in after the
      clear reads the sentinel (it carries the date, time and zone; the error adds the age) and
      fails, naming the run that consumed the copy. The age never proves that run is unrelated:
-     compare the stamp with when the operator said the value was copied. Copied before the stamp:
-     that run may have taken it, so BOTH names must be re-collected, one at a time; nothing copied
-     since: copy the value again. A same-name sentinel only needs a new copy. A SIGKILL or power
+     a copy made after the stamp would have replaced it, so if the operator copied the value for
+     this name at all, that run may have taken it and BOTH names must be re-collected, one at a
+     time; only if the operator had not copied yet: copy the value again; unsure: both. A same-name sentinel only needs a new copy. A SIGKILL or power
      loss between the read and the clear leaves the value on the
      pasteboard. A failing pbcopy prints a WARNING and the run (still storing and notifying, also
      under --dry-run) exits 3 instead of 0, its last line saying the clipboard was NOT cleared;
@@ -429,9 +429,9 @@ def main() -> int:
                          "finds another name's sentinel prints its date, time, zone and age: compare "
                          "the stamp with when the value for your name was copied (before it: "
                          "re-collect both names one at a time; nothing copied since: copy again). "
-                         "Needed for any --clipboard run with a non-tty stdin. Without --clipboard "
-                         "it needs a terminal (hidden prompt). Exit 3 = done, but the clipboard "
-                         "could not be cleared: overwrite it yourself")
+                         "Exit 3 = done, but the clipboard could not be cleared: overwrite it "
+                         "yourself. Needed for any --clipboard run with a non-tty stdin. Without "
+                         "--clipboard it needs a terminal (hidden prompt)")
     a = ap.parse_args()
 
     rc = _run(a)

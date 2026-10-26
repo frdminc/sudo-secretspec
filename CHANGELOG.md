@@ -16,8 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   right after the read under a per-user lock so parallel runs cannot store one
   copy twice, reports partial stores, and never prints value characters.
   Piped answers without `--yes` and `--yes` without `--clipboard` are refused.
-  The sentinel carries the date, time and zone, and the error adds its age, so an
-  agent can compare the stamp with when the value was copied: copied before it, re-collect both names.
+  The sentinel carries the date, time and zone, and the error adds its age;
+  if the value was copied before the stamp, re-collect both names.
   A run that stored but could not clear the clipboard exits 3 instead of 0.
 
 ### Fixed
