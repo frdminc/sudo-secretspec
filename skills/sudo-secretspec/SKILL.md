@@ -142,7 +142,7 @@ python3 $S \
 
 python3 $S --secret 'FOO_API_KEY=the API key'      # one value
 python3 $S --secret 'OVH_ENDPOINT=API endpoint' --literal   # not a key: skip the alnum check
-python3 $S --secret 'NAME=desc:8' --dry-run        # validate only, store nothing
+python3 $S --secret 'NAME=desc:8' --dry-run        # validate only, store nothing (with --clipboard --yes it still consumes and clears the copy)
 python3 $S --secret 'NAME=desc' --clipboard        # read from pbpaste instead of typing
 ```
 
@@ -169,28 +169,46 @@ proves the result with `run` (a length), never `get`. This script replaces the
 verification.
 
 **An agent with no terminal** cannot answer the final prompt or press Enter, so
-use `--clipboard --yes` — **ONE secret per run** (the clipboard cannot change
-between secrets; more than one `--secret` with `--clipboard` and a non-tty stdin
-exits 2), and **the spec MUST carry the expected length** (`NAME=desc:32`) or a
-regex, else exit 2. Reason: with no human at the prompt nothing else shows the
-clipboard is fresh, and the length is that check. In this mode a length mismatch
-aborts **without prompting** (nothing stored), the shape check still applies, and
-`cleared` and the script's own sentinel are refused. `--yes` skips only the
-"Store these?" prompt; every check and stdin-only delivery are unchanged. It
-reads `pbpaste` once, immediately, aborts (exit 1, nothing stored) on an empty,
-bad-shape or wrong-length value rather than retrying, and **overwrites the
-clipboard itself right after the read, on every path** (stored, rejected,
-interrupted), so the next run sees a fresh copy or the sentinel, never the
-previous secret. A failed overwrite prints `WARNING: ... NOT cleared`. The
-rejection text gives a count and character classes, never the characters. A
-clipboard that was stale **before the first run** and has the same shape and
-length cannot be detected: have the operator copy, say so in chat, then run.
-`--yes` without `--clipboard` and with a non-tty stdin is refused (exit 2): a
-value piped in went through your own command line. Without `--yes`, EOF at the
-prompt is still "no".
+use `--clipboard --yes`. Every rule below applies to **any** `--clipboard --yes`
+run, on a pty or not:
+
+1. **Run it only after the operator says the value is copied.** It reads and
+   then overwrites whatever is on the clipboard; run too early and it consumes
+   (and clears) something unrelated, and prints that content's length and
+   character classes into your transcript. `--dry-run` consumes and clears the
+   copy too, so it is not a free rehearsal.
+2. **ONE secret per run, and never two runs at once.** The clipboard cannot
+   change between secrets (more than one `--secret` exits 2). A per-user lock
+   (`$TMPDIR/secrets-collect-<uid>.lock`) is held from before `pbpaste` until
+   after the clear, so a parallel run waits, then reads the sentinel and fails
+   (exit 1, nothing stored). Still run them one after the other, each after a
+   fresh copy: issue the commands sequentially, never as parallel tool calls.
+3. **The spec MUST carry the expected length** (`NAME=desc:32`), else exit 2. A
+   regex does not count: the spec cannot carry both, and a regex can match
+   stale prose (`.+`); if you need a pattern, pin the length in it and use it
+   interactively. With no human at the prompt the length is the only freshness
+   check, so a mismatch aborts **without prompting** (nothing stored). The
+   alphanumeric shape check applies (a regex does not waive it; only
+   `--literal` does), and `cleared` and the script's own sentinel are refused.
+4. **`--clipboard` with a non-tty stdin and no `--yes` exits 2** ("a non-tty
+   stdin is not the operator"): piped Enter/`y` answers never stand in for the
+   operator. `--yes` without `--clipboard` and with a non-tty stdin also exits 2.
+
+`--yes` skips the "Store these?" prompt and the Enter wait; every check and
+stdin-only delivery are unchanged. It reads `pbpaste` once, aborts (exit 1,
+nothing stored) on an empty, non-UTF-8, bad-shape or wrong-length value rather
+than retrying, and **overwrites the clipboard itself right after the read**
+(in a `finally`, so a stored, rejected or interrupted run, including SIGTERM
+and SIGHUP, clears it; a SIGKILL between the read and the clear cannot). The
+next run sees a fresh copy or the sentinel, never the previous secret. A failed
+overwrite prints `WARNING: ... NOT cleared`. The rejection text gives a count
+and character classes, never the characters. A clipboard that was stale
+**before the first run** and has the same shape and length cannot be detected:
+have the operator copy, say so in chat, then run. SIGTERM/SIGHUP mid-store gets
+the same `PARTIAL STORE` report as Ctrl-C.
 
 Do **not** use `--literal` for a key: it removes the shape check. It is for
-endpoints and URLs (and then still give `:LEN` or a regex).
+endpoints and URLs (and then still give `:LEN`).
 
 ```bash
 python3 $S --secret 'NAME=desc:32' --clipboard --yes

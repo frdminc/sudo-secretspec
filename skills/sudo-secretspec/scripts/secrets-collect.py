@@ -19,7 +19,8 @@ Any agent, any provider. The operator runs it; the agent reads the result from t
     secrets-collect.py ... --dry-run      # validate only; store nothing, notify nobody
     secrets-collect.py ... --clipboard    # read each value from pbpaste instead of typing
 
-    # no terminal (an agent): ONE secret per run, no prompts, LEN (or a regex) REQUIRED
+    # no terminal (an agent): ONE secret per run, no prompts, LEN REQUIRED. Run it only after the
+    # operator says the value is copied, and never two at once (a lock makes a second one fail)
     secrets-collect.py --secret 'NAME=desc:32' --clipboard --yes
 
 Why this exists: an agent that needs values from a human must never ask the human to paste them
@@ -39,24 +40,32 @@ Properties, each deliberate:
      rejected value is described by a count and character classes, never the characters.
   5. The notification message carries names and lengths, never values.
   6. EOF is treated as "no", never a crash.
-  7. No-terminal mode (--clipboard --yes, stdin not a tty) cannot tell a fresh copy from a stale
-     clipboard by looking at it, so it (a) requires an expected LEN or a regex in the spec and
-     aborts on a mismatch without prompting, (b) refuses the sentinels `cleared` and
-     CLEARED_MARK, and (c) overwrites the clipboard with CLEARED_MARK itself, immediately after
-     reading it, on every path (stored, rejected, interrupted). The next run therefore sees a
-     fresh copy or the sentinel, never the previous secret. A clipboard that was stale before
-     the FIRST run and happens to have the same shape and length is not detectable.
+  7. --clipboard --yes (tty or not) cannot tell a fresh copy from a stale clipboard by looking
+     at it, so it (a) requires an expected LEN in the spec (a regex does not count) and aborts on
+     a mismatch without prompting, (b) refuses the sentinels `cleared` and CLEARED_MARK, (c)
+     overwrites the clipboard with CLEARED_MARK itself, in a `finally` right after the read
+     (stored, rejected, or interrupted by an exception or SIGINT/SIGTERM/SIGHUP), and (d) holds an
+     exclusive per-user lock from before pbpaste until after that overwrite, so two parallel runs
+     cannot both read one copy: the second reads the sentinel and fails. A SIGKILL or power loss
+     between the read and the clear still leaves the value on the pasteboard. A clipboard that was
+     stale before the FIRST run and happens to have the same shape and length is not detectable;
+     --dry-run reads and clears too, so it consumes the operator's copy.
+     --clipboard with a non-tty stdin and no --yes is refused: piped answers are not the operator.
   8. A clipboard value identical to one already collected in the same run is refused (the
      clipboard did not change between secrets), so a pty cannot read one value into N names.
 """
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import getpass
 import os
 import re
+import signal
 import subprocess
 import sys
+import tempfile
 import unicodedata
 
 CLEARED_MARK = "secrets-collect: clipboard cleared, copy the value again"
@@ -94,17 +103,55 @@ def parse_spec(spec: str) -> tuple[str, str, int | None, str | None]:
             length = int(tail)
         elif tail:
             pattern = tail
+    if pattern:
+        try:
+            re.compile(pattern)
+        except re.error as e:
+            raise SystemExit(f"bad regex in --secret {name!r}: {e}") from None
     return name, desc.strip() or name, length, pattern
+
+
+def _pb_env() -> dict[str, str]:
+    """pbcopy and pbpaste both need this: an agent shell's LC_CTYPE=C mangles non-ASCII text."""
+    return dict(os.environ, LC_CTYPE="UTF-8")
 
 
 def clear_clipboard() -> None:
     """Overwrite the pasteboard with CLEARED_MARK so a later run cannot read this secret again."""
     try:
         subprocess.run(["pbcopy"], input=CLEARED_MARK, text=True, check=True,
-                       capture_output=True, env=dict(os.environ, LC_CTYPE="UTF-8"))
+                       capture_output=True, env=_pb_env())
     except Exception as e:  # noqa: BLE001
         print(f"  WARNING: the clipboard was NOT cleared ({type(e).__name__}); "
               "overwrite it yourself", file=sys.stderr)
+
+
+@contextlib.contextmanager
+def clipboard_lock():
+    """Per-user exclusive lock held from before pbpaste until after the clear, so two parallel
+    no-terminal runs cannot both read the same copy: the loser reads CLEARED_MARK and fails."""
+    path = os.path.join(tempfile.gettempdir(), f"secrets-collect-{os.getuid()}.lock")
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)  # closing releases the flock
+
+
+def read_and_clear() -> bytes:
+    """pbpaste, then overwrite the clipboard in a finally, so an interrupt right after the read
+    still clears. A pbpaste that failed read nothing, so it leaves the clipboard alone."""
+    failed = False
+    try:
+        return subprocess.run(["pbpaste"], capture_output=True, check=True,
+                              env=_pb_env()).stdout
+    except (subprocess.CalledProcessError, OSError):
+        failed = True
+        raise
+    finally:
+        if not failed:
+            clear_clipboard()
 
 
 def read_value(label: str, from_clipboard: bool, no_wait: bool = False) -> str:
@@ -118,21 +165,20 @@ def read_value(label: str, from_clipboard: bool, no_wait: bool = False) -> str:
             try:
                 if no_wait:
                     print(f"  Reading {label} from the clipboard (no terminal, no wait).")
+                    with clipboard_lock():
+                        data = read_and_clear()
                 else:
                     print(f"  Copy {label} to the clipboard, then press Enter.")
                     input("  [Enter when copied] ")
-                proc = subprocess.run(["pbpaste"], capture_output=True, check=True)
+                    data = subprocess.run(["pbpaste"], capture_output=True, check=True,
+                                          env=_pb_env()).stdout
                 try:
-                    raw = proc.stdout.decode("utf-8")
+                    raw = data.decode("utf-8")
                 except UnicodeDecodeError:
-                    if no_wait:
-                        clear_clipboard()
                     print("  the clipboard is not valid UTF-8 text", file=sys.stderr)
                     if no_wait:
                         raise SystemExit(1)
                     continue
-                if no_wait:
-                    clear_clipboard()
             except EOFError:
                 print("  no input available — aborting rather than guessing", file=sys.stderr)
                 raise SystemExit(1)
@@ -178,7 +224,7 @@ def check(value: str, length: int | None, pattern: str | None, literal: bool,
     length is the freshness check, so it blocks."""
     if pattern and not re.fullmatch(pattern, value):
         return f"does not match the required pattern {pattern!r}"
-    if not (literal or pattern):
+    if not literal:
         # API keys are alphanumeric (plus - and _); punctuation is the signature of a mis-copied
         # UI rendering — a masked box or a copied label — which passes a length check and is not a key.
         if not re.fullmatch(r"[A-Za-z0-9_\-]+", value):
@@ -246,7 +292,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Collect and store secret values (see the module docstring).")
     ap.add_argument("--secret", action="append", required=True, metavar="NAME=DESC[:LEN]",
                     help="repeatable; LEN is an expected character count (warns on mismatch; "
-                         "REQUIRED, with a mismatch aborting, in no-terminal mode)")
+                         "REQUIRED, with a mismatch aborting, under --clipboard --yes)")
     ap.add_argument("--reason", default="store values supplied by the operator",
                     help="the reason recorded in the audit ledger")
     ap.add_argument("--notify-to", metavar="ROLE",
@@ -259,10 +305,11 @@ def main() -> int:
     ap.add_argument("--clipboard", action="store_true",
                     help="read each value from pbpaste instead of typing it")
     ap.add_argument("--yes", action="store_true",
-                    help="skip only the final 'Store these?' prompt. With --clipboard and a non-tty "
-                         "stdin (an agent) it also skips the Enter wait: ONE secret per run, LEN or "
-                         "a regex required, and the clipboard is cleared after the read. Without "
-                         "--clipboard it needs a terminal (hidden prompt)")
+                    help="skip the final 'Store these?' prompt. With --clipboard it also skips the "
+                         "Enter wait (tty or not): ONE secret per run, LEN required, the clipboard is "
+                         "cleared after the read, and a lock stops two runs at once. Needed for any "
+                         "--clipboard run with a non-tty stdin. Without --clipboard it needs a "
+                         "terminal (hidden prompt)")
     a = ap.parse_args()
 
     tty = sys.stdin.isatty()
@@ -270,18 +317,27 @@ def main() -> int:
         print("refusing: --yes without --clipboard needs a terminal; a value piped on stdin "
               "went through the caller's command line", file=sys.stderr)
         return 2
-    no_wait = a.clipboard and a.yes and not tty
-    if a.clipboard and not tty and len(a.secret) > 1:
-        print("refusing: --clipboard with a non-tty stdin takes ONE --secret per run "
+    if a.clipboard and not a.yes and not tty:
+        print("refusing: a non-tty stdin is not the operator; use --yes (with LEN) for "
+              "--clipboard without a terminal", file=sys.stderr)
+        return 2
+    no_wait = a.clipboard and a.yes
+    if a.clipboard and (no_wait or not tty) and len(a.secret) > 1:
+        print("refusing: --clipboard --yes (or a non-tty stdin) takes ONE --secret per run "
               "(the clipboard cannot change between secrets)", file=sys.stderr)
         return 2
 
     specs = [parse_spec(s) for s in a.secret]
-    if no_wait and any(length is None and pattern is None for _, _, length, pattern in specs):
-        print("refusing: no-terminal mode needs an expected length or a regex in the spec "
-              "(--secret 'NAME=desc:32') — it is the check that the clipboard is fresh",
-              file=sys.stderr)
+    if no_wait and any(length is None for _, _, length, _ in specs):
+        print("refusing: --clipboard --yes needs an expected length in the spec "
+              "(--secret 'NAME=desc:32'; a regex does not count, the spec cannot carry both) — "
+              "the length is the check that the clipboard is fresh", file=sys.stderr)
         return 2
+
+    def _cancel(signum, frame):  # a harness cancel (SIGTERM/SIGHUP) gets the same report as Ctrl-C
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, _cancel)
+    signal.signal(signal.SIGHUP, _cancel)
 
     print(f"{len(specs)} value(s) to collect, stored in sudo-secretspec")
     if a.yes:
@@ -297,6 +353,7 @@ def main() -> int:
     stored: list[str] = []
     inflight: str | None = None
     storing = False
+    notifying = False
     try:
         for i, (name, desc, length, pattern) in enumerate(specs, 1):
             print(f"[{i}/{len(specs)}] {name}")
@@ -338,16 +395,19 @@ def main() -> int:
                 print(str(e), file=sys.stderr)
                 report_partial(stored, [n for n, _ in collected if n not in stored])
                 return 1
-            inflight = None
             stored.append(name)
+            inflight = None
             print(f"  stored {name}")
 
+        notifying = True
         if a.notify_to:
             notify(a.notify_to, [(n, len(v)) for n, v in collected], a.reason)
         print("\nDone.")
         return 0
     except KeyboardInterrupt:
-        if storing:
+        if notifying:
+            print("\nInterrupted while notifying; every value IS stored.", file=sys.stderr)
+        elif storing:
             print("\nInterrupted while storing.", file=sys.stderr)
             report_partial(stored, [n for n, _ in collected if n not in stored and n != inflight],
                            inflight)
