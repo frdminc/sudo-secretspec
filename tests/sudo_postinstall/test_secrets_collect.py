@@ -721,3 +721,59 @@ def test_banner_does_not_promise_a_confirmation_under_yes(env):
     env[2].write_text(VALUE)  # the first run cleared it
     rc, so, se = run_pty(env, ["--secret", "A=a:15", "--clipboard"], b"\ny\n")
     assert "until you confirm" in so
+
+
+# --- --declare and the undeclared-name hint ------------------------------------------------
+
+def _sudo_stub(bindir, log, script):
+    p = bindir / "sudo-secretspec"
+    p.write_text("#!/bin/sh\n" + script.format(log=log))
+    p.chmod(p.stat().st_mode | stat.S_IXUSR)
+
+
+def test_declare_runs_add_before_set(env):
+    _, log, _, _ = env
+    r = run(env, yes_args() + ["--declare"])
+    assert r.returncode == 0, r.stderr
+    argv = [l for l in calls(log).splitlines() if l.startswith("ARGV")]
+    assert argv == [
+        "ARGV: add A --description a --optional --reason store values supplied by the operator",
+        "ARGV: set A --reason store values supplied by the operator",
+    ]
+
+
+def test_declare_treats_already_declared_as_success(env):
+    _, log, _, bindir = env
+    _sudo_stub(bindir, log,
+               'echo "ARGV: $*" >> {log}\n'
+               'if [ "$1" = add ]; then echo "already declared" >&2; exit 1; fi\n'
+               'cat >> {log}\necho >> {log}\n')
+    r = run(env, yes_args() + ["--declare"])
+    assert r.returncode == 0, out(r)
+    assert "ARGV: set A" in calls(log)  # the store still ran
+
+
+def test_declare_failure_aborts_before_any_store(env):
+    _, log, _, bindir = env
+    _sudo_stub(bindir, log,
+               'echo "ARGV: $*" >> {log}\n'
+               'if [ "$1" = add ]; then echo "add refused" >&2; exit 1; fi\n'
+               'cat >> {log}\necho >> {log}\n')
+    r = run(env, yes_args() + ["--declare"])
+    assert r.returncode == 1
+    assert "FAILED to declare A" in r.stderr
+    assert "ARGV: set" not in calls(log)  # nothing was stored
+
+
+def test_undeclared_name_failure_names_the_fix(env):
+    _, log, _, bindir = env
+    _sudo_stub(bindir, log,
+               'echo "ARGV: $*" >> {log}\n'
+               'if [ "$1" = set ]; then '
+               'echo "broker: Secret A is not defined in profile default" >&2; exit 1; fi\n'
+               'cat >> {log}\necho >> {log}\n')
+    r = run(env, yes_args())  # no --declare: the hint must still name the fix
+    assert r.returncode == 1
+    assert "not defined in profile" in r.stderr
+    assert "--declare" in r.stderr
+

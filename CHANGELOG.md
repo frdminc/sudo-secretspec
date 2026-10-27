@@ -19,6 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The sentinel carries the date, time and zone, and the error adds its age;
   if the value was copied before the stamp, re-collect both names.
   A run that stored but could not clear the clipboard exits 3 instead of 0.
+- `skills/sudo-secretspec/scripts/secrets-collect.py` gained `--declare`: it
+  declares each name that is not already in the runtime manifest
+  (`add --optional`) before storing, leaving already-declared names as-is.
+  Storing into an undeclared name used to fail part-way through the store loop
+  with `broker: Secret 'NAME' is not defined in profile 'default'`; that error
+  now also names the fix (`add NAME --optional`, or re-run with `--declare`).
 
 ### Fixed
 

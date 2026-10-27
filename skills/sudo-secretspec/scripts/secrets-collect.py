@@ -18,6 +18,7 @@ Any agent, any provider. The operator runs it; the agent reads the result from t
 
     secrets-collect.py ... --dry-run      # validate only; store nothing, notify nobody
     secrets-collect.py ... --clipboard    # read each value from pbpaste instead of typing
+    secrets-collect.py ... --declare      # declare names not yet declared (--optional) first
 
     # no terminal (an agent): ONE secret per run, no prompts, LEN REQUIRED. Run it only after the
     # operator says the value is copied, and never two at once (a lock makes a second one fail)
@@ -369,7 +370,35 @@ def store(name: str, value: str, reason: str) -> None:
     except OSError as e:
         raise StoreError(f"FAILED to store {name}: {type(e).__name__}") from None
     if proc.returncode != 0:
-        raise StoreError(f"FAILED to store {name}: {proc.stderr.strip()}")
+        msg = proc.stderr.strip()
+        if "not defined in profile" in msg:
+            msg += (" — declare the name first (`sudo-secretspec add NAME --optional "
+                    "--reason R`) or re-run with --declare")
+        raise StoreError(f"FAILED to store {name}: {msg}")
+
+
+def declare(name: str, desc: str, reason: str) -> bool:
+    """Declare a name in the runtime manifest unless it is already declared.
+
+    'already declared' is not an error here: the script is told to make the
+    names exist, not to know whether an agent (or an earlier run) declared them
+    already. Declares --optional so `check` stays green on hosts that never set
+    the value. Returns True when it added a declaration, False when the name was
+    already declared. `add` takes no value, so stdin is DEVNULL, never the value.
+    """
+    try:
+        proc = subprocess.run(
+            ["sudo-secretspec", "add", name, "--description", desc,
+             "--optional", "--reason", reason],
+            text=True, capture_output=True, stdin=subprocess.DEVNULL,
+        )
+    except OSError as e:
+        raise StoreError(f"FAILED to declare {name}: {type(e).__name__}") from None
+    if proc.returncode != 0:
+        if "already declared" in proc.stderr:
+            return False
+        raise StoreError(f"FAILED to declare {name}: {proc.stderr.strip()}")
+    return True
 
 
 def report_partial(stored: list[str], rest: list[str], unknown: str | None = None) -> None:
@@ -420,6 +449,10 @@ def main() -> int:
                          "/+= (AWS secret keys, Azure keys), with :LEN still required")
     ap.add_argument("--dry-run", action="store_true",
                     help="validate but store nothing and notify nobody")
+    ap.add_argument("--declare", action="store_true",
+                    help="declare each name not already in the runtime manifest "
+                         "(sudo-secretspec add --optional) before storing; a name "
+                         "already declared is left as-is")
     ap.add_argument("--clipboard", action="store_true",
                     help="read each value from pbpaste instead of typing it")
     ap.add_argument("--yes", action="store_true",
@@ -517,6 +550,15 @@ def _run(a: argparse.Namespace) -> int:
         if a.dry_run:
             print("\nDRY RUN: skipping the store and the notification.")
             return 0
+
+        if a.declare:
+            try:
+                declared = [n for n, d, _, _ in specs if declare(n, d, a.reason)]
+            except StoreError as e:
+                print(str(e), file=sys.stderr)
+                return 1
+            if declared:
+                print("  declared: " + ", ".join(declared))
 
         storing = True
         for name, value in collected:

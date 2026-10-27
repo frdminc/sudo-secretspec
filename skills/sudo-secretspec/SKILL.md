@@ -144,6 +144,7 @@ python3 $S --secret 'FOO_API_KEY=the API key'      # one value
 python3 $S --secret 'OVH_ENDPOINT=API endpoint' --literal   # not a key: skip the alnum check
 python3 $S --secret 'NAME=desc:8' --dry-run        # validate only, store nothing (with --clipboard --yes it still consumes and clears the copy)
 python3 $S --secret 'NAME=desc' --clipboard        # read from pbpaste instead of typing
+python3 $S --secret 'FOO_API_KEY=the API key' --declare   # declare the name (--optional) first if it is not already declared
 ```
 
 1. **It prompts for each value with the input hidden** (`getpass`), so nothing is
@@ -172,6 +173,15 @@ The declaring agent still declares the names first (`add --optional`), and still
 proves the result with `run` (a length), never `get`. This script replaces the
 "ask the human, then pipe" dance; it does not replace the declaration or the
 verification.
+
+**`set` fails on an undeclared name** with
+`broker: Secret 'NAME' is not defined in profile 'default'` — so declare the
+name first, or pass `--declare` and the script declares each missing name
+`--optional` before storing (a name already declared is left as-is). `--declare`
+is still a runtime `add`, so on a host with a tracked declarations source it
+creates drift you must mirror or `undeclare` (Declaration lifecycle); on a host
+with no tracked source (`template-check` → `no tracked declaration source
+configured`) there is nothing to mirror.
 
 **An agent with no terminal** cannot answer the final prompt or press Enter, so
 use `--clipboard --yes`. Every rule below applies to **any** `--clipboard --yes`
