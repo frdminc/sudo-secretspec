@@ -63,7 +63,7 @@
       # The broker store path is interpolated by Nix into this line as a Python
       # string literal (not a Nix `let` binding), so the f-strings below can use
       # it. A Nix `let` value would never reach the Python script: `{broker}`
-      # here is Python syntax, not `${broker}` Nix interpolation.
+      # here is Python syntax, not Nix interpolation.
       broker = "${nodes.machine.config.services.sudo-secretspec.package}/libexec/sudo-secretspec"
 
       start_all()
