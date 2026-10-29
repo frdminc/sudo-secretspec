@@ -9,4 +9,5 @@ pub mod uninstall;
 
 pub use drift::{
     AvailableBuild, Finding, InspectOptions, Layout, Report, inspect, load_config, media_candidates,
+    uid_for_user,
 };

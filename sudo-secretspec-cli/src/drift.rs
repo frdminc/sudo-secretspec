@@ -248,8 +248,10 @@ fn owner_name(uid: u32) -> String {
 /// Resolve a service-user name to its uid, or `None` if the account is absent.
 ///
 /// The inverse of [`owner_name`]. `drift` carries the configured identity as a
-/// name, but the audit ledger's ownership check compares uids.
-fn uid_for_user(name: &str) -> Option<u32> {
+/// name, but the audit ledger's ownership check compares uids — and so does the
+/// privileged `doctor`'s config-ownership check, which accepts a file owned by
+/// the service user rather than by root.
+pub fn uid_for_user(name: &str) -> Option<u32> {
     let c = std::ffi::CString::new(name).ok()?;
     // SAFETY: `getpwnam` is called with a valid NUL-terminated string and the
     // returned pointer is only dereferenced while non-null.

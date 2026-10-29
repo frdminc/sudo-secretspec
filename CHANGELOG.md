@@ -883,8 +883,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--config` that is not the installed config, the unprivileged client no
   longer forwards `--config` across the privilege boundary, the config read
   itself refuses symlinks, and a parse failure while privileged reports a
-  fixed message instead of quoting the file. Re-run `sudo-secretspec install`
-  to pick up the rebuilt boundary.
+  fixed message instead of quoting the file. The privileged config check
+  accepts a file owned by root or by the service user, matching how the
+  installer writes it. Re-run `sudo-secretspec install` to pick up the
+  rebuilt boundary.
 
 ## [0.19.1] - 2026-08-11
 

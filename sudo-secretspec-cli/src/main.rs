@@ -1031,12 +1031,14 @@ fn probe_available_build(unprivileged: bool) -> Option<sudo_secretspec_cli::Avai
 
 /// Enforce the privilege boundary on the config the privileged `doctor` reads.
 ///
-/// The installed config is root-owned and read-only (`0444`). A root `doctor`
-/// that accepted a caller-chosen `--config` would read whatever file the caller
-/// named with root authority, so refuse anything that is not a plain,
-/// root-owned, non-group/world-writable regular file. Every message here is a
-/// fixed string: the failure must never echo the file's contents.
-fn assert_privileged_config(path: &Path) -> Result<(), &'static str> {
+/// The installed config is read-only (`0444`) and owned by the service user
+/// (`_sudo_secretspec`), not root. A root `doctor` that accepted a
+/// caller-chosen `--config` would read whatever file the caller named with root
+/// authority, so refuse anything that is not a plain regular file, not a
+/// symlink, not group/world-writable, and owned by either root or the service
+/// user whose uid the caller supplies. Every message here is a fixed string:
+/// the failure must never echo the file's contents.
+fn assert_privileged_config(path: &Path, service_uid: Option<u32>) -> Result<(), &'static str> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let meta = match std::fs::symlink_metadata(path) {
         Ok(m) => m,
@@ -1048,8 +1050,10 @@ fn assert_privileged_config(path: &Path) -> Result<(), &'static str> {
     if !meta.file_type().is_file() {
         return Err("config is not a regular file");
     }
-    if meta.uid() != 0 {
-        return Err("config is not root-owned");
+    let uid = meta.uid();
+    let service_owned = service_uid == Some(uid);
+    if uid != 0 && !service_owned {
+        return Err("config is not root- or service-user-owned");
     }
     if meta.permissions().mode() & 0o022 != 0 {
         return Err("config is group- or world-writable");
@@ -1182,7 +1186,8 @@ fn doctor(
     // The unprivileged path reads the operator's own file as themselves and
     // needs no such check.
     if !unprivileged {
-        if let Err(reason) = assert_privileged_config(&config) {
+        let service_uid = sudo_secretspec_cli::uid_for_user(&get_service_user());
+        if let Err(reason) = assert_privileged_config(&config, service_uid) {
             if json {
                 println!(
                     "{}",
@@ -1295,5 +1300,85 @@ mod tests {
         // This is the one case agents may run unattended: a single named,
         // non-forced restore that refuses rather than overwrites a live value.
         assert_eq!(restore_verb(false, false), "source-restore");
+    }
+
+    // The privileged `doctor` config check. Ownership cannot be forged in an
+    // unprivileged test, so the root-owned acceptance branch is exercised by
+    // the live verification, not here: these prove the service-user-owned and
+    // refusal branches, which is exactly the case the C1 fix got wrong.
+    #[test]
+    fn privileged_config_accepts_service_user_ownership() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("config.toml");
+        std::fs::write(&file, "engine = \"/usr/local/libexec/sudo-secretspec\"\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let my_uid = std::fs::symlink_metadata(&file).unwrap().uid();
+        assert!(my_uid != 0, "test must run unprivileged");
+
+        assert_eq!(assert_privileged_config(&file, Some(my_uid)), Ok(()));
+    }
+
+    #[test]
+    fn privileged_config_refuses_a_file_owned_by_neither_root_nor_service_user() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("config.toml");
+        std::fs::write(&file, "x = 1\n").unwrap();
+
+        let my_uid = std::fs::symlink_metadata(&file).unwrap().uid();
+
+        // No service user at all: only root is accepted.
+        assert_eq!(
+            assert_privileged_config(&file, None),
+            Err("config is not root- or service-user-owned")
+        );
+        // A service user that is not the actual owner: still refused.
+        assert_eq!(
+            assert_privileged_config(&file, Some(my_uid + 1)),
+            Err("config is not root- or service-user-owned")
+        );
+    }
+
+    #[test]
+    fn privileged_config_refuses_a_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target.toml");
+        std::fs::write(&target, "x = 1\n").unwrap();
+        let link = tmp.path().join("link.toml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert_eq!(
+            assert_privileged_config(&link, Some(12345)),
+            Err("config is a symlink")
+        );
+    }
+
+    #[test]
+    fn privileged_config_refuses_a_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            assert_privileged_config(tmp.path(), Some(12345)),
+            Err("config is not a regular file")
+        );
+    }
+
+    #[test]
+    fn privileged_config_refuses_a_group_or_world_writable_file() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("config.toml");
+        std::fs::write(&file, "x = 1\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        let my_uid = std::fs::symlink_metadata(&file).unwrap().uid();
+        assert_eq!(
+            assert_privileged_config(&file, Some(my_uid)),
+            Err("config is group- or world-writable")
+        );
     }
 }
