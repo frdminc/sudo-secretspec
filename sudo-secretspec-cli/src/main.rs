@@ -316,9 +316,11 @@ fn main() {
             profile,
             non_interactive,
         } => run_install(
-            declarations,
-            dry_run,
-            adopt_existing,
+            sudo_secretspec_cli::install::InstallRequest::from_cli(
+                declarations,
+                dry_run,
+                adopt_existing,
+            ),
             vault,
             service_user,
             service_group,
@@ -526,9 +528,7 @@ fn detect_existing_vault() -> Option<sudo_secretspec_cli::install::ExistingVault
 }
 
 fn run_install(
-    declarations: Option<PathBuf>,
-    dry_run: bool,
-    adopt_existing: bool,
+    mut req: sudo_secretspec_cli::install::InstallRequest,
     vault: Option<PathBuf>,
     service_user: Option<String>,
     service_group: Option<String>,
@@ -553,19 +553,13 @@ fn run_install(
         std::process::exit(2);
     }
 
-    let declarations = match resolve_declarations(declarations, non_interactive) {
+    req.declarations = match resolve_declarations(req.declarations.take(), non_interactive) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("install denied: {e}");
             std::process::exit(2);
         }
     };
-
-    let mut req = sudo_secretspec_cli::install::InstallRequest::from_cli(
-        declarations,
-        dry_run,
-        adopt_existing,
-    );
 
     if let Some(existing) = detect_existing_vault()
         && vault.is_none()
@@ -584,7 +578,7 @@ fn run_install(
         // exists to prevent. Announce the automatic adoption either way, so an
         // operator who believed they were installing clean finds out here.
         let adopt_by_default = sudo_secretspec_cli::install::adopts_without_flag(existing.origin);
-        if adopt_existing
+        if req.adopt_existing
             || adopt_by_default
             || (!non_interactive
                 && is_tty()
@@ -596,7 +590,7 @@ fn run_install(
                     true,
                 ))
         {
-            if adopt_by_default && !adopt_existing {
+            if adopt_by_default && !req.adopt_existing {
                 eprintln!(
                     "adopting the installed vault at {} (recorded in {}); \
                      pass --vault to install elsewhere",
@@ -1136,23 +1130,21 @@ fn doctor(
     // direct `sudo … doctor --config <path>` is refused here unless the path is
     // the installed `CONFIG_PATH` itself. This closes the disclosure where a
     // NOPASSWD root `doctor` echoed an arbitrary file's contents.
-    if !unprivileged {
-        if let Some(cfg) = &config {
-            let is_default = match (Path::new(CONFIG_PATH).canonicalize(), cfg.canonicalize()) {
-                (Ok(installed), Ok(given)) => installed == given,
-                _ => false,
-            };
-            if !is_default {
-                if json {
-                    println!(
-                        "{}",
-                        serde_json::json!({"ok": false, "error": "config invalid"})
-                    );
-                } else {
-                    eprintln!("doctor: refusing a non-default --config while privileged");
-                }
-                std::process::exit(1);
+    if !unprivileged && let Some(cfg) = &config {
+        let is_default = match (Path::new(CONFIG_PATH).canonicalize(), cfg.canonicalize()) {
+            (Ok(installed), Ok(given)) => installed == given,
+            _ => false,
+        };
+        if !is_default {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"ok": false, "error": "config invalid"})
+                );
+            } else {
+                eprintln!("doctor: refusing a non-default --config while privileged");
             }
+            std::process::exit(1);
         }
     }
 
