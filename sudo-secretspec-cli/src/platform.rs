@@ -59,6 +59,9 @@ mod os {
     pub const CONFIG_PATH: &str = "/usr/local/etc/sudo-secretspec.toml";
     pub const SUDOERS_DIR: &str = "/private/etc/sudoers.d";
     pub const SUDOERS_FILE: &str = "/private/etc/sudoers.d/sudo-secretspec";
+    /// `secure_path` for the broker's `Defaults!` line, so `sudo` cannot hand
+    /// the privileged process a caller-chosen `PATH`.
+    pub const SUDOERS_SECURE_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
     pub const DEFAULT_VAULT: &str = "/var/db/sudo-secretspec";
     pub const VAULT_PARENT: &str = "/var/db";
     pub const VAULT_REAL_PARENT: &str = "/private/var/db";
@@ -83,6 +86,9 @@ mod os {
     pub const CONFIG_PATH: &str = "/etc/sudo-secretspec.toml";
     pub const SUDOERS_DIR: &str = "/etc/sudoers.d";
     pub const SUDOERS_FILE: &str = "/etc/sudoers.d/sudo-secretspec";
+    /// NixOS `secure_path`: the setuid `sudo` wrapper and the current system
+    /// profile. There is no `/usr/bin` on NixOS.
+    pub const SUDOERS_SECURE_PATH: &str = "/run/current-system/sw/bin:/run/wrappers/bin";
     pub const DEFAULT_VAULT: &str = "/var/lib/sudo-secretspec";
     pub const VAULT_PARENT: &str = "/var/lib";
     /// `/var/lib` is a real directory on Linux; there is no `/private` chain.
@@ -108,6 +114,7 @@ pub const CONFIG_PATH: &str = pick(option_env!("SUDO_SECRETSPEC_CONFIG_PATH"), o
 pub const PREFIX: &str = os::PREFIX;
 pub const SUDOERS_DIR: &str = os::SUDOERS_DIR;
 pub const SUDOERS_FILE: &str = os::SUDOERS_FILE;
+pub const SUDOERS_SECURE_PATH: &str = os::SUDOERS_SECURE_PATH;
 pub const DEFAULT_VAULT: &str = os::DEFAULT_VAULT;
 pub const VAULT_PARENT: &str = os::VAULT_PARENT;
 pub const VAULT_REAL_PARENT: &str = os::VAULT_REAL_PARENT;

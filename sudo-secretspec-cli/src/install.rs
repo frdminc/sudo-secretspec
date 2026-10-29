@@ -32,6 +32,7 @@ const SUDOERS_PATH: &str = platform::SUDOERS_FILE;
 /// Any file installed under here is a sudo policy and must be validated before
 /// it is allowed to take effect.
 pub(crate) const SUDOERS_DIR: &str = platform::SUDOERS_DIR;
+const SUDOERS_SECURE_PATH: &str = platform::SUDOERS_SECURE_PATH;
 const DEFAULT_VAULT: &str = platform::DEFAULT_VAULT;
 const DEFAULT_USER: &str = platform::DEFAULT_USER;
 const DEFAULT_GROUP: &str = platform::DEFAULT_GROUP;
@@ -807,6 +808,43 @@ fn version_transition(previous: Option<&str>) -> String {
     }
 }
 
+/// The mediated broker verbs granted NOPASSWD with a `--*` argument glob.
+///
+/// `source-restore-force` and `source-destroy` are deliberately absent: with no
+/// line they fall through to the operator's ordinary password-prompted sudo,
+/// which is what makes them "authenticated" operations (see `main.rs`'s
+/// `lifecycle_restore` and `lifecycle_destroy`). `audit-verify` is not here
+/// either — it is granted below without the glob, since it takes no `--*`
+/// argument.
+pub const BROKER_VERBS: &[&str] = &[
+    "source-add",
+    "source-set",
+    "source-delete",
+    "source-undeclare",
+    "source-get",
+    "source-check",
+    "source-export",
+    "source-template-check",
+    "source-schema",
+    "source-restore",
+];
+
+/// The operator's NOPASSWD grant lines for the mediated broker operations, for
+/// one broker path. `audit-verify` is appended without a glob: it takes no
+/// argument and is a read-only integrity check, not a credential operation.
+fn operator_grant_lines(operator: &str, service_user: &str, broker: &str) -> String {
+    let mut lines = String::new();
+    for verb in BROKER_VERBS {
+        lines.push_str(&format!(
+            "{operator} ALL=({service_user}) NOPASSWD: {broker} __broker {verb} --*\n"
+        ));
+    }
+    lines.push_str(&format!(
+        "{operator} ALL=({service_user}) NOPASSWD: {broker} __broker audit-verify\n"
+    ));
+    lines
+}
+
 /// Sudoers policy for the operator.
 ///
 /// The grant is deliberately per-subcommand. A blanket `sudo-secretspec *`
@@ -857,26 +895,53 @@ fn version_transition(previous: Option<&str>) -> String {
 /// sudoers — from the single-name, forward-safe restore the NOPASSWD grant
 /// exists for. See `main.rs`'s `lifecycle_restore`.
 pub fn sudoers_text(operator: &str, service_user: &str) -> String {
+    let broker = format!("{PREFIX}/libexec/sudo-secretspec");
     format!(
-        "Defaults!{prefix}/libexec/sudo-secretspec env_reset,env_keep-=\"HOME\",secure_path=/usr/bin:/bin:/usr/sbin:/sbin,umask=0077,always_set_home\n\
-         Defaults!{prefix}/bin/sudo-secretspec timestamp_timeout=0\n\
-         {operator} ALL=({service_user}) NOPASSWD: {prefix}/libexec/sudo-secretspec __broker source-add --*\n\
-         {operator} ALL=({service_user}) NOPASSWD: {prefix}/libexec/sudo-secretspec __broker source-set --*\n\
-         {operator} ALL=({service_user}) NOPASSWD: {prefix}/libexec/sudo-secretspec __broker source-delete --*\n\
-         {operator} ALL=({service_user}) NOPASSWD: {prefix}/libexec/sudo-secretspec __broker source-undeclare --*\n\
-         {operator} ALL=({service_user}) NOPASSWD: {prefix}/libexec/sudo-secretspec __broker source-get --*\n\
-         {operator} ALL=({service_user}) NOPASSWD: {prefix}/libexec/sudo-secretspec __broker source-check --*\n\
-         {operator} ALL=({service_user}) NOPASSWD: {prefix}/libexec/sudo-secretspec __broker source-export --*\n\
-         {operator} ALL=({service_user}) NOPASSWD: {prefix}/libexec/sudo-secretspec __broker source-template-check --*\n\
-         {operator} ALL=({service_user}) NOPASSWD: {prefix}/libexec/sudo-secretspec __broker source-schema --*\n\
-         {operator} ALL=({service_user}) NOPASSWD: {prefix}/libexec/sudo-secretspec __broker audit-verify\n\
-         {operator} ALL=({service_user}) NOPASSWD: {prefix}/libexec/sudo-secretspec __broker source-restore --*\n\
-         {operator} ALL=(root) NOPASSWD: {prefix}/libexec/sudo-secretspec doctor\n\
-         {operator} ALL=(root) NOPASSWD: {prefix}/libexec/sudo-secretspec doctor *\n",
-        prefix = PREFIX,
+        "Defaults!{broker} env_reset,env_keep-=\"HOME\",secure_path={secure_path},umask=0077,always_set_home\n\
+         Defaults!{PREFIX}/bin/sudo-secretspec timestamp_timeout=0\n\
+         {grants}\
+         {operator} ALL=(root) NOPASSWD: {broker} doctor\n\
+         {operator} ALL=(root) NOPASSWD: {broker} doctor *\n",
+        secure_path = SUDOERS_SECURE_PATH,
+        grants = operator_grant_lines(operator, service_user, &broker),
         operator = operator,
-        service_user = service_user,
     )
+}
+
+/// Sudoers policy for the declared (Linux/NixOS) boundary.
+///
+/// The broker is [`platform::BROKER_PATH`], the store path baked in at compile
+/// time by the flake's package. There is no public client path on Linux — no
+/// `/usr/local/bin/sudo-secretspec` and no Touch ID — so the
+/// `timestamp_timeout=0` client line and the `doctor` grants (a macOS-only
+/// diagnostic) have nothing to attach to and are omitted. `doctor` refuses on
+/// Linux anyway (`platform::lifecycle_refusal`), so granting it would name a
+/// command that cannot run.
+///
+/// Printed by the hidden `print-sudoers` subcommand and embedded by the NixOS
+/// module via import-from-derivation, so the module's sudoers text and the
+/// binary's own view of the broker path can never drift apart.
+pub fn linux_sudoers_text(operator: &str, service_user: &str) -> String {
+    format!(
+        "Defaults!{broker} env_reset,env_keep-=\"HOME\",secure_path={secure_path},umask=0077,always_set_home\n\
+         {grants}",
+        broker = platform::BROKER_PATH,
+        secure_path = SUDOERS_SECURE_PATH,
+        grants = operator_grant_lines(operator, service_user, platform::BROKER_PATH),
+    )
+}
+
+/// The sudoers policy for the platform this binary was compiled for.
+///
+/// The macOS installer (`install`) calls [`sudoers_text`]; the NixOS module and
+/// the hidden `print-sudoers` subcommand call this so one function is the single
+/// source of truth per platform.
+pub fn sudoers_text_for_platform(operator: &str, service_user: &str) -> String {
+    if platform::IS_MACOS {
+        sudoers_text(operator, service_user)
+    } else {
+        linux_sudoers_text(operator, service_user)
+    }
 }
 
 /// Run the installer. Returns Ok(()) on success.
@@ -1527,6 +1592,46 @@ mod tests {
             !text.contains("source-restore-force"),
             "source-restore-force must have no sudoers grant at all, NOPASSWD or otherwise:\n{text}"
         );
+    }
+
+    #[test]
+    fn linux_policy_grants_broker_verbs_only() {
+        // The declared boundary has no public client path (no Touch ID, no
+        // imperative installer), so the Linux text omits the `timestamp_timeout=0`
+        // client line and the macOS-only `doctor` grants, and grants exactly the
+        // mediated broker verbs plus the read-only `audit-verify`. The force and
+        // destroy verbs stay un-granted for the same reason as on macOS.
+        let text = linux_sudoers_text("dann", "sudo-secretspec");
+        for verb in BROKER_VERBS {
+            assert!(
+                text.contains(&format!(
+                    "NOPASSWD: {} __broker {verb} --*\n",
+                    platform::BROKER_PATH
+                )),
+                "missing grant for {verb}:\n{text}"
+            );
+        }
+        assert!(
+            text.contains(&format!(
+                "NOPASSWD: {} __broker audit-verify\n",
+                platform::BROKER_PATH
+            )),
+            "audit-verify must keep its NOPASSWD grant:\n{text}"
+        );
+        assert!(
+            !text.contains("timestamp_timeout=0"),
+            "Linux has no client path to attach timestamp_timeout=0 to:\n{text}"
+        );
+        assert!(
+            !text.contains(" doctor"),
+            "doctor is a macOS-only diagnostic and must have no Linux grant:\n{text}"
+        );
+        for absent in ["source-restore-force", "source-destroy"] {
+            assert!(
+                !text.contains(absent),
+                "{absent} must have no Linux grant:\n{text}"
+            );
+        }
     }
 
     #[test]

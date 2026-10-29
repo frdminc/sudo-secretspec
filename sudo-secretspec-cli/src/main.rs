@@ -220,6 +220,21 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<OsString>,
     },
+    /// Print the sudoers policy for this platform's boundary.
+    ///
+    /// Consumed by the NixOS module (import-from-derivation) so the module's
+    /// sudoers text and the compiled-in broker path cannot drift. Runs as the
+    /// public client, never through the broker, so it is outside the privileged
+    /// allowlist. Reads nothing, writes only stdout.
+    #[command(hide = true, name = "print-sudoers")]
+    PrintSudoers {
+        /// Operator granted the NOPASSWD broker rules.
+        #[arg(long)]
+        operator: String,
+        /// Service user the broker runs as.
+        #[arg(long)]
+        service_user: String,
+    },
 }
 
 /// True when this process is the installed privileged broker, i.e. it was
@@ -365,6 +380,15 @@ fn main() {
             if let Err(code) = sudo_secretspec_cli::broker::dispatch(&args) {
                 std::process::exit(code);
             }
+        }
+        Cmd::PrintSudoers {
+            operator,
+            service_user,
+        } => {
+            print!(
+                "{}",
+                sudo_secretspec_cli::install::sudoers_text_for_platform(&operator, &service_user)
+            );
         }
     }
 }
