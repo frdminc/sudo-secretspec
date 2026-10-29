@@ -192,7 +192,12 @@ fn sha256_file(path: &Path) -> Result<String, UninstallError> {
 fn require_root() -> Result<(), UninstallError> {
     if unsafe { libc::geteuid() } != 0 {
         return Err(UninstallError::Denied(
-            "must run as root (Touch ID/sudo is expected, including dry-run)".into(),
+            if platform::host() == Host::MacOs {
+                "must run as root (Touch ID/sudo is expected, including dry-run)"
+            } else {
+                "must run as root (sudo is expected, including dry-run)"
+            }
+            .into(),
         ));
     }
     Ok(())
@@ -213,6 +218,16 @@ pub fn run(req: UninstallRequest) -> Result<(), UninstallError> {
              which is missing or unreadable",
             req.config.display()
         )));
+    }
+    if let Some(layout) = &layout {
+        check_linux_removal_targets(
+            host,
+            &layout.service_user,
+            &layout.service_group,
+            &layout.vault,
+            req.purge_vault,
+            req.remove_service_user,
+        )?;
     }
 
     // Both opt-in removals are decided here, before a single artifact is
@@ -360,6 +375,29 @@ pub fn run(req: UninstallRequest) -> Result<(), UninstallError> {
             "{} owned path(s) could not be removed; see the warnings above",
             failed.len()
         )));
+    }
+    Ok(())
+}
+
+fn check_linux_removal_targets(
+    host: Host,
+    user: &str,
+    group: &str,
+    vault: &Path,
+    purge_vault: bool,
+    remove_service_user: bool,
+) -> Result<(), UninstallError> {
+    // The service owns its config. Never let that config aim root's opt-in
+    // cleanup at another package's system account or /var/lib directory.
+    if host == Host::Linux
+        && (purge_vault || remove_service_user)
+        && (user != platform::DEFAULT_USER
+            || group != platform::DEFAULT_GROUP
+            || (purge_vault && vault != Path::new(platform::DEFAULT_VAULT)))
+    {
+        return Err(UninstallError::Denied(
+            "non-default/adopted identity or vault: remove by hand".into(),
+        ));
     }
     Ok(())
 }
@@ -756,6 +794,45 @@ fn remove_linux_service_identity(user: &str, group: &str) -> Result<(), Uninstal
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linux_destructive_cleanup_requires_default_identity_and_purge_vault() {
+        let vault = Path::new(platform::DEFAULT_VAULT);
+        let user = platform::DEFAULT_USER;
+        let group = platform::DEFAULT_GROUP;
+        for (purge, remove) in [(true, false), (false, true), (true, true)] {
+            assert!(
+                check_linux_removal_targets(Host::Linux, user, group, vault, purge, remove).is_ok()
+            );
+            for (user, group) in [("messagebus", group), (user, "messagebus")] {
+                let err =
+                    check_linux_removal_targets(Host::Linux, user, group, vault, purge, remove)
+                        .unwrap_err();
+                assert!(
+                    err.to_string()
+                        .contains("non-default/adopted identity or vault: remove by hand")
+                );
+            }
+        }
+        let other = Path::new("/var/lib/dpkg");
+        assert!(check_linux_removal_targets(Host::Linux, user, group, other, true, false).is_err());
+        assert!(check_linux_removal_targets(Host::Linux, user, group, other, false, true).is_ok());
+        assert!(
+            check_linux_removal_targets(
+                Host::Linux,
+                "messagebus",
+                "messagebus",
+                other,
+                false,
+                false
+            )
+            .is_ok()
+        );
+        assert!(
+            check_linux_removal_targets(Host::MacOs, "_secretspec", "staff", other, true, true)
+                .is_ok()
+        );
+    }
     use std::os::unix::fs::MetadataExt as _;
 
     fn hash(bytes: &[u8]) -> String {

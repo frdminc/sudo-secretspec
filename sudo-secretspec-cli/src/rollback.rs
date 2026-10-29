@@ -12,7 +12,9 @@ use std::process::Command;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::install::{PREFIX, SNAPSHOT_PREFIX, SUDOERS_DIR, installed_artifacts};
+use crate::install::{
+    PREFIX, SNAPSHOT_PREFIX, SUDOERS_DIR, artifact_owner, installed_artifacts, set_owner,
+};
 use crate::platform;
 
 fn sha256_file(path: &Path) -> Result<String, RollbackError> {
@@ -72,6 +74,10 @@ pub fn run(snapshot: &Path) -> Result<(), RollbackError> {
     }
 
     let pairs = plan_restore(&snapshot)?;
+    let host = platform::host();
+    let layout = crate::load_config(Path::new(platform::CONFIG_PATH)).map_err(|e| {
+        RollbackError::Denied(format!("cannot read installed service identity: {e}"))
+    })?;
 
     for (prior, dest, mode) in pairs.iter().rev() {
         if let Some(parent) = dest.parent() {
@@ -94,6 +100,8 @@ pub fn run(snapshot: &Path) -> Result<(), RollbackError> {
         let mut perms = fs::metadata(&tmp)?.permissions();
         perms.set_mode(*mode);
         fs::set_permissions(&tmp, perms)?;
+        let owner = artifact_owner(host, dest, &layout.service_user, &layout.service_group);
+        set_owner(host, &tmp, &owner).map_err(|e| RollbackError::Denied(e.to_string()))?;
         fs::rename(&tmp, dest)?;
     }
 
@@ -231,7 +239,7 @@ mod tests {
     /// `/etc/sudoers.d`.
     fn debian_artifacts() -> Vec<(PathBuf, u32)> {
         vec![
-            (PathBuf::from("/usr/local/bin/sudo-secretspec"), 0o755),
+            (PathBuf::from("/usr/bin/sudo-secretspec"), 0o755),
             (PathBuf::from("/usr/libexec/sudo-secretspec"), 0o755),
             (PathBuf::from("/etc/sudoers.d/sudo-secretspec"), 0o440),
         ]
@@ -296,7 +304,7 @@ mod tests {
         write_snapshot(
             dir.path(),
             &[
-                ("/usr/local/bin/sudo-secretspec", "client"),
+                ("/usr/bin/sudo-secretspec", "client"),
                 ("/usr/libexec/sudo-secretspec", "broker"),
             ],
         );
@@ -310,8 +318,8 @@ mod tests {
         assert_eq!(
             targets,
             vec![
+                (PathBuf::from("/usr/bin/sudo-secretspec"), 0o755),
                 (PathBuf::from("/usr/libexec/sudo-secretspec"), 0o755),
-                (PathBuf::from("/usr/local/bin/sudo-secretspec"), 0o755),
             ]
         );
     }
@@ -325,7 +333,7 @@ mod tests {
             "/usr/bin/sudo",
             "/etc/sudoers",
             "/etc/sudoers.d/other",
-            "/usr/bin/sudo-secretspec",
+            "/usr/local/bin/sudo-secretspec",
         ] {
             let dir = tempfile::tempdir().unwrap();
             write_snapshot(dir.path(), &[(dest, "payload")]);

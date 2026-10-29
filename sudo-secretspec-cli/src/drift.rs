@@ -58,7 +58,7 @@ impl Layout {
     /// `host` decides where the public client lives: macOS derives it from the
     /// configured prefix (`<prefix>/bin`), Linux uses the fixed
     /// [`platform::client_path`] because the broker's prefix (`/usr`) is not
-    /// where the client goes (`/usr/local/bin`, on the caller's real `PATH`).
+    /// where the public client goes (`/usr/bin` on ordinary Linux).
     fn from_config(cfg: Config, config_path: PathBuf, host: Host) -> Self {
         // Prefer deriving the install prefix from the configured engine path.
         // Single-binary installs place the privileged binary under libexec and
@@ -159,8 +159,8 @@ const SEARCH_DIRS: &[&str] = &[
 ];
 
 /// Linux counterpart of [`SEARCH_DIRS`]: the directories Debian's default
-/// `secure_path` names, which is where the installed client (`/usr/local/bin`)
-/// and a distro-packaged or hand-copied one (`/usr/bin`, `/bin`) would live.
+/// `secure_path` names, including the installed client (`/usr/bin`) and
+/// earlier, potentially staff-writable copies (`/usr/local/bin`).
 /// Fixed for the same reason as the macOS list; there is no Homebrew or
 /// MacPorts prefix to scan.
 const LINUX_SEARCH_DIRS: &[&str] = &[
@@ -1387,17 +1387,26 @@ mod tests {
 
     fn write_cfg(dir: &Path) -> PathBuf {
         let path = dir.join("sudo-secretspec.toml");
+        let broker = platform::DEFAULT_BROKER_PATH;
+        let vault = platform::DEFAULT_VAULT;
+        let real = Path::new(platform::VAULT_REAL_PARENT).join("sudo-secretspec");
+        let prefix = platform::PREFIX;
+        let user = platform::DEFAULT_USER;
+        let group = platform::DEFAULT_GROUP;
         fs::write(
             &path,
-            r#"
-engine = "/usr/local/libexec/sudo-secretspec"
-audit_helper = "/usr/local/libexec/sudo-secretspec"
-vault = "/var/db/sudo-secretspec"
-vault_realpath = "/private/var/db/sudo-secretspec"
-declarations = "/usr/local/share/sudo-secretspec/secretspec.toml"
-service_user = "_sudo_secretspec"
-service_group = "_sudo_secretspec"
+            format!(
+                r#"
+engine = "{broker}"
+audit_helper = "{broker}"
+vault = "{vault}"
+vault_realpath = "{}"
+declarations = "{prefix}/share/sudo-secretspec/secretspec.toml"
+service_user = "{user}"
+service_group = "{group}"
 "#,
+                real.display()
+            ),
         )
         .unwrap();
         path
@@ -1408,15 +1417,12 @@ service_group = "_sudo_secretspec"
         let tmp = tempdir().unwrap();
         let path = write_cfg(tmp.path());
         let layout = load_config(&path).unwrap();
-        assert_eq!(
-            layout.broker,
-            PathBuf::from("/usr/local/libexec/sudo-secretspec")
-        );
+        assert_eq!(layout.broker, PathBuf::from(platform::DEFAULT_BROKER_PATH));
         assert_eq!(
             layout.client,
-            PathBuf::from("/usr/local/bin/sudo-secretspec")
+            PathBuf::from(platform::client_path(platform::host()))
         );
-        assert_eq!(layout.vault, PathBuf::from("/var/db/sudo-secretspec"));
+        assert_eq!(layout.vault, PathBuf::from(platform::DEFAULT_VAULT));
     }
 
     #[test]
@@ -1959,9 +1965,13 @@ service_group = "_sudo_secretspec"
         // a neighbour, so a failing code here would wedge automation forever.
         let tmp = tempdir().unwrap();
         let (layout, dir) = layout_with_sudoers_dir(tmp.path());
-        // Test runs unprivileged, so this file is not uid 0 and is refused for
-        // ownership — the same branch a real root:staff drop-in takes.
-        fs::write(dir.join("yabai"), "Defaults env_reset\n").unwrap();
+        // Preserve the non-root-owner scenario even in a root-run CI container.
+        let neighbour = dir.join("yabai");
+        fs::write(&neighbour, "Defaults env_reset\n").unwrap();
+        if unsafe { libc::geteuid() } == 0 {
+            std::os::unix::fs::chown(&neighbour, Some(65534), None).unwrap();
+        }
+        assert_ne!(fs::metadata(&neighbour).unwrap().uid(), 0);
 
         let reported = neighbour_findings(&layout);
         assert_eq!(
@@ -2111,8 +2121,8 @@ service_group = "_sudo_secretspec"
     #[test]
     fn the_linux_ancestor_walk_reaches_root_and_the_macos_walk_stops_where_it_did() {
         assert_eq!(
-            ancestor_dirs(Host::Linux, Path::new("/usr/local/bin/sudo-secretspec")),
-            ["/usr/local/bin", "/usr/local", "/usr", "/"].map(PathBuf::from)
+            ancestor_dirs(Host::Linux, Path::new("/usr/bin/sudo-secretspec")),
+            ["/usr/bin", "/usr", "/"].map(PathBuf::from)
         );
         assert_eq!(
             ancestor_dirs(Host::Linux, Path::new("/var/lib/sudo-secretspec")),
@@ -2132,21 +2142,14 @@ service_group = "_sudo_secretspec"
 
     #[test]
     fn a_clean_linux_chain_passes_and_every_way_of_being_replaceable_is_flagged() {
-        for dir in [
-            "/etc",
-            "/var/lib",
-            "/usr",
-            "/usr/local",
-            "/usr/local/bin",
-            "/",
-        ] {
+        for dir in ["/etc", "/var/lib", "/usr", "/usr/bin", "/"] {
             let found = judge_ancestor(Host::Linux, Path::new(dir), false, Some(("root", 0o755)));
             assert!(found.is_empty(), "{dir}: {found:?}");
         }
         let codes = |owner: &str, mode: u32, symlink: bool| {
             judge_ancestor(
                 Host::Linux,
-                Path::new("/usr/local/bin"),
+                Path::new("/usr/bin"),
                 symlink,
                 Some((owner, mode)),
             )
@@ -2154,8 +2157,8 @@ service_group = "_sudo_secretspec"
             .map(|f| f.code)
             .collect::<Vec<_>>()
         };
-        // Debian ships `/usr/local` as root:staff 2775; the group-writable bit
-        // lets any `staff` member replace the client root is asked to run.
+        // Group-write access to an installed ancestor permits replacement.
+        // `/usr/local` is outside this protected chain; shadows are checked separately.
         assert_eq!(codes("root", 0o775, false), ["REMOVABLE_ANCESTOR"]);
         assert_eq!(codes("root", 0o757, false), ["REMOVABLE_ANCESTOR"]);
         assert_eq!(codes("operator", 0o755, false), ["REMOVABLE_ANCESTOR"]);
@@ -2308,10 +2311,7 @@ service_group = "sudo-secretspec"
         )
         .unwrap();
         let layout = load_config_for_host(&path, Host::Linux).unwrap();
-        assert_eq!(
-            layout.client,
-            PathBuf::from("/usr/local/bin/sudo-secretspec")
-        );
+        assert_eq!(layout.client, PathBuf::from("/usr/bin/sudo-secretspec"));
         assert_eq!(layout.broker, PathBuf::from("/usr/libexec/sudo-secretspec"));
         assert_ne!(layout.client, layout.broker);
         assert_eq!(

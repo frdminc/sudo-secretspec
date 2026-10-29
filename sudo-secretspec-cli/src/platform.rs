@@ -126,11 +126,11 @@ const MACOS_CLIENT_PATH: &str = "/usr/local/bin/sudo-secretspec";
 const NIXOS_SECURE_PATH: &str = "/run/current-system/sw/bin:/run/wrappers/bin";
 const NIXOS_CLIENT_PATH: &str = "/run/current-system/sw/bin/sudo-secretspec";
 /// Ordinary FHS Linux (Debian's own sudo default): `/usr/bin` for the system
-/// tools, `/usr/local/bin` for the public client.
+/// tools and the public client. Keep sudo's other standard search directories.
 const LINUX_SECURE_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 /// The public client on an ordinary FHS Linux: on the real `PATH`, and a
 /// different file from the broker at [`DEFAULT_BROKER_PATH`].
-const LINUX_CLIENT_PATH: &str = "/usr/local/bin/sudo-secretspec";
+const LINUX_CLIENT_PATH: &str = "/usr/bin/sudo-secretspec";
 pub const SERVICE_USER_REQUIRES_UNDERSCORE: bool = os::SERVICE_USER_REQUIRES_UNDERSCORE;
 pub const SERVICE_IDENTITY_ALLOWS_HYPHEN: bool = os::SERVICE_IDENTITY_ALLOWS_HYPHEN;
 
@@ -199,12 +199,18 @@ pub fn host_for(macos_build: bool, nixos_running: bool) -> Host {
     }
 }
 
-/// True when the running system is NixOS: `/run/current-system` exists as a
-/// symlink. `/run` is a root-owned tmpfs, so an unprivileged caller cannot
-/// plant one. Looked at with `symlink_metadata` so a dangling link still counts.
+/// Root-controlled NixOS markers cover both activated systems and chroots.
+/// `symlink_metadata` also recognizes a dangling system-profile link.
 #[must_use]
 pub fn nixos_running() -> bool {
-    std::fs::symlink_metadata("/run/current-system").is_ok()
+    nixos_markers_present(
+        std::path::Path::new("/run/current-system"),
+        std::path::Path::new("/etc/NIXOS"),
+    )
+}
+
+fn nixos_markers_present(profile: &std::path::Path, marker: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(profile).is_ok() || std::fs::symlink_metadata(marker).is_ok()
 }
 
 /// The system this process is running on.
@@ -275,6 +281,28 @@ pub fn lifecycle_refusal(command: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn either_nixos_marker_selects_the_declarative_host() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = tmp.path().join("current-system");
+        let marker = tmp.path().join("NIXOS");
+        assert_eq!(
+            host_for(false, nixos_markers_present(&profile, &marker)),
+            Host::Linux
+        );
+        std::fs::write(&marker, "").unwrap();
+        assert_eq!(
+            host_for(false, nixos_markers_present(&profile, &marker)),
+            Host::NixOs
+        );
+        std::fs::remove_file(&marker).unwrap();
+        std::os::unix::fs::symlink("/nonexistent", &profile).unwrap();
+        assert_eq!(
+            host_for(false, nixos_markers_present(&profile, &marker)),
+            Host::NixOs
+        );
+    }
 
     #[test]
     fn vault_lives_directly_under_its_parent() {

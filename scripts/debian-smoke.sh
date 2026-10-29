@@ -4,13 +4,28 @@ set -euo pipefail
 [[ $(id -u) == 0 ]] || { echo 'requires root in a disposable Debian container' >&2; exit 1; }
 [[ -f /.dockerenv || -f /run/.containerenv ]] || { echo 'requires a disposable container' >&2; exit 1; }
 [[ ! -e /etc/sudo-secretspec.toml && ! -e /var/lib/sudo-secretspec ]]
-[[ ! -e /run/current-system && ! -L /run/current-system ]]
+[[ ! -e /run/current-system && ! -L /run/current-system && ! -e /etc/NIXOS ]]
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+local_before=$(stat -c '%a %U:%G' /usr/local/bin)
+printf 'Debian /usr/local/bin before install: %s\n' "$local_before"
 binary=$(realpath "${1:-target/release/sudo-secretspec}")
 root=$(git rev-parse --show-toplevel)
 work=$(mktemp -d /opt/sudo-secretspec-smoke.XXXXXX)
-trap 'rm -f /run/current-system; rm -rf "$work"' EXIT
+trap 'rm -f /run/current-system /etc/NIXOS; rm -rf "$work"' EXIT
 ok() { printf 'PASS: %s\n' "$*"; }
+fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
+must_fail() {
+  local label=$1
+  shift
+  if "$@"; then fail "$label unexpectedly succeeded"; fi
+  ok "$label refused as expected"
+}
+forbid_match() {
+  local status
+  if grep -E "$1" "$2"; then fail "forbidden match in $2: $1";
+  else status=$?; fi
+  [[ $status == 1 ]] || fail "grep failed with status $status"
+}
 meta() {
   local actual
   actual=$(stat -c '%a %U:%G' "$1")
@@ -49,40 +64,73 @@ getent group sudo-secretspec
 [[ $(getent group sudo-secretspec | cut -d: -f3) == "$service_gid" ]]
 ok 'service system user/group exist with a non-login shell'
 meta /var/lib/sudo-secretspec '700 sudo-secretspec:sudo-secretspec'
-meta /etc/sudo-secretspec.toml '444 root:root'
-meta /usr/libexec/sudo-secretspec '755 root:root'
-meta /usr/local/bin/sudo-secretspec '755 root:root'
-[[ $(stat -c '%d:%i' /usr/libexec/sudo-secretspec) != $(stat -c '%d:%i' /usr/local/bin/sudo-secretspec) ]]
-cmp /usr/libexec/sudo-secretspec /usr/local/bin/sudo-secretspec
-sha256sum /usr/libexec/sudo-secretspec /usr/local/bin/sudo-secretspec
+meta /etc/sudo-secretspec.toml '444 sudo-secretspec:sudo-secretspec'
+meta /usr/libexec/sudo-secretspec '755 sudo-secretspec:sudo-secretspec'
+meta /usr/bin/sudo-secretspec '755 root:root'
+[[ $(stat -c '%d:%i' /usr/libexec/sudo-secretspec) != $(stat -c '%d:%i' /usr/bin/sudo-secretspec) ]]
+cmp /usr/libexec/sudo-secretspec /usr/bin/sudo-secretspec
+sha256sum /usr/libexec/sudo-secretspec /usr/bin/sudo-secretspec
 ok 'client and broker are separate files with identical hashes'
 meta /etc/sudoers.d/sudo-secretspec '440 root:root'
 visudo -c
 ok 'combined sudoers accepted by visudo'
 policy=/etc/sudoers.d/sudo-secretspec
-! grep -E '^ALL[[:space:]].*NOPASSWD|NOPASSWD:.*[[:space:]](install|uninstall|rollback|doctor)([[:space:]]|$)' "$policy"
+forbid_match '^ALL[[:space:]].*NOPASSWD|NOPASSWD:.*[[:space:]](install|uninstall|rollback|doctor)([[:space:]]|$)' "$policy"
 [[ $(grep -c 'NOPASSWD:' "$policy") == 11 ]]
 for verb in source-add source-set source-delete source-undeclare source-get source-check source-export source-template-check source-schema source-restore; do
   grep -Fx "opuser ALL=(sudo-secretspec) NOPASSWD: /usr/libexec/sudo-secretspec __broker $verb --*" "$policy"
 done
 grep -Fx 'opuser ALL=(sudo-secretspec) NOPASSWD: /usr/libexec/sudo-secretspec __broker audit-verify' "$policy"
-! grep 'NOPASSWD:' "$policy" | grep -v '^opuser ALL=(sudo-secretspec) NOPASSWD: /usr/libexec/sudo-secretspec __broker '
 grep -F 'secure_path=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' "$policy"
-grep -Fx 'Defaults!/usr/local/bin/sudo-secretspec timestamp_timeout=0' "$policy"
+grep -Fx 'Defaults!/usr/bin/sudo-secretspec timestamp_timeout=0' "$policy"
 ok 'only the eleven broker verbs are granted NOPASSWD; Debian PATH and client timeout are pinned'
 su opuser -c 'sudo -n -l' > "$work/sudo-list.txt"
 cat "$work/sudo-list.txt"
 grep -F '/usr/libexec/sudo-secretspec __broker source-get --*' "$work/sudo-list.txt"
 grep -F '/usr/libexec/sudo-secretspec __broker audit-verify' "$work/sudo-list.txt"
 ok 'operator can list the mediated broker grants without a password'
-if su opuser -c 'sudo -n /usr/local/bin/sudo-secretspec install --declarations x' > "$work/denied.txt" 2>&1; then
+if su opuser -c 'sudo -n /usr/bin/sudo-secretspec install --declarations x' > "$work/denied.txt" 2>&1; then
   echo 'FAIL: install unexpectedly allowed without authentication' >&2; exit 1
 fi
 cat "$work/denied.txt"
 grep -Ei 'password.*required|password is required' "$work/denied.txt"
 ok 'public-client install requires interactive authentication'
-/usr/local/bin/sudo-secretspec doctor
+# Exercise the actual boundary as the ordinary operator, including system SQLite.
+su opuser -c 'sudo-secretspec add SMOKE_BROKER --optional --description "Disposable CI value" --reason debian-smoke'
+printf '%s' 'smoke-value' | su opuser -c 'sudo-secretspec set SMOKE_BROKER --reason debian-smoke'
+su opuser -c 'sudo-secretspec get SMOKE_BROKER --reason debian-smoke' > "$work/value.txt"
+[[ $(cat "$work/value.txt") == smoke-value ]]
+su opuser -c 'sudo-secretspec check --reason debian-smoke'
+su opuser -c 'sudo-secretspec run --reason debian-smoke -- /bin/sh -c '\''test "$SMOKE_BROKER" = smoke-value'\'''
+meta /var/lib/sudo-secretspec/secrets.db '600 sudo-secretspec:sudo-secretspec'
+must_fail 'operator reading private SQLite vault' su opuser -c 'cat /var/lib/sudo-secretspec/secrets.db'
+ok 'add, stdin set, get, check and run work through the installed public client'
+# Runtime additions deliberately cause declaration drift; remove the fixture.
+su opuser -c 'sudo-secretspec delete SMOKE_BROKER --reason debian-smoke'
+su opuser -c 'sudo-secretspec undeclare SMOKE_BROKER --reason debian-smoke'
+/usr/bin/sudo-secretspec doctor
 ok 'doctor accepts the Debian layout'
+# The staff-writable directory stays outside the protected chain. Its earlier
+# client must still be reported as a shadow by doctor.
+[[ $(stat -c '%a %U:%G' /usr/local/bin) == "$local_before" ]]
+install -m755 /usr/bin/sudo-secretspec /usr/local/bin/sudo-secretspec
+must_fail 'doctor with earlier PATH client' /usr/bin/sudo-secretspec doctor
+rm /usr/local/bin/sudo-secretspec
+[[ $(stat -c '%a %U:%G' /usr/local/bin) == "$local_before" ]]
+/usr/bin/sudo-secretspec doctor
+ok 'earlier client detected; /usr/local metadata unchanged'
+# Prove purge on a fresh vault before adoption makes it ineligible.
+/usr/bin/sudo-secretspec uninstall --purge-vault --remove-service-user --non-interactive
+absent /var/lib/sudo-secretspec
+must_fail 'service user lookup after purge' getent passwd sudo-secretspec
+must_fail 'service group lookup after purge' getent group sudo-secretspec
+ok 'fresh purge removes vault and service identity'
+groupadd --system sudo-secretspec
+must_fail 'fresh install with pre-existing group' install_boundary
+absent /etc/sudo-secretspec.toml
+absent /var/lib/sudo-secretspec
+groupdel sudo-secretspec
+install_boundary
 # A first installation has no prior artifacts. Reinstall to produce a real,
 # restorable snapshot; timestamp-based snapshot names require a distinct second.
 sleep 1
@@ -91,21 +139,27 @@ cat "$work/upgrade.log"
 snapshot=$(awk -F= '/^rollback_snapshot=/{print substr($0,index($0,"=")+1)}' "$work/upgrade.log")
 [[ $snapshot == /usr/libexec/sudo-secretspec-rollback-* && -d $snapshot ]]
 ls -la "$snapshot"
-/usr/local/bin/sudo-secretspec rollback "$snapshot"
-/usr/local/bin/sudo-secretspec doctor
+/usr/bin/sudo-secretspec rollback "$snapshot"
+/usr/bin/sudo-secretspec doctor
 ok 'upgrade snapshot listed, restored and accepted by doctor'
-/usr/local/bin/sudo-secretspec uninstall --non-interactive
-for path in /etc/sudo-secretspec.toml /etc/sudoers.d/sudo-secretspec /usr/libexec/sudo-secretspec /usr/local/bin/sudo-secretspec; do absent "$path"; done
+/usr/bin/sudo-secretspec uninstall --non-interactive
+for path in /etc/sudo-secretspec.toml /etc/sudoers.d/sudo-secretspec /usr/libexec/sudo-secretspec /usr/bin/sudo-secretspec; do absent "$path"; done
 getent passwd sudo-secretspec >/dev/null
 getent group sudo-secretspec >/dev/null
 meta /var/lib/sudo-secretspec '700 sudo-secretspec:sudo-secretspec'
 ok 'default uninstall retains the service identity and vault'
 SUDO_USER=opuser "$bootstrap" install --adopt-existing --vault /var/lib/sudo-secretspec --declarations "$work/secretspec.toml" --non-interactive
-/usr/local/bin/sudo-secretspec uninstall --purge-vault --remove-service-user --non-interactive
-absent /var/lib/sudo-secretspec
-! getent passwd sudo-secretspec
-! getent group sudo-secretspec
-ok 'explicit purge removes vault and service identity'
+must_fail 'purge of adopted vault' /usr/bin/sudo-secretspec uninstall --purge-vault --remove-service-user --non-interactive > "$work/adopted-denied.txt" 2>&1
+cat "$work/adopted-denied.txt"
+grep -F 'the vault was adopted' "$work/adopted-denied.txt"
+meta /var/lib/sudo-secretspec '700 sudo-secretspec:sudo-secretspec'
+[[ -f /etc/sudo-secretspec.toml && -f /etc/sudoers.d/sudo-secretspec ]]
+/usr/bin/sudo-secretspec uninstall --remove-service-user --non-interactive
+# This disposable adopted fixture requires manual teardown, as asserted above.
+rm -rf /var/lib/sudo-secretspec
+must_fail 'service user lookup after removal' getent passwd sudo-secretspec
+must_fail 'service group lookup after removal' getent group sudo-secretspec
+ok 'adopted purge refusal preserves the boundary before removal'
 ln -s /nonexistent /run/current-system
 set +e
 install_boundary > "$work/nixos.txt" 2>&1
@@ -117,9 +171,15 @@ grep -F 'services.sudo-secretspec' "$work/nixos.txt"
 absent /etc/sudo-secretspec.toml
 ok 'dangling NixOS system marker refuses install with exit 2 before mutation'
 rm /run/current-system
+touch /etc/NIXOS
+must_fail 'NixOS chroot install' install_boundary > "$work/nixos-chroot.txt" 2>&1
+cat "$work/nixos-chroot.txt"
+grep -F 'services.sudo-secretspec' "$work/nixos-chroot.txt"
+absent /etc/sudo-secretspec.toml
+rm /etc/NIXOS
 install_boundary
-/usr/local/bin/sudo-secretspec doctor
+/usr/bin/sudo-secretspec doctor
 ok 'ordinary Debian installation works again after removing the NixOS marker'
-/usr/local/bin/sudo-secretspec uninstall --purge-vault --remove-service-user --non-interactive
+/usr/bin/sudo-secretspec uninstall --purge-vault --remove-service-user --non-interactive
 visudo -c
 ok 'final cleanup complete; Debian installer smoke passed'

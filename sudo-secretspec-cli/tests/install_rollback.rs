@@ -47,7 +47,11 @@ fn write_pair(dir: &std::path::Path, index: usize, dest: &str, body: &[u8], mani
 fn plan_restore_requires_a_manifest() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("0.prior"), b"x").unwrap();
-    std::fs::write(dir.path().join("0.path"), "/usr/local/bin/sudo-secretspec").unwrap();
+    std::fs::write(
+        dir.path().join("0.path"),
+        platform::client_path(platform::host()),
+    )
+    .unwrap();
 
     let err = sudo_secretspec_cli::rollback::plan_restore(dir.path())
         .expect_err("a snapshot without a manifest must be refused");
@@ -80,7 +84,7 @@ fn plan_restore_refuses_bytes_that_do_not_match_the_manifest() {
     write_pair(
         dir.path(),
         0,
-        "/usr/local/bin/sudo-secretspec",
+        platform::client_path(platform::host()),
         b"original",
         &mut manifest,
     );
@@ -151,8 +155,13 @@ fn a_valid_policy_stages_without_touching_the_live_path() {
 fn the_shipped_policy_parses_and_gates_boundary_lifecycle() {
     let dir = tempfile::tempdir().unwrap();
     let dst = dir.path().join("sudo-secretspec");
+    let host = if platform::IS_MACOS {
+        platform::Host::MacOs
+    } else {
+        platform::Host::Linux
+    };
     let policy = sudo_secretspec_cli::install::sudoers_text_for_host(
-        platform::host(),
+        host,
         "someoperator",
         platform::DEFAULT_USER,
     )
@@ -165,7 +174,10 @@ fn the_shipped_policy_parses_and_gates_boundary_lifecycle() {
     // Per-operation authentication for the client path. Without this the gate
     // is sudo's shared 5-minute timestamp, which any other command can satisfy.
     assert!(
-        policy.contains("Defaults!/usr/local/bin/sudo-secretspec timestamp_timeout=0\n"),
+        policy.contains(&format!(
+            "Defaults!{} timestamp_timeout=0\n",
+            platform::client_path(host)
+        )),
         "{policy}"
     );
     // The broker stays NOPASSWD: mediated credential operations are the
@@ -178,7 +190,7 @@ fn the_shipped_policy_parses_and_gates_boundary_lifecycle() {
     // client path carries no NOPASSWD rule at all; it rides the host's own
     // admin grant, which is what `timestamp_timeout=0` then constrains.
     assert!(
-        !policy.contains("NOPASSWD: /usr/local/bin/sudo-secretspec"),
+        !policy.contains(&format!("NOPASSWD: {}", platform::client_path(host))),
         "{policy}"
     );
     // The broker must not inherit the caller's HOME: the engine resolves its
@@ -233,7 +245,9 @@ fn installed_artifact_table_pins_the_sensitive_modes() {
         Some(0o440)
     );
     assert_eq!(
-        artifact_mode(std::path::Path::new("/usr/local/bin/sudo-secretspec")),
+        artifact_mode(std::path::Path::new(
+            platform::client_path(platform::host())
+        )),
         Some(0o755)
     );
     assert_eq!(

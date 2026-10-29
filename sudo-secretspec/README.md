@@ -69,7 +69,7 @@ for the Homebrew safety boundary.
 ## Linux
 
 Which Linux you are on decides how the boundary is managed, and it is decided
-from the running system (`/run/current-system`), not from how the binary was
+from the running system (`/run/current-system` or `/etc/NIXOS`), not from how the binary was
 built:
 
 | System | How the boundary is managed |
@@ -88,7 +88,7 @@ sudo-secretspec doctor
 
 | Path | Role |
 |---|---|
-| `/usr/local/bin/sudo-secretspec` | public client (on `PATH`) |
+| `/usr/bin/sudo-secretspec` | public client (on `PATH`) |
 | `/usr/libexec/sudo-secretspec` | privileged broker (a separate copy of the binary) |
 | `/etc/sudo-secretspec.toml` | protected config |
 | `/etc/sudoers.d/sudo-secretspec` | NOPASSWD broker policy for the operator |
@@ -100,7 +100,8 @@ NOPASSWD covers only the broker path and the mediated broker verbs: never
 `install`, `uninstall`, `rollback` or `doctor` (they ask for the operator's
 password every time, because the client carries `timestamp_timeout=0`), and
 never `ALL`. `uninstall` removes the service user and group only when they are
-the dedicated service identity.
+the default dedicated service identity. Purging on Linux also requires the
+default vault path; adopted vaults must be removed by hand.
 
 ## Removing it
 

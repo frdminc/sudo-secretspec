@@ -108,17 +108,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   boundary as on macOS with Linux paths: system service user and group
   `sudo-secretspec`, vault `/var/lib/sudo-secretspec` (0700), protected
   `/etc/sudo-secretspec.toml`, a broker at `/usr/libexec/sudo-secretspec` that
-  is a different file from the public client at `/usr/local/bin/sudo-secretspec`,
+  is a different file from the public client at `/usr/bin/sudo-secretspec`,
   and `/etc/sudoers.d/sudo-secretspec`, which is validated with `visudo` before
   it can take effect. The policy grants NOPASSWD only for the broker path and
   the mediated broker verbs, never for `install`, `uninstall`, `rollback` or
   `doctor`, and `timestamp_timeout=0` on the client makes those always ask for a
   password. `secure_path` names `/usr/bin` and `/usr/local/bin`. `doctor`
-  checks this layout (root:root ownership, POSIX ACLs, the `/etc/sudoers`
+  checks this layout (root and service ownership, POSIX ACLs, the `/etc/sudoers`
   `@includedir`, shadowing clients on `PATH`) instead of the macOS one.
 
-- NixOS is now detected from the running system (`/run/current-system`), not
-  from `target_os`: a build made on Debian refuses the imperative lifecycle
+- NixOS is now detected from the running system (`/run/current-system` or
+  `/etc/NIXOS`), not from `target_os`: a build made on Debian refuses the imperative lifecycle
   commands when it runs on NixOS, and a build with a baked
   `SUDO_SECRETSPEC_BROKER_PATH` (the NixOS package) refuses them everywhere.
   The NixOS module's sudoers policy text is unchanged.
@@ -446,6 +446,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   restores the document byte for byte.
 
 ### Fixed
+
+- `sudo-secretspec rollback` preserves root and service ownership when restoring
+  installed files on macOS and Linux, so a restored boundary passes `doctor`.
+- Fresh installs on macOS and Linux refuse an existing service group unless it
+  is explicitly adopted. Linux uninstall refuses destructive cleanup of
+  non-default service identities and vault paths.
 
 - Scaleway: `secretspec set` on a secret that already exists adds a new version
   instead of failing with HTTP 400 "cannot have same secret name in same path".

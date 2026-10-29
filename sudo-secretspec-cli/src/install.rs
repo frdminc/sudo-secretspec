@@ -116,6 +116,21 @@ fn installed_artifacts_for_host(host: platform::Host) -> Vec<(PathBuf, u32)> {
     ]
 }
 
+/// Ownership shared by installation and rollback. The public client and policy
+/// belong to root; broker, config and shared assets belong to the service.
+pub(crate) fn artifact_owner(
+    host: platform::Host,
+    path: &Path,
+    service_user: &str,
+    service_group: &str,
+) -> String {
+    if path == Path::new(platform::client_path(host)) || path == Path::new(SUDOERS_PATH) {
+        format!("root:{}", platform::root_group(host))
+    } else {
+        format!("{service_user}:{service_group}")
+    }
+}
+
 /// Installed mode for `path`, or `None` when it is not an owned artifact.
 pub fn artifact_mode(path: &Path) -> Option<u32> {
     installed_artifacts()
@@ -351,14 +366,18 @@ fn write_bytes(
     Ok(())
 }
 
-/// A Linux install must not succeed with the wrong owner; staging remains usable
+/// An install must not succeed with the wrong owner; staging remains usable
 /// by unprivileged callers for syntax-only checks, as it was on macOS.
-fn set_owner(host: platform::Host, path: &Path, owner: &str) -> Result<(), InstallError> {
+pub(crate) fn set_owner(
+    host: platform::Host,
+    path: &Path,
+    owner: &str,
+) -> Result<(), InstallError> {
     let status = Command::new(platform::chown_path(host))
         .arg(owner)
         .arg(path)
         .status();
-    if host == platform::Host::Linux && unsafe { libc::geteuid() } == 0 && !status?.success() {
+    if unsafe { libc::geteuid() } == 0 && !status?.success() {
         return Err(InstallError::Denied(format!(
             "cannot set owner {owner} on {}",
             path.display()
@@ -510,6 +529,7 @@ fn ensure_service_group(
         .args([".", "-read", &format!("/Groups/{name}"), "PrimaryGroupID"])
         .output()?;
     if output.status.success() {
+        refuse_implicit_group_adoption(name, create)?;
         let text = String::from_utf8_lossy(&output.stdout);
         let gid = text
             .split_whitespace()
@@ -671,6 +691,7 @@ fn account_id(entry: &str, field: usize) -> Result<u32, InstallError> {
 
 fn ensure_linux_service_group(name: &str, create: bool) -> Result<u32, InstallError> {
     if let Some(entry) = linux_account("group", name)? {
+        refuse_implicit_group_adoption(name, create)?;
         return account_id(&entry, 2);
     }
     if !create {
@@ -686,6 +707,25 @@ fn ensure_linux_service_group(name: &str, create: bool) -> Result<u32, InstallEr
     let entry = linux_account("group", name)?
         .ok_or_else(|| InstallError::Denied(format!("created group missing: {name}")))?;
     account_id(&entry, 2)
+}
+
+fn refuse_implicit_group_adoption(name: &str, create: bool) -> Result<(), InstallError> {
+    if create {
+        return Err(InstallError::Denied(format!(
+            "service group {name} already exists; use --adopt-existing"
+        )));
+    }
+    Ok(())
+}
+
+fn service_group_exists(host: platform::Host, name: &str) -> Result<bool, InstallError> {
+    if host == platform::Host::Linux {
+        return Ok(linux_account("group", name)?.is_some());
+    }
+    Ok(Command::new("/usr/bin/dscl")
+        .args([".", "-read", &format!("/Groups/{name}"), "PrimaryGroupID"])
+        .status()?
+        .success())
 }
 
 fn ensure_linux_service_user(
@@ -836,8 +876,7 @@ fn protected_ancestors(host: platform::Host) -> &'static [&'static str] {
             "/etc",
             "/etc/sudoers.d",
             "/usr",
-            "/usr/local",
-            "/usr/local/bin",
+            "/usr/bin",
             "/usr/libexec",
             "/usr/share",
             "/usr/share/sudo-secretspec",
@@ -856,11 +895,7 @@ fn validate_protected_ancestors(host: platform::Host) -> Result<(), InstallError
         let optional = host == platform::Host::Linux
             && matches!(
                 dir,
-                "/etc/sudoers.d"
-                    | "/usr/local"
-                    | "/usr/local/bin"
-                    | "/usr/libexec"
-                    | "/usr/share/sudo-secretspec"
+                "/etc/sudoers.d" | "/usr/libexec" | "/usr/share/sudo-secretspec"
             );
         if optional
             && fs::symlink_metadata(path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
@@ -984,8 +1019,7 @@ fn resolve_source_root(explicit: Option<&Path>) -> Result<PathBuf, InstallError>
     }
     let self_exe = std::env::current_exe()
         .map_err(|e| InstallError::Denied(format!("cannot resolve current exe: {e}")))?;
-    // On FHS Linux the client lives under /usr/local but the boundary's media
-    // shape is under /usr. Point installed-client invocations at that boundary
+    // Point installed-client invocations at the installed boundary
     // so resolve_media catches a self-install instead of reporting missing media.
     if same_file(
         &self_exe,
@@ -1392,7 +1426,8 @@ fn run_for_host(host: platform::Host, req: InstallRequest) -> Result<(), Install
                 .arg(&req.service_user)
                 .status()
                 .map(|s| s.success())
-                .unwrap_or(false))
+                .unwrap_or(false)
+            || service_group_exists(host, &req.service_group)?)
     {
         return Err(fresh_install_refusal(req.declarations.as_deref()));
     }
@@ -1556,13 +1591,7 @@ fn run_for_host(host: platform::Host, req: InstallRequest) -> Result<(), Install
             prepare_install_dir(&PathBuf::from(PREFIX).join(dir))?;
         }
     } else {
-        for dir in [
-            "/usr/local",
-            "/usr/local/bin",
-            "/usr/libexec",
-            "/usr/share",
-            "/etc/sudoers.d",
-        ] {
+        for dir in ["/usr/bin", "/usr/libexec", "/usr/share", "/etc/sudoers.d"] {
             prepare_install_dir(Path::new(dir))?;
         }
     }
@@ -1575,7 +1604,7 @@ fn run_for_host(host: platform::Host, req: InstallRequest) -> Result<(), Install
     let rollback = libexec.join(format!("{SNAPSHOT_PREFIX}{stamp}"));
     let captured = capture_snapshot(host, &rollback)?;
 
-    let root_owner = format!("root:{}", platform::root_group(host));
+    let owner = |path: &Path| artifact_owner(host, path, &req.service_user, &req.service_group);
     let service_owner = format!("{}:{}", req.service_user, req.service_group);
 
     install_file(
@@ -1583,14 +1612,14 @@ fn run_for_host(host: platform::Host, req: InstallRequest) -> Result<(), Install
         &media.broker,
         &client_dst,
         require_mode(&client_dst)?,
-        &root_owner,
+        &owner(&client_dst),
     )?;
     install_file(
         host,
         &media.broker,
         &broker_dst,
         require_mode(&broker_dst)?,
-        &service_owner,
+        &owner(&broker_dst),
     )?;
     if let Some(decl) = &req.declarations {
         install_file(
@@ -1598,7 +1627,7 @@ fn run_for_host(host: platform::Host, req: InstallRequest) -> Result<(), Install
             decl,
             &declarations_dst,
             require_mode(&declarations_dst)?,
-            &service_owner,
+            &owner(&declarations_dst),
         )?;
     }
     install_file(
@@ -1606,21 +1635,21 @@ fn run_for_host(host: platform::Host, req: InstallRequest) -> Result<(), Install
         &media.retired,
         &retired_dst,
         require_mode(&retired_dst)?,
-        &service_owner,
+        &owner(&retired_dst),
     )?;
     install_file(
         host,
         &media.guidance,
         &guidance_dst,
         require_mode(&guidance_dst)?,
-        &service_owner,
+        &owner(&guidance_dst),
     )?;
     write_bytes(
         host,
         &config_dst,
         config_toml(&req, &vault_real).as_bytes(),
         require_mode(&config_dst)?,
-        &service_owner,
+        &owner(&config_dst),
     )?;
     // Validated before it can take effect, and rolled back if the combined
     // configuration is rejected — a broken sudoers.d file would leave the
@@ -1648,7 +1677,7 @@ fn run_for_host(host: platform::Host, req: InstallRequest) -> Result<(), Install
         &manifest_dst,
         manifest.as_bytes(),
         require_mode(&manifest_dst)?,
-        &service_owner,
+        &owner(&manifest_dst),
     )?;
 
     // Runtime files for fresh install only.
@@ -2048,7 +2077,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("Defaults!/usr/local/bin/sudo-secretspec timestamp_timeout=0\n"),
+            text.contains("Defaults!/usr/bin/sudo-secretspec timestamp_timeout=0\n"),
             "{text}"
         );
         let grants: Vec<_> = text.lines().filter(|l| l.contains("NOPASSWD:")).collect();
@@ -2244,9 +2273,47 @@ mod tests {
         let artifacts = installed_artifacts_for_host(platform::Host::Linux);
         assert_eq!(
             artifacts[0],
-            (PathBuf::from("/usr/local/bin/sudo-secretspec"), 0o755)
+            (PathBuf::from("/usr/bin/sudo-secretspec"), 0o755)
         );
         assert_ne!(artifacts[0].0, artifacts[1].0);
+    }
+
+    #[test]
+    fn artifact_ownership_plan_preserves_root_and_service_roles_on_both_hosts() {
+        for host in [platform::Host::MacOs, platform::Host::Linux] {
+            let artifacts = installed_artifacts_for_host(host);
+            for (index, (path, _)) in artifacts.iter().enumerate() {
+                let expected = if index == 0 || path == Path::new(SUDOERS_PATH) {
+                    format!("root:{}", platform::root_group(host))
+                } else {
+                    "dedicated:dedicated-group".into()
+                };
+                assert_eq!(
+                    artifact_owner(host, path, "dedicated", "dedicated-group"),
+                    expected,
+                    "{}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_existing_group_requires_explicit_adoption() {
+        let err = refuse_implicit_group_adoption("dedicated", true).unwrap_err();
+        assert!(err.to_string().contains("--adopt-existing"));
+        assert!(refuse_implicit_group_adoption("dedicated", false).is_ok());
+    }
+
+    #[test]
+    fn linux_protected_ancestors_exclude_staff_writable_local_directories() {
+        let dirs = protected_ancestors(platform::Host::Linux);
+        assert!(dirs.contains(&"/usr/bin"));
+        assert!(
+            !dirs
+                .iter()
+                .any(|dir| Path::new(dir).starts_with("/usr/local"))
+        );
     }
 
     #[test]
@@ -2474,10 +2541,15 @@ mod tests {
         // The scenario is a host carrying a legacy Intel-Homebrew `chown -R` of
         // /usr/local: the directory exists, looks ordinary, and is writable by
         // an unprivileged user — who could then replace the binary root
-        // executes through the NOPASSWD rule. A tempdir is owned by whoever
-        // runs the tests, which is the same condition.
+        // executes through the NOPASSWD rule. Set an unprivileged owner when
+        // the test runner itself is root, as in the Debian CI container.
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("bin");
+        fs::create_dir(&path).unwrap();
+        if unsafe { libc::geteuid() } == 0 {
+            std::os::unix::fs::chown(&path, Some(65534), None).unwrap();
+        }
+        assert_ne!(fs::metadata(&path).unwrap().uid(), 0);
 
         let err = prepare_install_dir(&path).expect_err("a user-owned prefix must be refused");
         assert!(
