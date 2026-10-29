@@ -29,14 +29,14 @@
 # at manifest load before that guard, so here we assert only "no password
 # demanded + non-zero exit", the exact refusal being a Rust unit test.
 #
-# This is a `nixosTest`: it needs a hypervisor (QEMU), so it only runs on Linux
+# This is a `testers.nixosTest`: it needs a hypervisor (QEMU), so it only runs on Linux
 # and only in CI (Forgejo/Hyades), not on a macOS dev box. The module's
 # import-from-derivation (the `print-sudoers` runCommand) also requires
 # `allow-import-from-derivation = true` when evaluating the flake.
 {
   pkgs,
   self,
-}: pkgs.nixosTest {
+}: pkgs.testers.nixosTest {
   name = "sudo-secretspec";
 
   nodes.machine = {
