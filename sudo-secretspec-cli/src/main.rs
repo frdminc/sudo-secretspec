@@ -567,48 +567,47 @@ fn run_install(
         adopt_existing,
     );
 
-    if let Some(existing) = detect_existing_vault() {
-        if vault.is_none() {
-            // Adopting is the default only when the installed root-owned config
-            // named this vault -- the boundary vouching for the store it already
-            // serves from, which makes a reinstall an upgrade rather than a trust
-            // decision. Upgrades are the common case (a fresh install happens once
-            // per host), and refusing them taught scripts to "fix" the refusal by
-            // deleting the vault.
-            //
-            // A path-scanned vault keeps demanding the flag. There the vault is a
-            // guess, and one of the candidates is the retired wrapper's store that
-            // migration deliberately leaves on disk -- silently binding a new
-            // boundary to retired secrets is exactly what `detect_existing_vault`
-            // exists to prevent. Announce the automatic adoption either way, so an
-            // operator who believed they were installing clean finds out here.
-            let adopt_by_default =
-                sudo_secretspec_cli::install::adopts_without_flag(existing.origin);
-            if adopt_existing
-                || adopt_by_default
-                || (!non_interactive
-                    && is_tty()
-                    && prompt_yes_no(
-                        &format!(
-                            "Found existing vault at {}. Adopt it?",
-                            existing.vault.display()
-                        ),
-                        true,
-                    ))
-            {
-                if adopt_by_default && !adopt_existing {
-                    eprintln!(
-                        "adopting the installed vault at {} (recorded in {}); \
-                         pass --vault to install elsewhere",
-                        existing.vault.display(),
-                        CONFIG_PATH,
-                    );
-                }
-                req.adopt_existing = true;
-                req.vault = existing.vault;
-                req.service_user = existing.service_user;
-                req.service_group = existing.service_group;
+    if let Some(existing) = detect_existing_vault()
+        && vault.is_none()
+    {
+        // Adopting is the default only when the installed root-owned config
+        // named this vault -- the boundary vouching for the store it already
+        // serves from, which makes a reinstall an upgrade rather than a trust
+        // decision. Upgrades are the common case (a fresh install happens once
+        // per host), and refusing them taught scripts to "fix" the refusal by
+        // deleting the vault.
+        //
+        // A path-scanned vault keeps demanding the flag. There the vault is a
+        // guess, and one of the candidates is the retired wrapper's store that
+        // migration deliberately leaves on disk -- silently binding a new
+        // boundary to retired secrets is exactly what `detect_existing_vault`
+        // exists to prevent. Announce the automatic adoption either way, so an
+        // operator who believed they were installing clean finds out here.
+        let adopt_by_default = sudo_secretspec_cli::install::adopts_without_flag(existing.origin);
+        if adopt_existing
+            || adopt_by_default
+            || (!non_interactive
+                && is_tty()
+                && prompt_yes_no(
+                    &format!(
+                        "Found existing vault at {}. Adopt it?",
+                        existing.vault.display()
+                    ),
+                    true,
+                ))
+        {
+            if adopt_by_default && !adopt_existing {
+                eprintln!(
+                    "adopting the installed vault at {} (recorded in {}); \
+                     pass --vault to install elsewhere",
+                    existing.vault.display(),
+                    CONFIG_PATH,
+                );
             }
+            req.adopt_existing = true;
+            req.vault = existing.vault;
+            req.service_user = existing.service_user;
+            req.service_group = existing.service_group;
         }
     }
 
@@ -626,10 +625,11 @@ fn run_install(
     }
     if let Some(o) = operator {
         req.operator = o;
-    } else if !non_interactive && is_tty() {
-        if let Some(o) = prompt_line("Operator username for sudoers", Some(&req.operator)) {
-            req.operator = o;
-        }
+    } else if !non_interactive
+        && is_tty()
+        && let Some(o) = prompt_line("Operator username for sudoers", Some(&req.operator))
+    {
+        req.operator = o;
     }
 
     // Install itself needs interactive sudo/Touch ID, not NOPASSWD -n.

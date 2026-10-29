@@ -1384,12 +1384,12 @@ fn run_for_host(host: platform::Host, req: InstallRequest) -> Result<(), Install
     validate_vault_realpath(&initial_vault_real, Path::new(platform::VAULT_REAL_PARENT))?;
     crate::config::Config::parse(&config_toml(&req, &initial_vault_real))
         .map_err(|e| InstallError::Denied(e.to_string()))?;
-    if let Some(decl) = &req.declarations {
-        if !decl.is_file() || decl.is_symlink() {
-            return Err(InstallError::Denied(
-                "declarations must be a regular file".into(),
-            ));
-        }
+    if let Some(decl) = &req.declarations
+        && (!decl.is_file() || decl.is_symlink())
+    {
+        return Err(InstallError::Denied(
+            "declarations must be a regular file".into(),
+        ));
     }
     validate_protected_ancestors(host)?;
 

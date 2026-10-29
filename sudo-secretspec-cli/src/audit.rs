@@ -96,7 +96,7 @@ impl Outcome {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn from_label(s: &str) -> Option<Self> {
         match s {
             "attempt" => Some(Outcome::Attempt),
             "success" => Some(Outcome::Success),
@@ -135,7 +135,7 @@ impl ClientFamily {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn from_label(s: &str) -> Option<Self> {
         match s {
             "hermes" => Some(ClientFamily::Hermes),
             "claude" => Some(ClientFamily::Claude),
@@ -335,12 +335,12 @@ fn check_protected_dir(path: &Path, expected_uid: Option<u32>) -> Result<(), Aud
         ));
     }
 
-    if let Some(uid) = expected_uid {
-        if meta.uid() != uid {
-            return Err(AuditError::Denied(
-                "protected directory owner mismatch".into(),
-            ));
-        }
+    if let Some(uid) = expected_uid
+        && meta.uid() != uid
+    {
+        return Err(AuditError::Denied(
+            "protected directory owner mismatch".into(),
+        ));
     }
 
     Ok(())
@@ -371,10 +371,10 @@ fn check_ledger_metadata(path: &Path, expected_uid: Option<u32>) -> Result<(), A
         return Err(AuditError::Denied("ledger must be mode 0600".into()));
     }
 
-    if let Some(uid) = expected_uid {
-        if meta.uid() != uid {
-            return Err(AuditError::Denied("ledger owner mismatch".into()));
-        }
+    if let Some(uid) = expected_uid
+        && meta.uid() != uid
+    {
+        return Err(AuditError::Denied("ledger owner mismatch".into()));
     }
 
     Ok(())
@@ -690,10 +690,10 @@ fn verify_rows(conn: &Connection) -> Result<(String, i64), AuditError> {
         let transaction = uuid::Uuid::parse_str(&transaction_id)
             .map_err(|e| AuditError::Denied(format!("invalid transaction UUID in ledger: {e}")))?;
 
-        let phase = Outcome::from_str(&phase_str)
+        let phase = Outcome::from_label(&phase_str)
             .ok_or_else(|| AuditError::Denied(format!("invalid phase in ledger: {phase_str}")))?;
 
-        let client = ClientFamily::from_str(&client_str)
+        let client = ClientFamily::from_label(&client_str)
             .ok_or_else(|| AuditError::Denied(format!("invalid client in ledger: {client_str}")))?;
 
         let names: Vec<String> = serde_json::from_str(&names_json)
@@ -896,14 +896,14 @@ pub fn append_event(
     };
 
     // Command basename
-    if let Some(ref basename) = request.command_basename {
-        if !is_valid_command_basename(basename) {
-            return Err(AuditError::Denied("invalid command basename".into()));
-        }
+    if let Some(ref basename) = request.command_basename
+        && !is_valid_command_basename(basename)
+    {
+        return Err(AuditError::Denied("invalid command basename".into()));
     }
 
     // Names
-    let mut clean_names: Vec<String> = request.names.iter().cloned().collect();
+    let mut clean_names: Vec<String> = request.names.to_vec();
     clean_names.sort();
     clean_names.dedup();
     {
@@ -1805,7 +1805,7 @@ mod tests {
             "unknown",
         ] {
             let dir = protected_dir(&tmp.path().join(client_str));
-            let client = ClientFamily::from_str(client_str).unwrap();
+            let client = ClientFamily::from_label(client_str).unwrap();
             let r = append_event(
                 &dir,
                 AppendEventRequest {
