@@ -92,8 +92,11 @@ grep -Fx 'Defaults!/usr/bin/sudo-secretspec timestamp_timeout=0' "$policy"
 ok 'only the eleven broker verbs are granted NOPASSWD; Debian PATH and client timeout are pinned'
 su opuser -c 'sudo -n -l' > "$work/sudo-list.txt"
 cat "$work/sudo-list.txt"
-grep -F '/usr/libexec/sudo-secretspec __broker source-get --*' "$work/sudo-list.txt"
-grep -F '/usr/libexec/sudo-secretspec __broker audit-verify' "$work/sudo-list.txt"
+# sudo wraps this human-readable listing to the terminal width. Preserve the
+# full command assertion while treating those display line breaks as spaces.
+tr -s '[:space:]' ' ' < "$work/sudo-list.txt" > "$work/sudo-list-flat.txt"
+grep -F '/usr/libexec/sudo-secretspec __broker source-get --*' "$work/sudo-list-flat.txt"
+grep -F '/usr/libexec/sudo-secretspec __broker audit-verify' "$work/sudo-list-flat.txt"
 ok 'operator can list the mediated broker grants without a password'
 if su opuser -c 'sudo -n /usr/bin/sudo-secretspec install --declarations x' > "$work/denied.txt" 2>&1; then
   echo 'FAIL: install unexpectedly allowed without authentication' >&2; exit 1
