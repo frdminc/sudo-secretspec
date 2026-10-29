@@ -876,6 +876,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tells readers to check each `doctor` finding's `advisory` field instead of
   matching a hardcoded list of codes, and flags `CLIENT_SHADOWED` as a hard
   stop.
+- `doctor --config` can no longer be used to read an arbitrary file as root.
+  The NOPASSWD sudoers grant allowed `sudo -n sudo-secretspec doctor --config
+  <path>` to echo a file's contents — including files only root can read —
+  through the config parse error. The elevated doctor now refuses any
+  `--config` that is not the installed config, the unprivileged client no
+  longer forwards `--config` across the privilege boundary, the config read
+  itself refuses symlinks, and a parse failure while privileged reports a
+  fixed message instead of quoting the file. Re-run `sudo-secretspec install`
+  to pick up the rebuilt boundary.
 
 ## [0.19.1] - 2026-08-11
 

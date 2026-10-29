@@ -11,7 +11,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -219,7 +219,16 @@ fn finding(code: &str, path: Option<&Path>, detail: impl Into<String>) -> Findin
 
 /// Load and validate the protected TOML configuration at `path`.
 pub fn load_config(path: &Path) -> Result<Layout, DriftError> {
-    let content = fs::read_to_string(path)?;
+    // `O_NOFOLLOW`: refuse to follow a symlink. This function is also used by
+    // the privileged `doctor`, and a symlinked config could redirect a root
+    // read at an arbitrary file (e.g. `doctor --config /tmp/link`). The failure
+    // surfaces as `Io` without ever opening the target.
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let mut content = String::new();
+    std::io::Read::read_to_string(&mut file, &mut content)?;
     let cfg = Config::parse(&content)?;
     Ok(Layout::from_config(cfg, path.to_path_buf()))
 }
@@ -1149,6 +1158,20 @@ service_group = "_sudo_secretspec"
             PathBuf::from("/usr/local/bin/sudo-secretspec")
         );
         assert_eq!(layout.vault, PathBuf::from("/var/db/sudo-secretspec"));
+    }
+
+    #[test]
+    fn load_config_refuses_a_symlink() {
+        // `load_config` opens with O_NOFOLLOW, so a config reached through a
+        // symlink must be rejected before the target is read. This is the
+        // defence-in-depth for C1: even if a root `doctor` is handed an
+        // attacker-chosen path that is a symlink into a root-only file, the
+        // read itself fails rather than following the link.
+        let tmp = tempdir().unwrap();
+        let real = write_cfg(tmp.path());
+        let link = tmp.path().join("link.toml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(load_config(&link).is_err());
     }
 
     #[test]

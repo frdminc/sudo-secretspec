@@ -1029,6 +1029,34 @@ fn probe_available_build(unprivileged: bool) -> Option<sudo_secretspec_cli::Avai
         })
 }
 
+/// Enforce the privilege boundary on the config the privileged `doctor` reads.
+///
+/// The installed config is root-owned and read-only (`0444`). A root `doctor`
+/// that accepted a caller-chosen `--config` would read whatever file the caller
+/// named with root authority, so refuse anything that is not a plain,
+/// root-owned, non-group/world-writable regular file. Every message here is a
+/// fixed string: the failure must never echo the file's contents.
+fn assert_privileged_config(path: &Path) -> Result<(), &'static str> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(_) => return Err("config is missing or unreadable"),
+    };
+    if meta.file_type().is_symlink() {
+        return Err("config is a symlink");
+    }
+    if !meta.file_type().is_file() {
+        return Err("config is not a regular file");
+    }
+    if meta.uid() != 0 {
+        return Err("config is not root-owned");
+    }
+    if meta.permissions().mode() & 0o022 != 0 {
+        return Err("config is group- or world-writable");
+    }
+    Ok(())
+}
+
 fn doctor(
     json: bool,
     config: Option<PathBuf>,
@@ -1039,6 +1067,35 @@ fn doctor(
     // has to be told what the caller's PATH was before elevating. Trust the
     // ambient value only while still unprivileged.
     let unprivileged = unsafe { libc::geteuid() } != 0;
+
+    // A privileged `doctor` may only read the installed config. `--config` must
+    // never reach root: the unprivileged client no longer forwards it, and a
+    // direct `sudo … doctor --config <path>` is refused here unless the path is
+    // the installed `CONFIG_PATH` itself. This closes the disclosure where a
+    // NOPASSWD root `doctor` echoed an arbitrary file's contents.
+    if !unprivileged {
+        if let Some(cfg) = &config {
+            let is_default = match (
+                Path::new(CONFIG_PATH).canonicalize(),
+                cfg.canonicalize(),
+            ) {
+                (Ok(installed), Ok(given)) => installed == given,
+                _ => false,
+            };
+            if !is_default {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"ok": false, "error": "config invalid"})
+                    );
+                } else {
+                    eprintln!("doctor: refusing a non-default --config while privileged");
+                }
+                std::process::exit(1);
+            }
+        }
+    }
+
     let caller_path = caller_path.or_else(|| {
         if unprivileged {
             std::env::var_os("PATH")
@@ -1057,9 +1114,9 @@ fn doctor(
             if json {
                 cmd.arg("--json");
             }
-            if let Some(cfg) = &config {
-                cmd.arg("--config").arg(cfg);
-            }
+            // `--config` is deliberately not forwarded: the privileged doctor
+            // must only ever read the installed `CONFIG_PATH`. See the refusal
+            // guard at the top of this function.
             if with_hints {
                 if let Some(path) = &caller_path {
                     cmd.arg("--caller-path").arg(path);
@@ -1119,16 +1176,51 @@ fn doctor(
     }
 
     let config = config.unwrap_or_else(|| PathBuf::from(CONFIG_PATH));
-    let layout = match sudo_secretspec_cli::load_config(&config) {
-        Ok(l) => l,
-        Err(e) => {
+
+    // The privileged doctor must not open a config it does not own: reject a
+    // non-root-owned, group-writable or world-writable file before reading it.
+    // The unprivileged path reads the operator's own file as themselves and
+    // needs no such check.
+    if !unprivileged {
+        if let Err(reason) = assert_privileged_config(&config) {
             if json {
                 println!(
                     "{}",
-                    serde_json::json!({"ok": false, "error": format!("{e}")})
+                    serde_json::json!({"ok": false, "error": "config invalid"})
                 );
             } else {
-                eprintln!("doctor: config error: {e}");
+                eprintln!("doctor: config invalid ({reason})");
+            }
+            std::process::exit(1);
+        }
+    }
+
+    let layout = match sudo_secretspec_cli::load_config(&config) {
+        Ok(l) => l,
+        Err(e) => {
+            if unprivileged {
+                // The operator read their own file as themselves; echoing the
+                // parse error is safe and useful.
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"ok": false, "error": format!("{e}")})
+                    );
+                } else {
+                    eprintln!("doctor: config error: {e}");
+                }
+            } else {
+                // Privileged: a parse error can quote the file's contents, so
+                // never echo it — an arbitrary `--config` must not leak a
+                // root-only file through the error path.
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"ok": false, "error": "config invalid"})
+                    );
+                } else {
+                    eprintln!("doctor: config invalid");
+                }
             }
             std::process::exit(1);
         }
