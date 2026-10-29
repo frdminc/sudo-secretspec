@@ -67,10 +67,14 @@ loaded into agent context automatically.
 
 ## Useful commands
 
-The companion is macOS-only, so it is excluded from the workspace-wide test
+The companion targets macOS and Linux (ordinary Linux through the imperative
+installer, NixOS through the module; the running system decides, see
+`platform::host`). It is excluded from the workspace-wide test
 invocations in `.github/workflows/test.yml` and `devenv.nix` (they also run on
-Linux and Windows, where `libc`/`dscl`/`/private/var` do not exist). Its suite
-runs in `.github/workflows/sudo-release.yml` on macOS. Test it locally with
+Linux and Windows without its system tools: `dscl`, `useradd`, `/private/var`).
+Its suite runs in `.github/workflows/sudo-release.yml` on macOS and in the
+`debian` job of the `ci/base` overlay (`linux-ci.yml`, with
+`scripts/debian-smoke.sh`). Test it locally with
 `-p`, never by relying on `cargo test --all`.
 
 ```bash

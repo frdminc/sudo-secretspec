@@ -4,7 +4,9 @@ Privilege-separated SecretSpec companion for this fork
 (`frdminc/sudo-secretspec`).
 
 Upstream SecretSpec remains the declaration/provider engine. This companion adds
-a single mediated control plane for autonomous local AI/operator use on macOS.
+a single mediated control plane for autonomous local AI/operator use on macOS
+and on Linux (Debian and other non-NixOS systems through the imperative
+installer; NixOS through `services.sudo-secretspec`).
 
 ## Quick start (short forms)
 
@@ -63,6 +65,42 @@ sudo-secretspec install \
 Privileged boundary creation always requires an explicit `sudo-secretspec
 install` (Touch ID/sudo); see [`../packaging/README.md`](../packaging/README.md)
 for the Homebrew safety boundary.
+
+## Linux
+
+Which Linux you are on decides how the boundary is managed, and it is decided
+from the running system (`/run/current-system`), not from how the binary was
+built:
+
+| System | How the boundary is managed |
+|---|---|
+| NixOS | Declaratively by `services.sudo-secretspec` (`nixosModules.default`). `install`, `uninstall`, `rollback` and `doctor` refuse and point there; a rebuild is the only way the boundary changes. |
+| Debian and other Linux | `sudo-secretspec install`, as on macOS, with the paths below. |
+
+On Debian, install from the extracted Linux x86_64 release artifact (see
+[`../packaging/README.md`](../packaging/README.md)); the media is the directory
+tree you extracted, not an installed copy:
+
+```bash
+sudo ./libexec/sudo-secretspec install --declarations /path/to/secretspec.toml
+sudo-secretspec doctor
+```
+
+| Path | Role |
+|---|---|
+| `/usr/local/bin/sudo-secretspec` | public client (on `PATH`) |
+| `/usr/libexec/sudo-secretspec` | privileged broker (a separate copy of the binary) |
+| `/etc/sudo-secretspec.toml` | protected config |
+| `/etc/sudoers.d/sudo-secretspec` | NOPASSWD broker policy for the operator |
+| `/usr/share/sudo-secretspec/` | declarations pin, guidance, manifest |
+| `/var/lib/sudo-secretspec` | 0700 vault owned by the `sudo-secretspec` system user |
+
+The sudoers file is validated with `visudo` before it can take effect.
+NOPASSWD covers only the broker path and the mediated broker verbs: never
+`install`, `uninstall`, `rollback` or `doctor` (they ask for the operator's
+password every time, because the client carries `timestamp_timeout=0`), and
+never `ALL`. `uninstall` removes the service user and group only when they are
+the dedicated service identity.
 
 ## Removing it
 

@@ -30,13 +30,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SUDO_SECRETSPEC_BROKER_PATH`, `SUDO_SECRETSPEC_CONFIG_PATH`) live in one
   `platform` module; macOS paths are unchanged. `add`, `set`, `get`, `run`,
   `restore` and the other broker-backed commands work through the same
-  `sudo` + sudoers boundary. `install`, `uninstall`, `rollback` and `doctor`
-  are macOS-only and refuse on Linux, pointing at the NixOS module.
+  `sudo` + sudoers boundary. On NixOS `install`, `uninstall`, `rollback` and
+  `doctor` refuse, pointing at the NixOS module.
 - A Nix flake (`flake.nix`) with `packages.<system>.sudo-secretspec` and
   `nixosModules.default` (`services.sudo-secretspec`), which declares the
   `sudo-secretspec` service user, the immutable broker store path (baked in at
   compile time, not a `/run` symlink), the vault under `/var/lib`, the
   root-owned `/etc/sudo-secretspec.toml` and the NOPASSWD sudoers rules.
+- `sudo-secretspec install` now works on ordinary (non-NixOS) Linux such as
+  Debian, and `uninstall`, `rollback` and `doctor` with it. It creates the same
+  boundary as on macOS with Linux paths: system service user and group
+  `sudo-secretspec`, vault `/var/lib/sudo-secretspec` (0700), protected
+  `/etc/sudo-secretspec.toml`, a broker at `/usr/libexec/sudo-secretspec` that
+  is a different file from the public client at `/usr/local/bin/sudo-secretspec`,
+  and `/etc/sudoers.d/sudo-secretspec`, which is validated with `visudo` before
+  it can take effect. The policy grants NOPASSWD only for the broker path and
+  the mediated broker verbs, never for `install`, `uninstall`, `rollback` or
+  `doctor`, and `timestamp_timeout=0` on the client makes those always ask for a
+  password. `secure_path` names `/usr/bin` and `/usr/local/bin`. `doctor`
+  checks this layout (root:root ownership, POSIX ACLs, the `/etc/sudoers`
+  `@includedir`, shadowing clients on `PATH`) instead of the macOS one.
+- NixOS is now detected from the running system (`/run/current-system`), not
+  from `target_os`: a build made on Debian refuses the imperative lifecycle
+  commands when it runs on NixOS, and a build with a baked
+  `SUDO_SECRETSPEC_BROKER_PATH` (the NixOS package) refuses them everywhere.
+  The NixOS module's sudoers policy text is unchanged.
+- Release tags (0.19.1-sudo.31+) also publish a Linux x86_64 artifact,
+  `sudo-secretspec-<version>-x86_64-unknown-linux-gnu.tar.gz`, built in
+  Debian 12 (glibc 2.36) with a `.sha256` and a build-provenance attestation.
+  Extract it and run `sudo ./libexec/sudo-secretspec install --declarations
+  <file>`; it needs only `sudo` and `libsqlite3-0`, not Nix.
 
 ### Fixed
 
