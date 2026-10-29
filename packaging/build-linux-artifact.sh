@@ -29,7 +29,8 @@ Extract the tarball anywhere, review its contents, then run from its root:
   sudo ./libexec/sudo-secretspec install --declarations /path/secretspec.toml
 Use an ordinary operator account with interactive sudo permission.
 No passwordless sudo is needed to bootstrap. The installer creates the public
-client at /usr/local/bin/sudo-secretspec and the protected broker separately.
+client at /usr/bin/sudo-secretspec and the protected broker at
+/usr/libexec/sudo-secretspec.
 After installation:
   sudo-secretspec doctor
 Review README.md and share/sudo-secretspec/AI-GUIDANCE.md before using secrets.

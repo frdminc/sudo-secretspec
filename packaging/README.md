@@ -1,23 +1,45 @@
 # sudo-secretspec downstream packaging
 
-Downstream releases are built from upstream SecretSpec `0.19.1` and stamp the
+Downstream releases are built from upstream SecretSpec `0.21.1` and stamp the
 whole workspace — including the `secretspec` crate — with a downstream version
-of the form `0.19.1-sudo.N`. `release.py` verifies both halves: that the
-upstream tag it descends from carries `version = "0.19.1"`, and that this tree's
+of the form `0.21.1-sudo.N`. `release.py` verifies both halves: that the
+upstream tag it descends from carries `version = "0.21.1"`, and that this tree's
 root `Cargo.toml` carries the downstream version being cut.
 
-- Tag: `v0.19.1-sudo.N`
-- Release title: `SecretSpec 0.19.1 — sudo-secretspec downstream N`
+- Tag: `v0.21.1-sudo.N`
+- Release title: `SecretSpec 0.21.1 — sudo-secretspec downstream N`
 - Fork: `frdminc/sudo-secretspec` (parent `cachix/secretspec`)
 
-The upstream base is a constant in `release.py`. Which downstream serial to cut
-is a `--version` argument; rebasing onto a newer upstream tag is a separate,
-larger decision and the script refuses to do it implicitly.
+The upstream base is one constant, `UPSTREAM_VERSION` in `release.py`. The
+release workflow reads the base from that same line when it validates a tag, and
+its tag trigger (`v*-sudo.*`) names no base at all, so nothing else carries the
+literal. Which downstream serial to cut is a `--version` argument; rebasing onto
+a newer upstream tag is a separate, larger decision and the script refuses to
+do it implicitly.
+
+### Version history and the 0.21.1 base
+
+Releases through `v0.19.1-djbclark.3` used the `-djbclark.N` spelling;
+`v0.19.1-sudo.4` through `v0.19.1-sudo.30` used `0.19.1-sudo.N`. Those tags
+remain published and are history: `release.py` accepts only the current base
+for a new release, but still recognises the older spellings when it restamps a
+formula that predates the change (`ANY_VERSION_RE`).
+
+The base moved to `v0.21.1` by merging upstream `cachix/secretspec` `main`
+(tag `v0.21.1` plus 47 commits, `a3e6cbeb`) into the fork, restamping the
+workspace to `0.21.1-sudo.1` and changing `UPSTREAM_VERSION`; the serial
+restarted at 1 because it counts releases per base. `release.py` checks the
+`v0.21.1` tag is an ancestor of HEAD, which the merge satisfies. The next re-base goes the same way,
+in one reviewed change set on a branch that is merged to `sudo-main` before any
+release: fetch the new upstream tag, merge it (never rewrite published
+history), change `UPSTREAM_VERSION`, run `packaging/stamp.py --version
+<new base>-sudo.1`, update the test fixtures that name the base, then rehearse
+with `python3 packaging/release.py --version <new base>-sudo.1 --dry-run`.
 
 ## Release
 
 The maintainer entrypoint is `packaging/release.py`. It validates a clean
-`sudo-main` tree, HTTPS remotes, the upstream `v0.19.1` ancestry/version, the
+`sudo-main` tree, HTTPS remotes, the upstream `v0.21.1` ancestry/version, the
 GitHub fork parent, that the workspace is stamped at the version being cut, and
 that the tag is not already published — all before any write.
 
@@ -27,13 +49,13 @@ at anything else.
 
 ```bash
 # Safe preview; performs no writes.
-python3 packaging/release.py --version 0.19.1-sudo.10 --dry-run
+python3 packaging/release.py --version 0.21.1-sudo.1 --dry-run
 
 # Live release after packaging and companion changes are committed on sudo-main.
-python3 packaging/release.py --version 0.19.1-sudo.10
+python3 packaging/release.py --version 0.21.1-sudo.1
 
 # Alternate local tap clone.
-python3 packaging/release.py --version 0.19.1-sudo.10 \
+python3 packaging/release.py --version 0.21.1-sudo.1 \
   --tap-path ~/src/homebrew-sudo-secretspec
 ```
 
@@ -57,7 +79,7 @@ write to the repository never shares a runner with the crate graph's build
 scripts:
 
 1. `bottle` (read-only token, no `GH_TOKEN`) runs for a release tag push or a
-   `workflow_dispatch`. It checks the tag against `^v0\.19\.1-sudo\.[1-9][0-9]*$`
+   `workflow_dispatch`. It checks the tag against `v<UPSTREAM_VERSION>-sudo.N` (N a positive integer without leading zeros; the base is read from `release.py`)
    (and, on a tag push, against the commit embedded in the source archive it
    downloads, `git get-tar-commit-id`), stamps
    the release formula into a throwaway tap, runs `brew install --build-bottle`
@@ -201,7 +223,7 @@ explicitly run `sudo-secretspec install` after reviewing the installed files.
 Canonical formula: `packaging/homebrew/sudo-secretspec.rb`.
 Tap clone default: `~/src/homebrew-sudo-secretspec`.
 
-## Linux x86_64 installer media (0.19.1-sudo.31+)
+## Linux x86_64 installer media (0.21.1-sudo.1+)
 
 Release tags also ship
 `sudo-secretspec-<version>-x86_64-unknown-linux-gnu.tar.gz` and its `.sha256`
@@ -244,8 +266,9 @@ sudo ./libexec/sudo-secretspec install --declarations /path/secretspec.toml
 sudo-secretspec doctor
 ```
 
-The installer puts the public client at `/usr/local/bin/sudo-secretspec` and a
-separate broker at `/usr/libexec/sudo-secretspec`. Keep the extracted media for
+On Linux the installer puts the public client at `/usr/bin/sudo-secretspec` and a
+separate broker at `/usr/libexec/sudo-secretspec` (the macOS client stays at
+`/usr/local/bin/sudo-secretspec`). Keep the extracted media for
 upgrades; run installation from the new media, rather than the installed
 client. NixOS continues to use `services.sudo-secretspec` declaratively and
 refuses these imperative lifecycle commands.

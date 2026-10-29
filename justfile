@@ -1,6 +1,6 @@
 # Deterministic release cutting for the sudo-secretspec fork.
 #
-# `just release 0.19.1-sudo.N` is the whole ceremony: disk guard, version
+# `just release 0.21.1-sudo.N` is the whole ceremony: disk guard, version
 # stamp, stamp commit, push, then packaging/release.py (which runs the gating
 # tests and publishes tag + GitHub Release + formula + tap + brew reinstall).
 # The full version string is deliberate — same principle as release.py: one
@@ -99,7 +99,7 @@ release-dry version: preflight-disk
     packaging/release.py --version "$1" --dry-run --allow-dirty --skip-tests
 
 # Cut the release end to end. Extra flags reach release.py, e.g.
-# `just release 0.19.1-sudo.N --build-from-source` to compile on this Mac
+# `just release 0.21.1-sudo.N --build-from-source` to compile on this Mac
 # instead of pouring the CI-built bottle.
 release version *flags: preflight-disk
     #!/usr/bin/env bash

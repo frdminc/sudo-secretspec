@@ -51,7 +51,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--version",
         required=True,
-        help="full downstream version to stamp, e.g. 0.19.1-sudo.16",
+        help="full downstream version to stamp, e.g. 0.21.1-sudo.2",
     )
     args = parser.parse_args(argv)
     release = load_release_module()

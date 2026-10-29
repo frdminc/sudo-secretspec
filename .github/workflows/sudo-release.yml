@@ -32,10 +32,13 @@ on:
       # Every downstream release tag, not one literal. This was pinned to
       # "v0.19.1-djbclark.1" and so fired exactly once, in the entire history
       # of the workflow -- .2, .3, sudo.4 and sudo.5 all published with the tag
-      # leg silently skipped. The djbclark spelling stays because those tags
-      # exist; it is the old version serial, not the org.
-      - "v0.19.1-sudo.*"
-      - "v0.19.1-djbclark.*"
+      # leg silently skipped. Then it listed "v0.19.1-sudo.*", which would have
+      # skipped every tag after the 0.21.1 upstream merge the same way. So the
+      # trigger names no upstream base at all: the base lives in exactly one
+      # place, `UPSTREAM_VERSION` in packaging/release.py, and the jobs below
+      # refuse any tag that is not `v<that base>-sudo.N`. The retired
+      # `-djbclark.N` tags are history and are never pushed again.
+      - "v*-sudo.*"
   workflow_dispatch:
     inputs:
       tag:
@@ -185,7 +188,11 @@ jobs:
           fi
           # Validate before the tag reaches $GITHUB_OUTPUT, a URL or a shell: a
           # tag name or dispatch input is an attacker-shaped string.
-          [[ "$tag" =~ ^v0\.19\.1-sudo\.[1-9][0-9]*$ ]] || { echo "refusing tag: $tag" >&2; exit 1; }
+          # The base is read from release.py's UPSTREAM_VERSION, the one place
+          # it is defined (the tag trigger above deliberately names none).
+          base="$(sed -n 's/^UPSTREAM_VERSION = "\(.*\)"$/\1/p' packaging/release.py)"
+          [[ "$base" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "could not read UPSTREAM_VERSION from packaging/release.py" >&2; exit 1; }
+          [[ "$tag" == "v$base-sudo."* && "${tag#"v$base-sudo."}" =~ ^[1-9][0-9]*$ ]] || { echo "refusing tag: $tag (want v$base-sudo.N)" >&2; exit 1; }
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           url="https://github.com/$GITHUB_REPOSITORY/archive/refs/tags/$tag.tar.gz"
           curl -fsSL --retry 5 --retry-all-errors -o "$RUNNER_TEMP/src.tar.gz" "$url"
@@ -360,7 +367,9 @@ jobs:
           else
             tag="v$(sed -n 's/^  version "\(.*\)"/\1/p' packaging/homebrew/sudo-secretspec.rb)"
           fi
-          [[ "$tag" =~ ^v0\.19\.1-sudo\.[1-9][0-9]*$ ]] || { echo "refusing tag: $tag" >&2; exit 1; }
+          base="$(sed -n 's/^UPSTREAM_VERSION = "\(.*\)"$/\1/p' packaging/release.py)"
+          [[ "$base" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "could not read UPSTREAM_VERSION from packaging/release.py" >&2; exit 1; }
+          [[ "$tag" == "v$base-sudo."* && "${tag#"v$base-sudo."}" =~ ^[1-9][0-9]*$ ]] || { echo "refusing tag: $tag (want v$base-sudo.N)" >&2; exit 1; }
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
       # Dispatches build the selected tag's sources too, not the dispatch branch.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

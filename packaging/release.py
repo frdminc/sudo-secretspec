@@ -2,15 +2,16 @@
 """Release a sudo-secretspec downstream version and its tap.
 
 The release descends from a pinned upstream tag and stamps the whole workspace
-with a downstream version such as ``0.19.1-djbclark.2``. Which one is a
+with a downstream version such as ``0.21.1-sudo.2``. Which one is a
 command-line argument::
 
-    packaging/release.py --version 0.19.1-djbclark.2 --dry-run
+    packaging/release.py --version 0.21.1-sudo.2 --dry-run
 
-The upstream base stays a constant in this file. Rebasing onto a newer upstream
-tag is a different and much larger decision than cutting the next downstream
-patch, and ``preflight`` verifies the pinned base really is an ancestor of what
-is being released.
+The upstream base stays a constant in this file (``UPSTREAM_VERSION``), and the
+release workflow reads its tag grammar from that same line. Rebasing onto a
+newer upstream tag is a different and much larger decision than cutting the next
+downstream patch, and ``preflight`` verifies the pinned base really is an
+ancestor of what is being released.
 
 ``--dry-run`` prints all mutating commands. The live path validates fork
 lineage, creates an annotated tag and GitHub Release, rewrites the formula
@@ -57,7 +58,8 @@ TAP_NAME = FORK_REPO
 BOTTLE_FORMULA_BASENAME = "sudo-secretspec"
 FORMULA_NAME = f"{TAP_NAME}/{BOTTLE_FORMULA_BASENAME}"
 # The downstream serial's prefix. Releases through 0.19.1-djbclark.3 used
-# "djbclark"; everything from 0.19.1-sudo.4 on uses "sudo".
+# "djbclark"; 0.19.1-sudo.4 through 0.19.1-sudo.30 and every release since the
+# 0.21.1 upstream merge (0.21.1-sudo.N) use "sudo".
 DOWNSTREAM_SUFFIX = "sudo"
 VERSION_RE = re.compile(
     rf"^{re.escape(UPSTREAM_VERSION)}-{DOWNSTREAM_SUFFIX}\.([1-9][0-9]*)$"
