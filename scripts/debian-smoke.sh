@@ -6,10 +6,16 @@ set -euo pipefail
 [[ ! -e /etc/sudo-secretspec.toml && ! -e /var/lib/sudo-secretspec ]]
 [[ ! -e /run/current-system && ! -L /run/current-system && ! -e /etc/NIXOS && ! -L /etc/NIXOS ]]
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Reproduce Debian's staff-writable local prefix in this disposable fixture;
+# the installer must leave it alone while putting the client under /usr/bin.
+chown root:staff /usr/local /usr/local/bin
+chmod 2775 /usr/local /usr/local/bin
 local_before=$(stat -c '%a %U:%G' /usr/local/bin)
 printf 'Debian /usr/local/bin before install: %s\n' "$local_before"
 binary=$(realpath "${1:-target/release/sudo-secretspec}")
-root=$(git rev-parse --show-toplevel)
+# Actions' root container need not trust the mounted checkout's Git owner.
+# Only source fixtures are needed here, so derive their root from this script.
+root=$(realpath "$(dirname "${BASH_SOURCE[0]}")/..")
 work=$(mktemp -d /opt/sudo-secretspec-smoke.XXXXXX)
 trap 'rm -f /run/current-system /etc/NIXOS; rm -rf "$work"' EXIT
 ok() { printf 'PASS: %s\n' "$*"; }
