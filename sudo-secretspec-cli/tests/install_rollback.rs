@@ -1,13 +1,14 @@
 use std::path::PathBuf;
 
 use sudo_secretspec_cli::install::InstallRequest;
+use sudo_secretspec_cli::platform;
 
 #[test]
 fn install_request_defaults_are_generic() {
     let req = InstallRequest::from_cli(Some(PathBuf::from("/tmp/decl.toml")), true, false);
-    assert_eq!(req.vault, PathBuf::from("/var/db/sudo-secretspec"));
-    assert_eq!(req.service_user, "_sudo_secretspec");
-    assert_eq!(req.service_group, "_sudo_secretspec");
+    assert_eq!(req.vault, PathBuf::from(platform::DEFAULT_VAULT));
+    assert_eq!(req.service_user, platform::DEFAULT_USER);
+    assert_eq!(req.service_group, platform::DEFAULT_GROUP);
     assert_eq!(req.profile, "default");
     assert!(req.dry_run);
     assert!(!req.adopt_existing);
@@ -99,7 +100,7 @@ fn plan_restore_accepts_an_owned_verified_pair_with_its_installed_mode() {
     write_pair(
         dir.path(),
         0,
-        "/private/etc/sudoers.d/sudo-secretspec",
+        platform::SUDOERS_FILE,
         b"policy",
         &mut manifest,
     );
@@ -108,10 +109,7 @@ fn plan_restore_accepts_an_owned_verified_pair_with_its_installed_mode() {
     let plan = sudo_secretspec_cli::rollback::plan_restore(dir.path()).expect("valid snapshot");
     assert_eq!(plan.len(), 1);
     let (_, dest, mode) = &plan[0];
-    assert_eq!(
-        dest,
-        std::path::Path::new("/private/etc/sudoers.d/sudo-secretspec")
-    );
+    assert_eq!(dest, std::path::Path::new(platform::SUDOERS_FILE));
     // Restored from the shared artifact table, never from the snapshot.
     assert_eq!(*mode, 0o440);
 }
@@ -153,7 +151,13 @@ fn a_valid_policy_stages_without_touching_the_live_path() {
 fn the_shipped_policy_parses_and_gates_boundary_lifecycle() {
     let dir = tempfile::tempdir().unwrap();
     let dst = dir.path().join("sudo-secretspec");
-    let policy = sudo_secretspec_cli::install::sudoers_text("someoperator", "_sudo_secretspec");
+    let policy = sudo_secretspec_cli::install::sudoers_text_for_host(
+        platform::host(),
+        "someoperator",
+        platform::DEFAULT_USER,
+    )
+    .unwrap();
+    let broker = format!("{}/libexec/sudo-secretspec", platform::PREFIX);
 
     sudo_secretspec_cli::install::stage_sudoers(&dst, &policy, 0o440)
         .expect("visudo should accept the policy we ship");
@@ -167,7 +171,7 @@ fn the_shipped_policy_parses_and_gates_boundary_lifecycle() {
     // The broker stays NOPASSWD: mediated credential operations are the
     // autonomous path, and making them prompt would wedge every agent.
     assert!(
-        policy.contains("NOPASSWD: /usr/local/libexec/sudo-secretspec __broker source-set --*\n"),
+        policy.contains(&format!("NOPASSWD: {broker} __broker source-set --*\n")),
         "{policy}"
     );
     // Boundary lifecycle must never be granted without authentication. The
@@ -185,7 +189,7 @@ fn the_shipped_policy_parses_and_gates_boundary_lifecycle() {
     for flag in ["env_keep-=\"HOME\"", "always_set_home"] {
         assert!(
             policy.lines().any(|line| line
-                .starts_with("Defaults!/usr/local/libexec/sudo-secretspec ")
+                .starts_with(&format!("Defaults!{broker} "))
                 && line.contains(flag)),
             "libexec policy line must carry {flag}:\n{policy}"
         );
@@ -225,9 +229,7 @@ fn an_invalid_policy_never_reaches_the_live_path() {
 fn installed_artifact_table_pins_the_sensitive_modes() {
     use sudo_secretspec_cli::install::artifact_mode;
     assert_eq!(
-        artifact_mode(std::path::Path::new(
-            "/private/etc/sudoers.d/sudo-secretspec"
-        )),
+        artifact_mode(std::path::Path::new(platform::SUDOERS_FILE)),
         Some(0o440)
     );
     assert_eq!(
@@ -235,7 +237,7 @@ fn installed_artifact_table_pins_the_sensitive_modes() {
         Some(0o755)
     );
     assert_eq!(
-        artifact_mode(std::path::Path::new("/usr/local/etc/sudo-secretspec.toml")),
+        artifact_mode(std::path::Path::new(platform::CONFIG_PATH)),
         Some(0o444)
     );
     assert_eq!(artifact_mode(std::path::Path::new("/etc/passwd")), None);
@@ -252,18 +254,15 @@ fn uninstall_plans_the_real_sudo_policy_before_any_binary() {
     let plan = sudo_secretspec_cli::uninstall::plan_uninstall(
         &artifacts,
         &[],
-        std::path::Path::new("/private/etc/sudoers.d"),
+        std::path::Path::new(platform::SUDOERS_DIR),
     );
 
     assert_eq!(plan.len(), artifacts.len(), "every owned path is planned");
-    assert_eq!(
-        plan[0].path,
-        PathBuf::from("/private/etc/sudoers.d/sudo-secretspec")
-    );
+    assert_eq!(plan[0].path, PathBuf::from(platform::SUDOERS_FILE));
     assert!(
         plan[1..]
             .iter()
-            .all(|step| !step.path.starts_with("/private/etc/sudoers.d")),
+            .all(|step| !step.path.starts_with(platform::SUDOERS_DIR)),
         "only one policy is owned, and it leads the plan: {plan:?}"
     );
 }
@@ -280,7 +279,7 @@ fn uninstall_never_removes_a_policy_it_cannot_prove_it_wrote() {
     let plan = sudo_secretspec_cli::uninstall::plan_uninstall(
         &sudo_secretspec_cli::install::installed_artifacts(),
         &[],
-        std::path::Path::new("/private/etc/sudoers.d"),
+        std::path::Path::new(platform::SUDOERS_DIR),
     );
     assert!(
         !matches!(plan[0].action, Action::Remove),

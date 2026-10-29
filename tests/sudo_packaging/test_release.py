@@ -2297,6 +2297,7 @@ def _published(monkeypatch, release, *, release_created=True):
     monkeypatch.setattr(release, "run", lambda argv, **kwargs: completed(argv))
     monkeypatch.setattr(release, "create_tag_and_release", publish)
     monkeypatch.setattr(release, "fetch_bottle", lambda *a, **k: [])
+    monkeypatch.setattr(release, "fetch_linux", lambda *a, **k: [])
     monkeypatch.setattr(release, "update_formula_commit", lambda *a, **k: None)
     monkeypatch.setattr(release, "sync_tap", lambda *a, **k: None)
     monkeypatch.setattr(release, "merge_bottle", lambda *a, **k: None)
@@ -3169,3 +3170,217 @@ def test_main_pours_the_bottle_unless_told_to_build_from_source(
     else:
         # The bottle is awaited before the tap moves, merged after it.
         assert seen == ["fetch", "sync", "merge", "install source=False"]
+
+
+# Linux release media is deliberately much narrower than a source archive.
+def linux_media(release, cut, dest, *, extra=None, omit=None):
+    name = release.linux_asset_name(cut)
+    path = dest / name
+    prefix = name.removesuffix(".tar.gz")
+    with tarfile.open(path, "w:gz") as archive:
+        for relative in sorted(release.LINUX_MEDIA_FILES - {omit}):
+            member = tarfile.TarInfo(f"{prefix}/{relative}")
+            member.mode = 0o755 if relative == "libexec/sudo-secretspec" else 0o644
+            body = b"installer payload\n"
+            member.size = len(body)
+            archive.addfile(member, io.BytesIO(body))
+        if extra:
+            archive.addfile(extra, io.BytesIO(b""))
+    checksum = dest / f"{name}.sha256"
+    checksum.write_text(f"{release.file_sha256(path)}  {name}\n")
+    return path, checksum
+
+
+def test_linux_media_accepts_the_installable_layout(release, cut, tmp_path):
+    tarball, _ = linux_media(release, cut, tmp_path)
+    release.validate_linux_media(cut, tarball)
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "traversal",
+        "absolute",
+        "symlink",
+        "hardlink",
+        "fifo",
+        "extra",
+        "duplicate",
+        "setuid",
+    ],
+)
+def test_linux_media_rejects_unsafe_members_before_extraction(
+    release, cut, tmp_path, kind, monkeypatch
+):
+    prefix = release.linux_asset_name(cut).removesuffix(".tar.gz")
+    member = tarfile.TarInfo(f"{prefix}/extra")
+    member.mode = 0o644
+    if kind == "traversal":
+        member.name = "../../escaped"
+    elif kind == "absolute":
+        member.name = "/escaped"
+    elif kind == "symlink":
+        member.type = tarfile.SYMTYPE
+        member.linkname = "../../escaped"
+    elif kind == "hardlink":
+        member.type = tarfile.LNKTYPE
+        member.linkname = f"{prefix}/LICENSE"
+    elif kind == "fifo":
+        member.type = tarfile.FIFOTYPE
+    elif kind == "duplicate":
+        member.name = f"{prefix}/LICENSE"
+    elif kind == "setuid":
+        member.name = f"{prefix}/libexec/sudo-secretspec"
+        member.mode = 0o4755
+    tarball, _ = linux_media(
+        release,
+        cut,
+        tmp_path,
+        extra=member,
+        omit="libexec/sudo-secretspec" if kind == "setuid" else None,
+    )
+    # No extraction may happen at all for a rejected member.
+    monkeypatch.setattr(
+        release,
+        "extracted_tree",
+        lambda *a, **k: pytest.fail("unsafe archive extracted"),
+    )
+    with pytest.raises(release.ReleaseError, match="Linux media member"):
+        release.validate_linux_media(cut, tarball)
+    assert not (tmp_path / "escaped").exists()
+
+
+def test_linux_media_requires_every_installer_file(release, cut, tmp_path):
+    tarball, _ = linux_media(
+        release, cut, tmp_path, omit="share/sudo-secretspec/AI-GUIDANCE.md"
+    )
+    with pytest.raises(release.ReleaseError, match="missing required"):
+        release.validate_linux_media(cut, tarball)
+
+
+def fake_linux_run(
+    monkeypatch,
+    release,
+    cut,
+    dest,
+    *,
+    published=None,
+    corrupt_published=False,
+    fail_attestation=False,
+):
+    tarball, checksum = linux_media(release, cut, dest)
+    names = [tarball.name, checksum.name]
+    attestations = []
+    calls = []
+
+    def output(argv, **kwargs):
+        if argv[:2] == ["git", "rev-parse"]:
+            return "a" * 40
+        assert argv[:3] == ["gh", "release", "view"]
+        return json.dumps(
+            {
+                "assets": [
+                    {"name": name}
+                    for name in (names if published is None else published)
+                ]
+            }
+        )
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+        if argv[:3] == ["gh", "release", "download"]:
+            name = argv[argv.index("--pattern") + 1]
+            destination = Path(argv[argv.index("-D") + 1]) / name
+            destination.write_bytes(
+                (dest / name).read_bytes() + (b"bad" if corrupt_published else b"")
+            )
+        return completed(argv)
+
+    def attest(path, **kwargs):
+        attestations.append((path.name, kwargs))
+        if fail_attestation:
+            raise release.ReleaseError("provenance denied")
+
+    monkeypatch.setattr(release, "output", output)
+    monkeypatch.setattr(release, "run", run)
+    monkeypatch.setattr(release, "find_run", lambda *a, **k: 123)
+    monkeypatch.setattr(release, "watch_run", lambda *a, **k: None)
+    monkeypatch.setattr(release, "verify_attestation", attest)
+    return tarball, checksum, attestations, calls
+
+
+def test_linux_fetch_verifies_hash_provenance_layout_and_published_bytes(
+    monkeypatch, release, cut, tmp_path
+):
+    tarball, checksum, attestations, calls = fake_linux_run(
+        monkeypatch, release, cut, tmp_path
+    )
+    assert release.fetch_linux(cut, tmp_path, dry_run=False) == [tarball, checksum]
+    assert attestations == [
+        (p.name, {"source_ref": f"refs/tags/{cut.tag}", "source_digest": "a" * 40})
+        for p in (tarball, checksum)
+    ]
+    downloads = [a for a in calls if a[:3] == ["gh", "release", "download"]]
+    assert [a[a.index("--pattern") + 1] for a in downloads] == [
+        tarball.name,
+        checksum.name,
+    ]
+    assert all(release.FORK_REPO in a for a in calls)
+
+
+@pytest.mark.parametrize(
+    "record", ["../escape", "/absolute", "*.tar.gz", "other.tar.gz", "extra-record"]
+)
+def test_linux_fetch_refuses_checksum_paths_and_extra_records(
+    monkeypatch, release, cut, tmp_path, record
+):
+    tarball, checksum, _, _ = fake_linux_run(monkeypatch, release, cut, tmp_path)
+    if record == "extra-record":
+        checksum.write_text(checksum.read_text() + checksum.read_text())
+    else:
+        checksum.write_text(f"{release.file_sha256(tarball)}  {record}\n")
+    with pytest.raises(release.ReleaseError, match="unsafe Linux checksum"):
+        release.fetch_linux(cut, tmp_path, dry_run=False)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["hash", "attestation", "missing-published", "changed-published", "extra-artifact"],
+)
+def test_linux_fetch_refuses_unverified_or_unpublished_media(
+    monkeypatch, release, cut, tmp_path, failure
+):
+    tarball, _, _, _ = fake_linux_run(
+        monkeypatch,
+        release,
+        cut,
+        tmp_path,
+        published=[] if failure == "missing-published" else None,
+        corrupt_published=failure == "changed-published",
+        fail_attestation=failure == "attestation",
+    )
+    if failure == "hash":
+        tarball.write_bytes(b"not the recorded archive")
+    elif failure == "extra-artifact":
+        (tmp_path / "extra").write_text("unexpected")
+    expected = {
+        "hash": "checksum mismatch",
+        "attestation": "provenance denied",
+        "missing-published": "missing or duplicated",
+        "changed-published": "differs from CI",
+        "extra-artifact": "exactly the tarball",
+    }[failure]
+    with pytest.raises(release.ReleaseError, match=expected):
+        release.fetch_linux(cut, tmp_path, dry_run=False)
+
+
+@pytest.mark.parametrize("flags", [[], ["--skip-homebrew"], ["--build-from-source"]])
+def test_linux_verification_is_required_independently_of_homebrew(
+    monkeypatch, release, cut, flags
+):
+    _published(monkeypatch, release)
+    seen = []
+    monkeypatch.setattr(release, "fetch_linux", lambda *a, **k: seen.append("linux"))
+    monkeypatch.setattr(release, "brew_install_and_test", lambda **k: "/prefix")
+    release.main(["--version", cut.version, "--dry-run", "--skip-tests", *flags])
+    assert seen == ["linux"]

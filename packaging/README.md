@@ -38,8 +38,8 @@ python3 packaging/release.py --version 0.19.1-sudo.10 \
 ```
 
 The live flow gates on GitHub CI for HEAD (`scripts/github-ci-run`: the Linux
-engine job plus a macOS job for the companion crate, this helper and the
-formula; `--local-tests` runs those suites here instead), creates and pushes an
+engine job, a Debian companion/installer job, the NixOS module job, and
+a macOS job for the companion crate, this helper and the formula; `--local-tests` runs those suites here instead), creates and pushes an
 annotated tag, creates the titled GitHub Release with `gh`, downloads the tag
 tarball over HTTPS, rewrites the formula SHA-256, commits/pushes that formula,
 syncs the configured tap clone, force-refreshes Homebrew and the tap checkout,
@@ -200,3 +200,82 @@ explicitly run `sudo-secretspec install` after reviewing the installed files.
 
 Canonical formula: `packaging/homebrew/sudo-secretspec.rb`.
 Tap clone default: `~/src/homebrew-sudo-secretspec`.
+
+## Linux x86_64 installer media (0.19.1-sudo.31+)
+
+Release tags also ship
+`sudo-secretspec-<version>-x86_64-unknown-linux-gnu.tar.gz` and its `.sha256`
+file. This is the companion, not the full upstream `secretspec` CLI. The tarball
+contains one directory with `libexec/sudo-secretspec`,
+`share/sudo-secretspec/AI-GUIDANCE.md`,
+`share/sudo-secretspec/sudo-secretspec-retired.toml`,
+`share/sudo-secretspec/skills/sudo-secretspec/SKILL.md`, `README.md`, `LICENSE`,
+and `INSTALL.txt`. Extracting the archive only writes the media; privilege
+changes require the explicit installer invocation below.
+
+The `linux-artifact` job builds the locked companion crate for
+`x86_64-unknown-linux-gnu` inside `debian:12` on a GitHub-hosted Ubuntu x86_64
+runner. Debian 12 provides [glibc 2.36](https://packages.debian.org/bookworm/libc6);
+this is the minimum supported glibc baseline, suitable for Debian 12/13 and
+[Ubuntu 24.04 (glibc 2.39)](https://discourse.ubuntu.com/t/noble-numbat-release-notes/39890)
+and newer. Ubuntu 22.04 has an older glibc and is unsupported.
+The container stays on Debian 12 deliberately to avoid raising the binary's
+runtime baseline when the Ubuntu runner image changes.
+
+SQLite is dynamically linked to `libsqlite3.so.0`. The companion's explicit
+`rusqlite` dependency does not inherit the workspace's `bundled` setting;
+Cargo.lock resolves it through `libsqlite3-sys` with pkg-config. Using the
+system library keeps the existing build configuration and distribution SQLite
+security updates. The build installs `libsqlite3-dev` and asserts the ELF
+binary actually names `libsqlite3.so.0`. Users need `libsqlite3-0` at runtime.
+No Nix installation or passwordless sudo is required.
+
+```bash
+# As an operator with ordinary interactive sudo access:
+sudo apt-get install sudo libsqlite3-0
+# Download both release assets into the current directory, then verify:
+sha256sum -c sudo-secretspec-<version>-x86_64-unknown-linux-gnu.tar.gz.sha256
+gh attestation verify sudo-secretspec-<version>-x86_64-unknown-linux-gnu.tar.gz \
+  --repo frdminc/sudo-secretspec
+# Extract anywhere, inspect the files, and enter the extracted directory:
+tar -xzf sudo-secretspec-<version>-x86_64-unknown-linux-gnu.tar.gz
+cd sudo-secretspec-<version>-x86_64-unknown-linux-gnu
+sudo ./libexec/sudo-secretspec install --declarations /path/secretspec.toml
+sudo-secretspec doctor
+```
+
+The installer puts the public client at `/usr/local/bin/sudo-secretspec` and a
+separate broker at `/usr/libexec/sudo-secretspec`. Keep the extracted media for
+upgrades; run installation from the new media, rather than the installed
+client. NixOS continues to use `services.sudo-secretspec` declaratively and
+refuses these imperative lifecycle commands.
+
+`packaging/build-linux-artifact.sh` creates sorted GNU tar media with root
+numeric ownership, fixed modes and the tag commit's timestamp; `gzip -n`
+removes compressor timestamps. These controls make packaging the same payload
+deterministic; they do not claim Rust builds are reproducible. The tarball and
+checksum receive signed build provenance with the same pinned actions and
+permission split as the bottle. `publish-linux` depends on `packaging` and
+`linux-artifact`, holds `contents: write`, runs no Cargo code, and attaches
+both assets only on a release tag push. Existing asset names fail rather than
+being overwritten. Dispatches validate the same tag grammar as the bottle,
+check out that tag's sources, and only upload workflow artifacts. Neither
+platform's publish job depends on the other platform's build.
+
+After the push run completes, `release.py` downloads the Linux workflow
+artifact, verifies both attestations against this workflow at the exact tag
+and commit, requires a single checksum record naming the expected bare
+filename, compares its hash, and rejects unexpected members, traversal,
+links, special files, duplicate paths, modes and owners before extraction
+with the explicit tar data filter. It then requires the published Release to
+list both names exactly once, downloads both assets, and compares their bytes
+to CI's artifact. Linux verification also runs with `--skip-homebrew` and
+`--build-from-source`; those options only change Homebrew handling.
+
+The `debian` job in the `ci/base` overlay tests and lints the companion,
+builds its release binary, and runs `scripts/debian-smoke.sh` as root in a
+throwaway Debian 12 container. The smoke proves install metadata, sudoers
+validation and limited broker grants, password-required lifecycle commands,
+doctor, snapshot rollback, retained-state uninstall, explicit purge, and
+runtime NixOS refusal followed by successful Debian reinstall. It never runs
+against the maintainer's host.

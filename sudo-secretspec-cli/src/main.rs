@@ -275,7 +275,7 @@ fn main() {
             "sudo-secretspec: the privileged broker path serves only __broker and doctor;\n\
              run install/rollback through {} so they require\n\
              interactive authentication",
-            platform::CLIENT_PATH
+            platform::client_path(platform::host())
         );
         std::process::exit(2);
     }
@@ -397,9 +397,9 @@ fn main() {
     }
 }
 
-/// Boundary lifecycle (`install`, `uninstall`, `rollback`) and `doctor`'s
-/// layout checks describe the macOS/Homebrew install. Anywhere else they
-/// refuse, and say where the boundary is managed instead.
+/// NixOS owns its boundary declaratively; macOS and ordinary Linux use the
+/// imperative lifecycle. Refuse before elevation when this host or build is
+/// managed by the NixOS module.
 fn require_imperative_installer(command: &str) {
     if let Some(message) = platform::lifecycle_refusal(command) {
         eprintln!("sudo-secretspec: {message}");
@@ -537,11 +537,17 @@ fn run_install(
     non_interactive: bool,
 ) {
     require_imperative_installer("install");
+    if platform::host() == platform::Host::Linux && !Path::new(SUDO).is_file() {
+        eprintln!(
+            "install denied: Linux install requires {SUDO}; install the sudo package before retrying"
+        );
+        std::process::exit(2);
+    }
     // Before anything else, and before elevating: an install that would copy
     // the installed boundary onto itself is refused here rather than after the
     // operator has authenticated. `install::run` repeats this check as root and
-    // that copy is the authoritative one; this is purely about not charging a
-    // Touch ID prompt for an answer already known.
+    // that copy is the authoritative one; this avoids an authentication
+    // prompt for an answer already known.
     if let Err(e) = sudo_secretspec_cli::install::preflight_media(None) {
         eprintln!("install denied: {e}");
         std::process::exit(2);
@@ -1095,6 +1101,24 @@ fn assert_privileged_config(path: &Path, service_uid: Option<u32>) -> Result<(),
     Ok(())
 }
 
+/// The executable `doctor` re-runs as root through `sudo`.
+///
+/// macOS grants NOPASSWD for `<broker> doctor`, so the broker path is used.
+/// The ordinary-Linux policy deliberately grants nothing for `doctor`: it
+/// runs the installed public client (the path `Defaults!<client>
+/// timestamp_timeout=0` is bound to) under plain `sudo`, which asks for the
+/// operator's password. A client that is not installed yet falls back to the
+/// running binary, as `install` does.
+fn doctor_elevation_target(host: platform::Host) -> PathBuf {
+    match host {
+        platform::Host::MacOs => privileged_broker(),
+        platform::Host::NixOs | platform::Host::Linux => {
+            let client = PathBuf::from(platform::client_path(host));
+            if client.is_file() { client } else { self_exe() }
+        }
+    }
+}
+
 fn doctor(
     json: bool,
     config: Option<PathBuf>,
@@ -1141,12 +1165,19 @@ fn doctor(
     });
     let available_build = available_build.or_else(|| probe_available_build(unprivileged));
 
-    // Privileged checks (sudoers/vault) need root. Prefer NOPASSWD libexec.
+    // Privileged checks (sudoers/vault) need root. macOS prefers the NOPASSWD
+    // libexec broker; ordinary Linux has no `doctor` grant and prompts.
     if unprivileged {
-        let broker = privileged_broker();
+        let host = platform::host();
+        let target = doctor_elevation_target(host);
         let elevated = |with_hints: bool| {
             let mut cmd = Command::new(SUDO);
-            cmd.arg("-n").arg(&broker).arg("doctor");
+            // `-n` is right only where a NOPASSWD grant exists; without one it
+            // would turn the operator's password prompt into a refusal.
+            if host == platform::Host::MacOs {
+                cmd.arg("-n");
+            }
+            cmd.arg(&target).arg("doctor");
             if json {
                 cmd.arg("--json");
             }
@@ -1193,7 +1224,7 @@ fn doctor(
                     }
                 }
                 Err(e) => {
-                    eprintln!("cannot elevate doctor via {}: {e}", broker.display());
+                    eprintln!("cannot elevate doctor via {}: {e}", target.display());
                     can_elevate = false;
                 }
             }
@@ -1204,7 +1235,7 @@ fn doctor(
                 Ok(s) if s.success() => return,
                 Ok(s) => std::process::exit(s.code().unwrap_or(1)),
                 Err(e) => {
-                    eprintln!("cannot elevate doctor via {}: {e}", broker.display());
+                    eprintln!("cannot elevate doctor via {}: {e}", target.display());
                     // Fall through to unprivileged best-effort.
                 }
             }
