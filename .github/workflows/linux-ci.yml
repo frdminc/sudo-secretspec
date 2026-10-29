@@ -1,9 +1,9 @@
 name: Linux CI
 
 # Overlay-only on ci/base. Port of .forgejo/workflows/ci.yml; no loopback-port-shim
-# (GitHub runners are not libkrun). sudo-secretspec-cli is macOS-only, so the
-# macos job runs it plus packaging/release.py's own suite: together the two jobs
-# are the release gate (release.py ci_gate, 2026-10-18).
+# (GitHub runners are not libkrun). The companion runs on Debian and macOS;
+# Debian also proves the imperative installer in a disposable root container.
+# macos covers the release helper and Homebrew formula; nix covers the module.
 
 on:
   push:
@@ -66,6 +66,45 @@ jobs:
           cmp schema/resolution-report.schema.json "$fixture"
           cargo package --package secretspec --list |
             grep -Fx 'src/fixtures/resolution-report.schema.json'
+
+  debian:
+    name: debian (companion crate and imperative installer)
+    runs-on: ubuntu-latest
+    container: debian:12
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install Debian dependencies
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends sudo build-essential pkg-config libsqlite3-dev curl ca-certificates git
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          timeout 600 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh
+          timeout 600 sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          . "$HOME/.cargo/env"
+          rustup toolchain install --profile minimal
+          rustup component add clippy
+      - name: Test downstream companion crate
+        run: cargo test -p sudo-secretspec-cli --locked
+      - name: Lint downstream companion crate
+        run: cargo clippy -p sudo-secretspec-cli --all-targets --locked -- -D warnings
+      - name: Build release binary
+        run: cargo build --release -p sudo-secretspec-cli --locked
+      - name: Smoke the Debian installer as root
+        run: bash scripts/debian-smoke.sh target/release/sudo-secretspec
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sudo-secretspec-linux-x86_64
+          path: target/release/sudo-secretspec
+          if-no-files-found: error
+          retention-days: 7
 
   macos:
     name: macos (companion crate, release helper, formula)
