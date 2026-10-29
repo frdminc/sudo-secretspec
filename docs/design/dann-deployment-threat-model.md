@@ -29,13 +29,14 @@ operator-managed end to end:
 - The audit ledger is service-owned, and root can re-chain it from genesis (the
   chain has no external anchor), so **audit is not tamper-evident against the
   operator.**
-- sudoers applies tags last-match-wins, so the `SETENV` tag on the wheel rule
-  (`%wheel ALL=(ALL:ALL) NOPASSWD:SETENV: ALL`) wins for the operator regardless
-  of the module's own NOPASSWD grant lines (which carry no `SETENV` tag). The
-  real route is `sudo -u <svc> env VAR=… $BROKER …`, which reaches the broker
-  with caller-chosen variables that `purge_ambient_env` does not cover. This is
-  moot while the operator is root — which is the point — and it is a reason
-  never to deploy this pattern on a host where the operator is *not* already
+- sudoers applies tags last-match-wins. For the broker command itself the
+  module's line matches last and carries no `SETENV`, so a `sudo VAR=… -u <svc>
+  $BROKER …` is refused; the wheel rule's `SETENV`
+  (`%wheel ALL=(ALL:ALL) NOPASSWD:SETENV: ALL`) still covers the `env` form,
+  `sudo -u <svc> env VAR=… $BROKER …`, which reaches the broker with
+  caller-chosen variables that `purge_ambient_env` does not cover. This is moot
+  while the operator is root — which is the point — and it is a reason never to
+  deploy this pattern on a host where the operator is *not* already
   root-equivalent.
 
 So on dann, sudo-secretspec provides exactly two things, and it is worth naming
