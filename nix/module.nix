@@ -2,14 +2,16 @@
 #
 # The boundary is `sudo` + a NOPASSWD sudoers rule; there is no daemon. This
 # module is the declarative equivalent of what `sudo-secretspec install` does
-# on macOS (`install.rs`): service account, protected config, vault directory,
-# sudoers policy. The imperative `install`/`uninstall`/`rollback`/`doctor`
-# commands refuse on Linux and point here.
+# on macOS and on ordinary Linux such as Debian (`install.rs`): service account,
+# protected config, vault directory, sudoers policy. On NixOS the imperative
+# `install`/`uninstall`/`rollback`/`doctor` commands refuse and point here; the
+# binary decides that from the running system (`/run/current-system`), not from
+# its build target.
 #
-# `doctor` — and its drift/layout checks — is a macOS-only diagnostic. Its
-# checks are macOS-shaped (a real `/bin/ls`, a `sudoers.d` `#include` line,
-# root-owned `/etc/static`, Homebrew paths) and have no NixOS equivalent, so
-# the Linux binary refuses it via `platform::lifecycle_refusal`. The declared
+# `doctor` — and its drift/layout checks — checks an imperative layout (a real
+# `/bin/ls` or POSIX ACLs, the `/etc/sudoers` include line, Homebrew or
+# `/usr/local` paths) that has no NixOS equivalent, so the binary refuses it
+# on NixOS via `platform::lifecycle_refusal`. The declared
 # boundary has no drift checker instead: the broker is an immutable store path
 # (not a mutable `/run` symlink), and `systemd.tmpfiles` re-asserts the vault
 # owner/mode and the config file owner/mode on every activation, so the
@@ -37,7 +39,7 @@ let
   configPath = cfg.package.passthru.configPath;
 
   # The sudoers policy is emitted by the same binary that enforces it, through
-  # the hidden `print-sudoers` subcommand (`install.rs::linux_sudoers_text`).
+  # the hidden `print-sudoers` subcommand (`install.rs::nixos_sudoers_text`).
   # Import-from-derivation means the module's sudoers text and the compiled-in
   # broker path can never drift apart: when the package changes, the text is
   # regenerated from the new binary. `OPERATOR`/`SERVICE_USER` reach the command
@@ -240,8 +242,8 @@ in
     # later wins. That is an availability-only risk (a later rule could
     # re-prompt for a verb), never an escalation — it cannot add a grant this
     # module did not already emit. There is no `timestamp_timeout=0` line and
-    # no `doctor` grant on Linux: the former has no client path to attach to,
-    # the latter refuses on Linux.
+    # no `doctor` grant on NixOS: the former has no client path to attach to,
+    # the latter refuses on NixOS.
     security.sudo.extraConfig = lib.mkAfter (builtins.readFile sudoersText);
   };
 }

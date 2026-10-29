@@ -12,7 +12,8 @@ use std::process::Command;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::install::SUDOERS_DIR;
+use crate::install::{PREFIX, SNAPSHOT_PREFIX, SUDOERS_DIR, installed_artifacts};
+use crate::platform;
 
 fn sha256_file(path: &Path) -> Result<String, RollbackError> {
     let bytes = fs::read(path)?;
@@ -48,14 +49,7 @@ pub fn run(snapshot: &Path) -> Result<(), RollbackError> {
     require_root()?;
     let snapshot = fs::canonicalize(snapshot)
         .map_err(|e| RollbackError::Denied(format!("invalid snapshot path: {e}")))?;
-    let prefix = PathBuf::from(format!(
-        "{}/libexec/sudo-secretspec-rollback-",
-        crate::install::PREFIX
-    ));
-    if !snapshot
-        .to_string_lossy()
-        .starts_with(prefix.to_string_lossy().as_ref())
-    {
+    if !in_snapshot_namespace(&snapshot, Path::new(PREFIX)) {
         return Err(RollbackError::Denied(
             "rollback snapshot is outside the protected rollback directory".into(),
         ));
@@ -106,7 +100,8 @@ pub fn run(snapshot: &Path) -> Result<(), RollbackError> {
     // Isolated validity is not combined validity; check the whole config. As in
     // the installer, only a fault in our own file is ours to fail on — an
     // unrelated bad policy elsewhere in sudoers.d is a warning.
-    let combined_ok = Command::new("/usr/sbin/visudo")
+    let visudo = platform::visudo_path(platform::host());
+    let combined_ok = Command::new(visudo)
         .arg("-c")
         .status()
         .map(|s| s.success())
@@ -114,7 +109,7 @@ pub fn run(snapshot: &Path) -> Result<(), RollbackError> {
     if !combined_ok {
         let ours = Path::new(SUDOERS_DIR).join("sudo-secretspec");
         let ours_ok = !ours.exists()
-            || Command::new("/usr/sbin/visudo")
+            || Command::new(visudo)
                 .args(["-c", "-f"])
                 .arg(&ours)
                 .status()
@@ -143,6 +138,30 @@ pub fn run(snapshot: &Path) -> Result<(), RollbackError> {
 /// the trust decisions — destination allowlist and manifest verification — can
 /// be tested without root.
 pub fn plan_restore(snapshot: &Path) -> Result<Vec<(PathBuf, PathBuf, u32)>, RollbackError> {
+    plan_restore_with(snapshot, &installed_artifacts())
+}
+
+/// True when `snapshot` is a direct child of `<prefix>/libexec` whose name
+/// carries the snapshot prefix `install` writes.
+///
+/// Compared by path component, on the canonicalised path, rather than by
+/// string prefix, so a directory *inside* a snapshot cannot pass for one. The
+/// location is relative to the install prefix, which is `/usr/local` on macOS
+/// and `/usr` on Linux, so it follows whatever layout `install` wrote.
+fn in_snapshot_namespace(snapshot: &Path, prefix: &Path) -> bool {
+    let libexec = prefix.join("libexec");
+    let named = snapshot
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().starts_with(SNAPSHOT_PREFIX));
+    named && snapshot.parent() == Some(libexec.as_path())
+}
+
+/// [`plan_restore`] against an explicit table of owned artifacts, so the
+/// destination allowlist can be exercised for any platform's layout.
+fn plan_restore_with(
+    snapshot: &Path,
+    artifacts: &[(PathBuf, u32)],
+) -> Result<Vec<(PathBuf, PathBuf, u32)>, RollbackError> {
     // The manifest is mandatory: it is what binds each destination to the
     // bytes allowed to land there.
     let manifest_path = snapshot.join("MANIFEST.sha256");
@@ -161,7 +180,7 @@ pub fn plan_restore(snapshot: &Path) -> Result<Vec<(PathBuf, PathBuf, u32)>, Rol
         expected.insert(PathBuf::from(dest.trim()), hash.to_string());
     }
 
-    let owned: HashMap<PathBuf, u32> = crate::install::installed_artifacts().into_iter().collect();
+    let owned: HashMap<PathBuf, u32> = artifacts.iter().cloned().collect();
 
     let mut pairs = Vec::new();
     for entry in fs::read_dir(snapshot)? {
@@ -201,4 +220,118 @@ pub fn plan_restore(snapshot: &Path) -> Result<Vec<(PathBuf, PathBuf, u32)>, Rol
         ));
     }
     Ok(pairs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The Debian-shaped table the installer owns: the public client on the
+    /// real `PATH`, the broker under `/usr/libexec`, the policy under
+    /// `/etc/sudoers.d`.
+    fn debian_artifacts() -> Vec<(PathBuf, u32)> {
+        vec![
+            (PathBuf::from("/usr/local/bin/sudo-secretspec"), 0o755),
+            (PathBuf::from("/usr/libexec/sudo-secretspec"), 0o755),
+            (PathBuf::from("/etc/sudoers.d/sudo-secretspec"), 0o440),
+        ]
+    }
+
+    /// Lay out a snapshot the way `install::capture_snapshot` does.
+    fn write_snapshot(dir: &Path, entries: &[(&str, &str)]) {
+        let mut manifest = String::new();
+        for (index, &(dest, content)) in entries.iter().enumerate() {
+            fs::write(dir.join(format!("{index}.prior")), content).unwrap();
+            fs::write(dir.join(format!("{index}.path")), dest).unwrap();
+            manifest.push_str(&format!("{:x}  {dest}\n", Sha256::digest(content)));
+        }
+        fs::write(dir.join("MANIFEST.sha256"), manifest).unwrap();
+    }
+
+    /// Snapshots live under the install prefix, which differs per platform: a
+    /// macOS snapshot path is not a Linux one and vice versa.
+    #[test]
+    fn snapshot_namespace_follows_the_install_prefix() {
+        let linux = Path::new("/usr");
+        assert!(in_snapshot_namespace(
+            Path::new("/usr/libexec/sudo-secretspec-rollback-1700000000"),
+            linux
+        ));
+        assert!(!in_snapshot_namespace(
+            Path::new("/usr/local/libexec/sudo-secretspec-rollback-1700000000"),
+            linux
+        ));
+
+        let macos = Path::new("/usr/local");
+        assert!(in_snapshot_namespace(
+            Path::new("/usr/local/libexec/sudo-secretspec-rollback-1700000000"),
+            macos
+        ));
+        assert!(!in_snapshot_namespace(
+            Path::new("/usr/libexec/sudo-secretspec-rollback-1700000000"),
+            macos
+        ));
+    }
+
+    #[test]
+    fn snapshot_namespace_rejects_lookalikes() {
+        let prefix = Path::new("/usr");
+        for path in [
+            "/usr/libexec/sudo-secretspec",
+            "/usr/libexec/other-rollback-1",
+            "/usr/libexec/sudo-secretspec-rollback-1/inner",
+            "/tmp/sudo-secretspec-rollback-1",
+            "/usr/libexec",
+        ] {
+            assert!(
+                !in_snapshot_namespace(Path::new(path), prefix),
+                "{path} must not pass for a snapshot"
+            );
+        }
+    }
+
+    #[test]
+    fn a_snapshot_restores_only_into_the_debian_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        write_snapshot(
+            dir.path(),
+            &[
+                ("/usr/local/bin/sudo-secretspec", "client"),
+                ("/usr/libexec/sudo-secretspec", "broker"),
+            ],
+        );
+
+        let plan = plan_restore_with(dir.path(), &debian_artifacts()).unwrap();
+        let mut targets: Vec<_> = plan
+            .iter()
+            .map(|(_, dest, mode)| (dest.clone(), *mode))
+            .collect();
+        targets.sort();
+        assert_eq!(
+            targets,
+            vec![
+                (PathBuf::from("/usr/libexec/sudo-secretspec"), 0o755),
+                (PathBuf::from("/usr/local/bin/sudo-secretspec"), 0o755),
+            ]
+        );
+    }
+
+    /// A writable snapshot directory must not become an arbitrary root write:
+    /// system binaries, another vendor's sudoers file, and even the client at
+    /// a path this layout does not own are all refused.
+    #[test]
+    fn a_snapshot_cannot_target_a_path_outside_the_artifact_table() {
+        for dest in [
+            "/usr/bin/sudo",
+            "/etc/sudoers",
+            "/etc/sudoers.d/other",
+            "/usr/bin/sudo-secretspec",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            write_snapshot(dir.path(), &[(dest, "payload")]);
+            let err = plan_restore_with(dir.path(), &debian_artifacts())
+                .expect_err("a destination outside the table must be refused");
+            assert!(err.to_string().contains("does not own"), "{dest}: {err}");
+        }
+    }
 }

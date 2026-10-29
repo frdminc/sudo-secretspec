@@ -32,7 +32,6 @@ const SUDOERS_PATH: &str = platform::SUDOERS_FILE;
 /// Any file installed under here is a sudo policy and must be validated before
 /// it is allowed to take effect.
 pub(crate) const SUDOERS_DIR: &str = platform::SUDOERS_DIR;
-const SUDOERS_SECURE_PATH: &str = platform::SUDOERS_SECURE_PATH;
 const DEFAULT_VAULT: &str = platform::DEFAULT_VAULT;
 const DEFAULT_USER: &str = platform::DEFAULT_USER;
 const DEFAULT_GROUP: &str = platform::DEFAULT_GROUP;
@@ -99,10 +98,14 @@ impl InstallRequest {
 /// mode from anywhere else would be a way to smuggle in a different one — the
 /// sudoers policy at `0440` and the client binary at `0755` both matter.
 pub fn installed_artifacts() -> Vec<(PathBuf, u32)> {
+    installed_artifacts_for_host(platform::host())
+}
+
+fn installed_artifacts_for_host(host: platform::Host) -> Vec<(PathBuf, u32)> {
     let prefix = PathBuf::from(PREFIX);
     let share = prefix.join("share/sudo-secretspec");
     vec![
-        (prefix.join("bin/sudo-secretspec"), 0o755),
+        (PathBuf::from(platform::client_path(host)), 0o755),
         (prefix.join("libexec/sudo-secretspec"), 0o755),
         (share.join("secretspec.toml"), 0o444),
         (share.join("sudo-secretspec-retired.toml"), 0o444),
@@ -136,7 +139,7 @@ fn require_mode(path: &Path) -> Result<u32, InstallError> {
 /// manifest, so a snapshot cannot be edited into a delivery vehicle for other
 /// content. On a first install there is nothing to capture and the manifest is
 /// written empty.
-fn capture_snapshot(snapshot: &Path) -> Result<usize, InstallError> {
+fn capture_snapshot(host: platform::Host, snapshot: &Path) -> Result<usize, InstallError> {
     fs::create_dir_all(snapshot)?;
     let mut perms = fs::metadata(snapshot)?.permissions();
     perms.set_mode(0o700);
@@ -144,7 +147,7 @@ fn capture_snapshot(snapshot: &Path) -> Result<usize, InstallError> {
 
     let mut manifest = String::new();
     let mut captured = 0usize;
-    for (index, (dest, _mode)) in installed_artifacts().iter().enumerate() {
+    for (index, (dest, _mode)) in installed_artifacts_for_host(host).iter().enumerate() {
         let meta = match fs::symlink_metadata(dest) {
             Ok(m) => m,
             Err(_) => continue,
@@ -161,19 +164,21 @@ fn capture_snapshot(snapshot: &Path) -> Result<usize, InstallError> {
         p.set_mode(0o600);
         fs::set_permissions(&prior, p)?;
         write_bytes(
+            host,
             &snapshot.join(format!("{index}.path")),
             dest.display().to_string().as_bytes(),
             0o600,
-            "root:wheel",
+            &format!("root:{}", platform::root_group(host)),
         )?;
         manifest.push_str(&format!("{}  {}\n", sha256_file(&prior)?, dest.display()));
         captured += 1;
     }
     write_bytes(
+        host,
         &snapshot.join("MANIFEST.sha256"),
         manifest.as_bytes(),
         0o600,
-        "root:wheel",
+        &format!("root:{}", platform::root_group(host)),
     )?;
     Ok(captured)
 }
@@ -279,10 +284,16 @@ pub(crate) fn prune_snapshots(dir: &Path, keep: usize) -> usize {
     removed
 }
 
-fn require_root() -> Result<(), InstallError> {
+fn require_root(host: platform::Host) -> Result<(), InstallError> {
     if unsafe { libc::geteuid() } != 0 {
         return Err(InstallError::Denied(
-            "must run as root (Touch ID/sudo is expected, including dry-run)".into(),
+            match host {
+                platform::Host::MacOs => {
+                    "must run as root (Touch ID/sudo is expected, including dry-run)"
+                }
+                _ => "must run as root (sudo is expected, including dry-run)",
+            }
+            .into(),
         ));
     }
     Ok(())
@@ -297,7 +308,13 @@ fn sha256_file(path: &Path) -> Result<String, InstallError> {
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
-fn install_file(src: &Path, dst: &Path, mode: u32, owner: &str) -> Result<(), InstallError> {
+fn install_file(
+    host: platform::Host,
+    src: &Path,
+    dst: &Path,
+    mode: u32,
+    owner: &str,
+) -> Result<(), InstallError> {
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -306,15 +323,18 @@ fn install_file(src: &Path, dst: &Path, mode: u32, owner: &str) -> Result<(), In
     let mut perms = fs::metadata(&tmp)?.permissions();
     perms.set_mode(mode);
     fs::set_permissions(&tmp, perms)?;
-    let _ = Command::new("/usr/sbin/chown")
-        .arg(owner)
-        .arg(&tmp)
-        .status();
+    set_owner(host, &tmp, owner)?;
     fs::rename(&tmp, dst)?;
     Ok(())
 }
 
-fn write_bytes(dst: &Path, bytes: &[u8], mode: u32, owner: &str) -> Result<(), InstallError> {
+fn write_bytes(
+    host: platform::Host,
+    dst: &Path,
+    bytes: &[u8],
+    mode: u32,
+    owner: &str,
+) -> Result<(), InstallError> {
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -326,11 +346,24 @@ fn write_bytes(dst: &Path, bytes: &[u8], mode: u32, owner: &str) -> Result<(), I
     let mut perms = fs::metadata(&tmp)?.permissions();
     perms.set_mode(mode);
     fs::set_permissions(&tmp, perms)?;
-    let _ = Command::new("/usr/sbin/chown")
-        .arg(owner)
-        .arg(&tmp)
-        .status();
+    set_owner(host, &tmp, owner)?;
     fs::rename(&tmp, dst)?;
+    Ok(())
+}
+
+/// A Linux install must not succeed with the wrong owner; staging remains usable
+/// by unprivileged callers for syntax-only checks, as it was on macOS.
+fn set_owner(host: platform::Host, path: &Path, owner: &str) -> Result<(), InstallError> {
+    let status = Command::new(platform::chown_path(host))
+        .arg(owner)
+        .arg(path)
+        .status();
+    if host == platform::Host::Linux && unsafe { libc::geteuid() } == 0 && !status?.success() {
+        return Err(InstallError::Denied(format!(
+            "cannot set owner {owner} on {}",
+            path.display()
+        )));
+    }
     Ok(())
 }
 
@@ -350,6 +383,15 @@ pub fn stage_sudoers(
     text: &str,
     mode: u32,
 ) -> Result<std::path::PathBuf, InstallError> {
+    stage_sudoers_for_host(platform::host(), dst, text, mode)
+}
+
+fn stage_sudoers_for_host(
+    host: platform::Host,
+    dst: &Path,
+    text: &str,
+    mode: u32,
+) -> Result<PathBuf, InstallError> {
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -361,12 +403,13 @@ pub fn stage_sudoers(
     let mut perms = fs::metadata(&staged)?.permissions();
     perms.set_mode(mode);
     fs::set_permissions(&staged, perms)?;
-    let _ = Command::new("/usr/sbin/chown")
-        .args(["root:wheel"])
-        .arg(&staged)
-        .status();
+    set_owner(
+        host,
+        &staged,
+        &format!("root:{}", platform::root_group(host)),
+    )?;
 
-    let accepted = Command::new("/usr/sbin/visudo")
+    let accepted = Command::new(platform::visudo_path(host))
         .args(["-c", "-f"])
         .arg(&staged)
         .status()
@@ -389,19 +432,23 @@ pub fn stage_sudoers(
 /// combined configuration is re-checked with a bare `visudo -c`. If that final
 /// check fails the previous policy is put back — or the file removed when there
 /// was no previous policy — before returning an error.
-fn install_sudoers(dst: &Path, text: &str, mode: u32) -> Result<(), InstallError> {
+fn install_sudoers(
+    host: platform::Host,
+    dst: &Path,
+    text: &str,
+    mode: u32,
+) -> Result<(), InstallError> {
     let previous = fs::read(dst).ok();
-    let staged = stage_sudoers(dst, text, mode)?;
+    let staged = stage_sudoers_for_host(host, dst, text, mode)?;
     fs::rename(&staged, dst)?;
 
     // Valid in isolation is not the same as valid in combination; re-check the
     // whole configuration now that the file is live.
     //
-    // A failure here is only ours to act on if *our* file is the one at fault.
-    // Unrelated policies in sudoers.d — another package shipping a file with
-    // the wrong mode, say — must not make this installer unusable, so re-check
-    // our own file and treat anyone else's problem as a warning.
-    let combined_ok = Command::new("/usr/sbin/visudo")
+    // macOS historically tolerates an unrelated policy error when our own file
+    // still validates. Linux requires the combined check to pass before calling
+    // the install successful, and restores the previous policy otherwise.
+    let combined_ok = Command::new(platform::visudo_path(host))
         .arg("-c")
         .status()
         .map(|s| s.success())
@@ -410,13 +457,13 @@ fn install_sudoers(dst: &Path, text: &str, mode: u32) -> Result<(), InstallError
         return Ok(());
     }
 
-    let ours_ok = Command::new("/usr/sbin/visudo")
+    let ours_ok = Command::new(platform::visudo_path(host))
         .args(["-c", "-f"])
         .arg(dst)
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
-    if ours_ok {
+    if ours_ok && host == platform::Host::MacOs {
         eprintln!(
             "warning: `visudo -c` reports a problem elsewhere in the sudoers configuration.\n\
              warning: {} itself is valid and has been installed. Review the output above;\n\
@@ -433,10 +480,11 @@ fn install_sudoers(dst: &Path, text: &str, mode: u32) -> Result<(), InstallError
             let mut perms = fs::metadata(&restore)?.permissions();
             perms.set_mode(mode);
             fs::set_permissions(&restore, perms)?;
-            let _ = Command::new("/usr/sbin/chown")
-                .args(["root:wheel"])
-                .arg(&restore)
-                .status();
+            set_owner(
+                host,
+                &restore,
+                &format!("root:{}", platform::root_group(host)),
+            )?;
             fs::rename(&restore, dst)?;
         }
         None => {
@@ -450,7 +498,14 @@ fn install_sudoers(dst: &Path, text: &str, mode: u32) -> Result<(), InstallError
     ))
 }
 
-fn ensure_service_group(name: &str, create: bool) -> Result<u32, InstallError> {
+fn ensure_service_group(
+    host: platform::Host,
+    name: &str,
+    create: bool,
+) -> Result<u32, InstallError> {
+    if host == platform::Host::Linux {
+        return ensure_linux_service_group(name, create);
+    }
     let output = Command::new("/usr/bin/dscl")
         .args([".", "-read", &format!("/Groups/{name}"), "PrimaryGroupID"])
         .output()?;
@@ -509,7 +564,17 @@ fn ensure_service_group(name: &str, create: bool) -> Result<u32, InstallError> {
     Ok(gid)
 }
 
-fn ensure_service_user(name: &str, gid: u32, create: bool) -> Result<(), InstallError> {
+fn ensure_service_user(
+    host: platform::Host,
+    name: &str,
+    group: &str,
+    gid: u32,
+    vault: &Path,
+    create: bool,
+) -> Result<(), InstallError> {
+    if host == platform::Host::Linux {
+        return ensure_linux_service_user(name, group, gid, vault, create);
+    }
     let output = Command::new("/usr/bin/id").arg(name).output()?;
     if output.status.success() {
         return Ok(());
@@ -550,6 +615,111 @@ fn ensure_service_user(name: &str, gid: u32, create: bool) -> Result<(), Install
                 "failed to create user {name}"
             )));
         }
+    }
+    Ok(())
+}
+
+/// Construct account-management commands separately so their fixed executable
+/// paths and argument boundaries can be checked without creating an account.
+fn linux_groupadd_command(name: &str) -> Command {
+    let mut command = Command::new("/usr/sbin/groupadd");
+    command.args(["--system", name]);
+    command
+}
+
+fn linux_useradd_command(name: &str, group: &str, vault: &Path) -> Command {
+    let mut command = Command::new("/usr/sbin/useradd");
+    command
+        .args(["--system", "--gid", group, "--home-dir"])
+        .arg(vault)
+        .args(["--no-create-home", "--shell", "/usr/sbin/nologin", name]);
+    command
+}
+
+/// NSS lookups also cover identities supplied by the host's configured account
+/// databases. A lookup error must not be mistaken for a missing account.
+fn linux_account(database: &str, name: &str) -> Result<Option<String>, InstallError> {
+    let output = Command::new("/usr/bin/getent")
+        .args([database, name])
+        .output()?;
+    if output.status.code() == Some(2) {
+        return Ok(None);
+    }
+    if !output.status.success() {
+        return Err(InstallError::Denied(format!(
+            "cannot look up {database} identity {name}"
+        )));
+    }
+    let entry = String::from_utf8(output.stdout)
+        .map_err(|_| InstallError::Denied("invalid account database response".into()))?;
+    if entry.lines().count() != 1 || entry.split(':').next() != Some(name) {
+        return Err(InstallError::Denied(format!(
+            "unexpected {database} identity for {name}"
+        )));
+    }
+    Ok(Some(entry))
+}
+
+fn account_id(entry: &str, field: usize) -> Result<u32, InstallError> {
+    entry
+        .split(':')
+        .nth(field)
+        .and_then(|v| v.trim().parse().ok())
+        .filter(|id| *id != 0)
+        .ok_or_else(|| InstallError::Denied("invalid service identity id".into()))
+}
+
+fn ensure_linux_service_group(name: &str, create: bool) -> Result<u32, InstallError> {
+    if let Some(entry) = linux_account("group", name)? {
+        return account_id(&entry, 2);
+    }
+    if !create {
+        return Err(InstallError::Denied(format!(
+            "adopted group missing: {name}"
+        )));
+    }
+    if !linux_groupadd_command(name).status()?.success() {
+        return Err(InstallError::Denied(format!(
+            "failed to create group {name}"
+        )));
+    }
+    let entry = linux_account("group", name)?
+        .ok_or_else(|| InstallError::Denied(format!("created group missing: {name}")))?;
+    account_id(&entry, 2)
+}
+
+fn ensure_linux_service_user(
+    name: &str,
+    group: &str,
+    gid: u32,
+    vault: &Path,
+    create: bool,
+) -> Result<(), InstallError> {
+    let entry = match linux_account("passwd", name)? {
+        Some(entry) => entry,
+        None if !create => {
+            return Err(InstallError::Denied(format!(
+                "adopted user missing: {name}"
+            )));
+        }
+        None => {
+            if !linux_useradd_command(name, group, vault)
+                .status()?
+                .success()
+            {
+                return Err(InstallError::Denied(format!(
+                    "failed to create user {name}"
+                )));
+            }
+            linux_account("passwd", name)?
+                .ok_or_else(|| InstallError::Denied(format!("created user missing: {name}")))?
+        }
+    };
+    account_id(&entry, 2)?;
+    if account_id(&entry, 3)? != gid {
+        return Err(InstallError::Denied(format!(
+            "service user {name} must have primary group {group}"
+        )));
     }
     Ok(())
 }
@@ -606,6 +776,31 @@ fn prepare_install_dir(path: &Path) -> Result<(), InstallError> {
     Ok(())
 }
 
+fn validate_adopted_vault(
+    host: platform::Host,
+    vault: &Path,
+    user: &str,
+    gid: u32,
+) -> Result<(), InstallError> {
+    if host != platform::Host::Linux {
+        return Ok(());
+    }
+    let meta = fs::symlink_metadata(vault)?;
+    if !meta.is_dir() || meta.mode() & 0o7777 != 0o700 {
+        return Err(InstallError::Denied(
+            "adopted vault must be a real directory with mode 0700".into(),
+        ));
+    }
+    let entry = linux_account("passwd", user)?
+        .ok_or_else(|| InstallError::Denied(format!("adopted user missing: {user}")))?;
+    if meta.uid() != account_id(&entry, 2)? || meta.gid() != gid {
+        return Err(InstallError::Denied(
+            "adopted vault must be owned by the service user and group".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// An adopted vault's `.env` is optional: present or absent is both fine.
 ///
 /// Matches `broker::require_boundary`'s own reasoning -- `.env` is vestigial
@@ -625,17 +820,53 @@ fn validate_adopted_env_if_present(vault: &Path) -> Result<(), InstallError> {
     Ok(())
 }
 
-fn validate_protected_ancestors() -> Result<(), InstallError> {
-    for dir in [
-        "/usr",
-        "/usr/local",
-        "/private",
-        "/private/var",
-        "/private/var/db",
-        "/private/etc",
-        "/private/etc/sudoers.d",
-    ] {
+fn protected_ancestors(host: platform::Host) -> &'static [&'static str] {
+    match host {
+        platform::Host::MacOs => &[
+            "/usr",
+            "/usr/local",
+            "/private",
+            "/private/var",
+            "/private/var/db",
+            "/private/etc",
+            "/private/etc/sudoers.d",
+        ],
+        _ => &[
+            "/",
+            "/etc",
+            "/etc/sudoers.d",
+            "/usr",
+            "/usr/local",
+            "/usr/local/bin",
+            "/usr/libexec",
+            "/usr/share",
+            "/usr/share/sudo-secretspec",
+            "/var",
+            "/var/lib",
+        ],
+    }
+}
+
+fn validate_protected_ancestors(host: platform::Host) -> Result<(), InstallError> {
+    for &dir in protected_ancestors(host) {
         let path = Path::new(dir);
+        // A minimal FHS system need not have these yet. Their existing parents
+        // are checked here; the live install creates and validates them before
+        // delivering any files. A dangling symlink is never "missing".
+        let optional = host == platform::Host::Linux
+            && matches!(
+                dir,
+                "/etc/sudoers.d"
+                    | "/usr/local"
+                    | "/usr/local/bin"
+                    | "/usr/libexec"
+                    | "/usr/share/sudo-secretspec"
+            );
+        if optional
+            && fs::symlink_metadata(path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+        {
+            continue;
+        }
         if !is_real_dir(path) {
             return Err(InstallError::Denied(format!(
                 "unsafe protected directory {dir}"
@@ -646,6 +877,61 @@ fn validate_protected_ancestors() -> Result<(), InstallError> {
                 "unsafe protected directory metadata {dir}"
             )));
         }
+    }
+    Ok(())
+}
+
+/// Recognize a direct include without mistaking a comment or a similarly named
+/// directory for an active sudoers directive. More elaborate include chains are
+/// left to visudo; an unrecognized layout produces a warning, never an edit to
+/// the host's main sudoers file.
+fn sudoers_includes_dropins(text: &str) -> bool {
+    text.lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        if !matches!(fields.next(), Some("@includedir" | "#includedir")) {
+            return false;
+        }
+        let Some(path) = fields.next() else {
+            return false;
+        };
+        let path = path
+            .strip_prefix('"')
+            .and_then(|p| p.strip_suffix('"'))
+            .unwrap_or(path);
+        if path.trim_end_matches('/') != "/etc/sudoers.d" {
+            return false;
+        }
+        fields.next().is_none_or(|tail| tail.starts_with('#'))
+    })
+}
+
+fn linux_install_prerequisites() -> Result<(), InstallError> {
+    for path in [platform::SUDO, platform::visudo_path(platform::Host::Linux)] {
+        if !fs::metadata(path).is_ok_and(|m| m.is_file() && m.mode() & 0o111 != 0) {
+            return Err(InstallError::Denied(format!(
+                "Linux install requires {path}; install the sudo package before retrying"
+            )));
+        }
+    }
+    let main = fs::read_to_string("/etc/sudoers")?;
+    if !sudoers_includes_dropins(&main) {
+        eprintln!(
+            "warning: /etc/sudoers has no recognized direct include of /etc/sudoers.d.\n\
+            warning: confirm it includes `@includedir /etc/sudoers.d` (possibly through another file)\n\
+            warning: using visudo before relying on the installed policy."
+        );
+    }
+    Ok(())
+}
+
+/// Match config validation: a vault is exactly one child of the protected
+/// parent, so neither traversal nor a nested directory can widen the boundary.
+fn validate_vault_realpath(vault: &Path, parent: &Path) -> Result<(), InstallError> {
+    if vault.parent() != Some(parent) || vault.file_name().is_none() {
+        return Err(InstallError::Denied(format!(
+            "vault must resolve to one direct child of {}",
+            parent.display()
+        )));
     }
     Ok(())
 }
@@ -698,6 +984,15 @@ fn resolve_source_root(explicit: Option<&Path>) -> Result<PathBuf, InstallError>
     }
     let self_exe = std::env::current_exe()
         .map_err(|e| InstallError::Denied(format!("cannot resolve current exe: {e}")))?;
+    // On FHS Linux the client lives under /usr/local but the boundary's media
+    // shape is under /usr. Point installed-client invocations at that boundary
+    // so resolve_media catches a self-install instead of reporting missing media.
+    if same_file(
+        &self_exe,
+        Path::new(platform::client_path(platform::host())),
+    ) {
+        return Ok(PathBuf::from(PREFIX));
+    }
     self_exe
         .parent()
         .and_then(Path::parent)
@@ -736,6 +1031,14 @@ fn same_file(a: &Path, b: &Path) -> bool {
 /// A destination that does not exist yet is a first install and cannot be
 /// self-sourced.
 fn resolve_media(source_root: &Path, broker_dst: &Path) -> Result<Media, InstallError> {
+    resolve_media_for_host(platform::host(), source_root, broker_dst)
+}
+
+fn resolve_media_for_host(
+    host: platform::Host,
+    source_root: &Path,
+    broker_dst: &Path,
+) -> Result<Media, InstallError> {
     let media = Media {
         broker: source_root.join("libexec/sudo-secretspec"),
         guidance: source_root.join("share/sudo-secretspec/AI-GUIDANCE.md"),
@@ -743,13 +1046,19 @@ fn resolve_media(source_root: &Path, broker_dst: &Path) -> Result<Media, Install
     };
 
     if same_file(&media.broker, broker_dst) {
+        let recovery = if host == platform::Host::MacOs {
+            "Run install from the copy your package manager ships, which is kept off PATH so \
+             it cannot shadow the installed client:\n  \
+             $(brew --prefix)/opt/sudo-secretspec/libexec/sudo-secretspec install"
+        } else {
+            "Run install from the extracted release artifact:\n  \
+             ./libexec/sudo-secretspec install --declarations /absolute/path/to/secretspec.toml"
+        };
         return Err(InstallError::Denied(format!(
             "refusing to install from the installed boundary itself ({}).\n\
              This would copy every artifact onto itself and report success while upgrading \
              nothing.\n\
-             Run install from the copy your package manager ships, which is kept off PATH so \
-             it cannot shadow the installed client:\n  \
-             $(brew --prefix)/opt/sudo-secretspec/libexec/sudo-secretspec install",
+             {recovery}",
             media.broker.display()
         )));
     }
@@ -902,25 +1211,12 @@ pub fn sudoers_text(operator: &str, service_user: &str) -> String {
          {grants}\
          {operator} ALL=(root) NOPASSWD: {broker} doctor\n\
          {operator} ALL=(root) NOPASSWD: {broker} doctor *\n",
-        secure_path = SUDOERS_SECURE_PATH,
+        secure_path = platform::secure_path(platform::Host::MacOs),
         grants = operator_grant_lines(operator, service_user, &broker),
         operator = operator,
     )
 }
 
-/// Sudoers policy for the declared (Linux/NixOS) boundary.
-///
-/// The broker is [`platform::BROKER_PATH`], the store path baked in at compile
-/// time by the flake's package. There is no public client path on Linux — no
-/// `/usr/local/bin/sudo-secretspec` and no Touch ID — so the
-/// `timestamp_timeout=0` client line and the `doctor` grants (a macOS-only
-/// diagnostic) have nothing to attach to and are omitted. `doctor` refuses on
-/// Linux anyway (`platform::lifecycle_refusal`), so granting it would name a
-/// command that cannot run.
-///
-/// Printed by the hidden `print-sudoers` subcommand and embedded by the NixOS
-/// module via import-from-derivation, so the module's sudoers text and the
-/// binary's own view of the broker path can never drift apart.
 /// Whether a name is acceptable as the grantee of a Linux NOPASSWD sudoers
 /// line (the operator) or as the service user the broker runs as.
 ///
@@ -944,7 +1240,54 @@ fn linux_identity_valid(value: &str) -> bool {
     })
 }
 
+/// Sudoers policy for the declared NixOS boundary.
+///
+/// The broker is [`platform::BROKER_PATH`], the store path baked in at compile
+/// time by the flake's package. There is no imperative installer and no public
+/// client path to bind `timestamp_timeout=0` to, and `doctor` refuses on NixOS
+/// (`platform::lifecycle_refusal`), so granting it would name a command that
+/// cannot run.
+///
+/// Printed by the hidden `print-sudoers` subcommand and embedded by the NixOS
+/// module via import-from-derivation, so the module's sudoers text and the
+/// binary's own view of the broker path can never drift apart. It never
+/// consults the running system: the IFD runs in a build sandbox that has no
+/// `/run/current-system`.
+pub fn nixos_sudoers_text(operator: &str, service_user: &str) -> Result<String, String> {
+    check_linux_principals(operator, service_user)?;
+    Ok(format!(
+        "Defaults!{broker} env_reset,env_keep-=\"HOME\",secure_path={secure_path},umask=0077,always_set_home\n\
+         {grants}",
+        broker = platform::BROKER_PATH,
+        secure_path = platform::secure_path(platform::Host::NixOs),
+        grants = operator_grant_lines(operator, service_user, platform::BROKER_PATH),
+    ))
+}
+
+/// Sudoers policy for an ordinary (non-NixOS) Linux, written by the imperative
+/// installer.
+///
+/// Same shape as the macOS policy minus the `doctor` grants: the broker at
+/// [`platform::DEFAULT_BROKER_PATH`] is NOPASSWD only for the mediated broker
+/// verbs, the public client at `platform::client_path(Host::Linux)` carries
+/// `timestamp_timeout=0` so `install`/`uninstall`/`rollback`/`doctor` always
+/// ask for the operator's password, and `secure_path` names `/usr/bin` and the
+/// client directory. Nothing is granted for `install`, `uninstall`, `rollback`
+/// or `doctor`, and nothing is granted to `ALL`.
 pub fn linux_sudoers_text(operator: &str, service_user: &str) -> Result<String, String> {
+    check_linux_principals(operator, service_user)?;
+    let broker = platform::DEFAULT_BROKER_PATH;
+    Ok(format!(
+        "Defaults!{broker} env_reset,env_keep-=\"HOME\",secure_path={secure_path},umask=0077,always_set_home\n\
+         Defaults!{client} timestamp_timeout=0\n\
+         {grants}",
+        secure_path = platform::secure_path(platform::Host::Linux),
+        client = platform::client_path(platform::Host::Linux),
+        grants = operator_grant_lines(operator, service_user, broker),
+    ))
+}
+
+fn check_linux_principals(operator: &str, service_user: &str) -> Result<(), String> {
     if !linux_identity_valid(operator) {
         return Err(format!(
             "refusing to emit sudoers: operator {operator:?} is not a valid sudoers principal"
@@ -955,31 +1298,58 @@ pub fn linux_sudoers_text(operator: &str, service_user: &str) -> Result<String, 
             "refusing to emit sudoers: service user {service_user:?} is not a valid identity"
         ));
     }
-    Ok(format!(
-        "Defaults!{broker} env_reset,env_keep-=\"HOME\",secure_path={secure_path},umask=0077,always_set_home\n\
-         {grants}",
-        broker = platform::BROKER_PATH,
-        secure_path = SUDOERS_SECURE_PATH,
-        grants = operator_grant_lines(operator, service_user, platform::BROKER_PATH),
-    ))
+    Ok(())
 }
 
-/// The sudoers policy for the platform this binary was compiled for.
-///
-/// The macOS installer (`install`) calls [`sudoers_text`]; the NixOS module and
-/// the hidden `print-sudoers` subcommand call this so one function is the single
-/// source of truth per platform.
+/// The policy the hidden `print-sudoers` subcommand emits: the declared
+/// boundary's policy for this build. On Linux that is the NixOS module's, never
+/// the imperative installer's (see [`nixos_sudoers_text`]).
 pub fn sudoers_text_for_platform(operator: &str, service_user: &str) -> Result<String, String> {
     if platform::IS_MACOS {
         Ok(sudoers_text(operator, service_user))
     } else {
-        linux_sudoers_text(operator, service_user)
+        nixos_sudoers_text(operator, service_user)
+    }
+}
+
+/// The policy the imperative installer writes on `host`.
+pub fn sudoers_text_for_host(
+    host: platform::Host,
+    operator: &str,
+    service_user: &str,
+) -> Result<String, String> {
+    match host {
+        platform::Host::MacOs => Ok(sudoers_text(operator, service_user)),
+        platform::Host::Linux => linux_sudoers_text(operator, service_user),
+        platform::Host::NixOs => Err("NixOS has no imperative installer".into()),
     }
 }
 
 /// Run the installer. Returns Ok(()) on success.
 pub fn run(req: InstallRequest) -> Result<(), InstallError> {
-    require_root()?;
+    run_for_host(platform::host(), req)
+}
+
+fn run_for_host(host: platform::Host, req: InstallRequest) -> Result<(), InstallError> {
+    if let Some(message) = platform::lifecycle_refusal_for(host, platform::BROKER_PATH, "install") {
+        return Err(InstallError::Denied(message));
+    }
+    require_root(host)?;
+    if host == platform::Host::Linux {
+        linux_install_prerequisites()?;
+    }
+    let policy = sudoers_text_for_host(host, &req.operator, &req.service_user)
+        .map_err(InstallError::Denied)?;
+    let initial_vault_real = if req.vault.exists() || req.vault.is_symlink() {
+        resolve_path(&req.vault)
+    } else if let (Some(parent), Some(name)) = (req.vault.parent(), req.vault.file_name()) {
+        resolve_path(parent).join(name)
+    } else {
+        req.vault.clone()
+    };
+    validate_vault_realpath(&initial_vault_real, Path::new(platform::VAULT_REAL_PARENT))?;
+    crate::config::Config::parse(&config_toml(&req, &initial_vault_real))
+        .map_err(|e| InstallError::Denied(e.to_string()))?;
     if let Some(decl) = &req.declarations {
         if !decl.is_file() || decl.is_symlink() {
             return Err(InstallError::Denied(
@@ -987,16 +1357,17 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
             ));
         }
     }
-    validate_protected_ancestors()?;
+    validate_protected_ancestors(host)?;
 
     // Resolve and validate the source media before the dry-run return, not
     // after it. These checks used to sit ~110 lines further down, past this
     // early exit, which left `--dry-run` — the one command reached for to
     // pre-flight an install — structurally unable to report the most likely
     // thing to be wrong with one.
-    let client_dst = PathBuf::from(PREFIX).join("bin/sudo-secretspec");
+    let client_dst = PathBuf::from(platform::client_path(host));
     let broker_dst = PathBuf::from(PREFIX).join("libexec/sudo-secretspec");
-    let media = resolve_media(
+    let media = resolve_media_for_host(
+        host,
         &resolve_source_root(req.source_root.as_deref())?,
         &broker_dst,
     )?;
@@ -1039,15 +1410,17 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
                     req.service_user
                 )));
             }
-            let group_status = Command::new("/usr/bin/dscl")
-                .args([".", "-read", &format!("/Groups/{}", req.service_group)])
-                .status()
-                .map_err(|e| InstallError::Denied(e.to_string()))?;
-            if !group_status.success() {
-                return Err(InstallError::Denied(format!(
-                    "adopted group missing: {}",
-                    req.service_group
-                )));
+            if host == platform::Host::MacOs {
+                let group_status = Command::new("/usr/bin/dscl")
+                    .args([".", "-read", &format!("/Groups/{}", req.service_group)])
+                    .status()
+                    .map_err(|e| InstallError::Denied(e.to_string()))?;
+                if !group_status.success() {
+                    return Err(InstallError::Denied(format!(
+                        "adopted group missing: {}",
+                        req.service_group
+                    )));
+                }
             }
             if !req.vault.is_dir() || req.vault.is_symlink() {
                 return Err(InstallError::Denied(
@@ -1073,10 +1446,18 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
             }
             validate_adopted_env_if_present(&req.vault)?;
             let vault_real = resolve_path(&req.vault);
-            if !vault_real.starts_with("/private/var/db/") {
-                return Err(InstallError::Denied(
-                    "vault resolves outside /private/var/db".into(),
-                ));
+            validate_vault_realpath(&vault_real, Path::new(platform::VAULT_REAL_PARENT))?;
+            if host == platform::Host::Linux {
+                let gid = ensure_service_group(host, &req.service_group, false)?;
+                ensure_service_user(
+                    host,
+                    &req.service_user,
+                    &req.service_group,
+                    gid,
+                    &req.vault,
+                    false,
+                )?;
+                validate_adopted_vault(host, &req.vault, &req.service_user, gid)?;
             }
         }
         println!(
@@ -1092,9 +1473,27 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
         return Ok(());
     }
 
+    if req.adopt_existing {
+        let manifest = req.vault.join("secretspec.toml");
+        if !manifest.is_file() || manifest.is_symlink() {
+            return Err(InstallError::Denied(format!(
+                "adopted runtime file missing or symlinked: {}",
+                manifest.display()
+            )));
+        }
+        validate_adopted_env_if_present(&req.vault)?;
+    }
+
     // Create or adopt service identity.
-    let gid = ensure_service_group(&req.service_group, !req.adopt_existing)?;
-    ensure_service_user(&req.service_user, gid, !req.adopt_existing)?;
+    let gid = ensure_service_group(host, &req.service_group, !req.adopt_existing)?;
+    ensure_service_user(
+        host,
+        &req.service_user,
+        &req.service_group,
+        gid,
+        &req.vault,
+        !req.adopt_existing,
+    )?;
 
     // Vault.
     let mut created_vault = false;
@@ -1117,20 +1516,20 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
             ));
         }
     } else {
-        let _ = Command::new("/usr/sbin/chown")
-            .arg(format!("{}:{}", req.service_user, req.service_group))
-            .arg(&req.vault)
-            .status();
+        set_owner(
+            host,
+            &req.vault,
+            &format!("{}:{}", req.service_user, req.service_group),
+        )?;
         let mut perms = fs::metadata(&req.vault)?.permissions();
         perms.set_mode(0o700);
         fs::set_permissions(&req.vault, perms)?;
     }
 
     let vault_real = resolve_path(&req.vault);
-    if !vault_real.starts_with("/private/var/db/") {
-        return Err(InstallError::Denied(
-            "vault resolves outside /private/var/db".into(),
-        ));
+    validate_vault_realpath(&vault_real, Path::new(platform::VAULT_REAL_PARENT))?;
+    if req.adopt_existing {
+        validate_adopted_vault(host, &req.vault, &req.service_user, gid)?;
     }
 
     // Source media resolved and validated above, before the dry-run return.
@@ -1152,8 +1551,20 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
     // Create first, then validate: on a first install these may not exist yet.
     // The nested `share/sudo-secretspec` is created by the same loop for the
     // same reason — it holds the manifest `rollback` verifies against.
-    for dir in ["bin", "libexec", "etc", "share"] {
-        prepare_install_dir(&PathBuf::from(PREFIX).join(dir))?;
+    if host == platform::Host::MacOs {
+        for dir in ["bin", "libexec", "etc", "share"] {
+            prepare_install_dir(&PathBuf::from(PREFIX).join(dir))?;
+        }
+    } else {
+        for dir in [
+            "/usr/local",
+            "/usr/local/bin",
+            "/usr/libexec",
+            "/usr/share",
+            "/etc/sudoers.d",
+        ] {
+            prepare_install_dir(Path::new(dir))?;
+        }
     }
     prepare_install_dir(&share)?;
 
@@ -1162,18 +1573,20 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
     let stamp = chrono_like_stamp();
     let libexec = PathBuf::from(PREFIX).join("libexec");
     let rollback = libexec.join(format!("{SNAPSHOT_PREFIX}{stamp}"));
-    let captured = capture_snapshot(&rollback)?;
+    let captured = capture_snapshot(host, &rollback)?;
 
-    let root_owner = "root:wheel";
+    let root_owner = format!("root:{}", platform::root_group(host));
     let service_owner = format!("{}:{}", req.service_user, req.service_group);
 
     install_file(
+        host,
         &media.broker,
         &client_dst,
         require_mode(&client_dst)?,
-        root_owner,
+        &root_owner,
     )?;
     install_file(
+        host,
         &media.broker,
         &broker_dst,
         require_mode(&broker_dst)?,
@@ -1181,6 +1594,7 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
     )?;
     if let Some(decl) = &req.declarations {
         install_file(
+            host,
             decl,
             &declarations_dst,
             require_mode(&declarations_dst)?,
@@ -1188,18 +1602,21 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
         )?;
     }
     install_file(
+        host,
         &media.retired,
         &retired_dst,
         require_mode(&retired_dst)?,
         &service_owner,
     )?;
     install_file(
+        host,
         &media.guidance,
         &guidance_dst,
         require_mode(&guidance_dst)?,
         &service_owner,
     )?;
     write_bytes(
+        host,
         &config_dst,
         config_toml(&req, &vault_real).as_bytes(),
         require_mode(&config_dst)?,
@@ -1208,11 +1625,7 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
     // Validated before it can take effect, and rolled back if the combined
     // configuration is rejected — a broken sudoers.d file would leave the
     // operator unable to elevate at all.
-    install_sudoers(
-        &sudoers_dst,
-        &sudoers_text(&req.operator, &req.service_user),
-        require_mode(&sudoers_dst)?,
-    )?;
+    install_sudoers(host, &sudoers_dst, &policy, require_mode(&sudoers_dst)?)?;
 
     // Release manifest of installed artifacts.
     let mut manifest = String::new();
@@ -1231,6 +1644,7 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
         manifest.push_str(&format!("{}  {}\n", sha256_file(path)?, path.display()));
     }
     write_bytes(
+        host,
         &manifest_dst,
         manifest.as_bytes(),
         require_mode(&manifest_dst)?,
@@ -1244,10 +1658,7 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
             let mut p = fs::metadata(path)?.permissions();
             p.set_mode(0o600);
             fs::set_permissions(path, p)?;
-            let _ = Command::new("/usr/sbin/chown")
-                .arg(format!("{}:{}", req.service_user, req.service_group))
-                .arg(path)
-                .status();
+            set_owner(host, path, &service_owner)?;
         }
     } else {
         let manifest_path = req.vault.join("secretspec.toml");
@@ -1628,13 +2039,242 @@ mod tests {
     }
 
     #[test]
-    fn linux_policy_grants_broker_verbs_only() {
+    fn linux_policy_names_fhs_paths_and_only_grants_broker_verbs() {
+        let text = linux_sudoers_text("dann", "sudo-secretspec").unwrap();
+        assert!(
+            text.contains(
+                "secure_path=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin,"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("Defaults!/usr/local/bin/sudo-secretspec timestamp_timeout=0\n"),
+            "{text}"
+        );
+        let grants: Vec<_> = text.lines().filter(|l| l.contains("NOPASSWD:")).collect();
+        assert_eq!(grants.len(), BROKER_VERBS.len() + 1);
+        for verb in BROKER_VERBS {
+            assert!(
+                grants.contains(
+                    &format!(
+                        "dann ALL=(sudo-secretspec) NOPASSWD: {} __broker {verb} --*",
+                        platform::DEFAULT_BROKER_PATH
+                    )
+                    .as_str()
+                ),
+                "{text}"
+            );
+        }
+        assert!(
+            grants.contains(
+                &format!(
+                    "dann ALL=(sudo-secretspec) NOPASSWD: {} __broker audit-verify",
+                    platform::DEFAULT_BROKER_PATH
+                )
+                .as_str()
+            ),
+            "{text}"
+        );
+        for line in grants {
+            assert!(
+                line.starts_with("dann ALL=(sudo-secretspec) NOPASSWD: "),
+                "{line}"
+            );
+            for absent in [
+                " doctor",
+                " install",
+                " uninstall",
+                " rollback",
+                "source-restore-force",
+                "source-destroy",
+                "NOPASSWD: ALL",
+            ] {
+                assert!(!line.contains(absent), "{line}");
+            }
+        }
+        assert!(!text.lines().any(|l| l.starts_with("ALL=")), "{text}");
+    }
+
+    #[test]
+    fn linux_policy_refuses_the_same_non_principals_as_nixos() {
+        for bad in [
+            "ALL",
+            "root",
+            "%wheel",
+            "#1000",
+            "dann,nginx",
+            "dann\nroot ALL=(ALL) NOPASSWD: ALL",
+            "Dann",
+            "-dann",
+            "",
+        ] {
+            assert!(
+                linux_sudoers_text(bad, "sudo-secretspec").is_err(),
+                "{bad:?}"
+            );
+            assert!(linux_sudoers_text("dann", bad).is_err(), "{bad:?}");
+            assert!(
+                nixos_sudoers_text(bad, "sudo-secretspec").is_err(),
+                "{bad:?}"
+            );
+            assert!(nixos_sudoers_text("dann", bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn nixos_policy_is_byte_identical_to_the_declared_policy() {
+        // Pinned from HEAD's original linux_sudoers_text: changing imperative
+        // Linux must not change what the NixOS module evaluates in its sandbox.
+        let expected = format!(
+            "Defaults!{broker} env_reset,env_keep-=\"HOME\",secure_path=/run/current-system/sw/bin:/run/wrappers/bin,umask=0077,always_set_home\n\
+             dann ALL=(sudo-secretspec) NOPASSWD: {broker} __broker source-add --*\n\
+             dann ALL=(sudo-secretspec) NOPASSWD: {broker} __broker source-set --*\n\
+             dann ALL=(sudo-secretspec) NOPASSWD: {broker} __broker source-delete --*\n\
+             dann ALL=(sudo-secretspec) NOPASSWD: {broker} __broker source-undeclare --*\n\
+             dann ALL=(sudo-secretspec) NOPASSWD: {broker} __broker source-get --*\n\
+             dann ALL=(sudo-secretspec) NOPASSWD: {broker} __broker source-check --*\n\
+             dann ALL=(sudo-secretspec) NOPASSWD: {broker} __broker source-export --*\n\
+             dann ALL=(sudo-secretspec) NOPASSWD: {broker} __broker source-template-check --*\n\
+             dann ALL=(sudo-secretspec) NOPASSWD: {broker} __broker source-schema --*\n\
+             dann ALL=(sudo-secretspec) NOPASSWD: {broker} __broker source-restore --*\n\
+             dann ALL=(sudo-secretspec) NOPASSWD: {broker} __broker audit-verify\n",
+            broker = platform::BROKER_PATH,
+        );
+        assert_eq!(
+            nixos_sudoers_text("dann", "sudo-secretspec").unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn imperative_policy_selection_is_host_driven() {
+        assert_eq!(
+            sudoers_text_for_host(platform::Host::MacOs, "dann", "_svc").unwrap(),
+            sudoers_text("dann", "_svc")
+        );
+        assert_eq!(
+            sudoers_text_for_host(platform::Host::Linux, "dann", "sudo-secretspec").unwrap(),
+            linux_sudoers_text("dann", "sudo-secretspec").unwrap()
+        );
+        assert!(sudoers_text_for_host(platform::Host::NixOs, "dann", "sudo-secretspec").is_err());
+    }
+
+    #[test]
+    fn imperative_installer_refuses_nixos_before_root_or_filesystem_work() {
+        let req = InstallRequest::from_cli(None, true, false);
+        let err = run_for_host(platform::Host::NixOs, req).unwrap_err();
+        assert!(
+            err.to_string().contains("services.sudo-secretspec"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn linux_service_creation_uses_absolute_tools_and_explicit_arguments() {
+        use std::ffi::OsStr;
+        let group = linux_groupadd_command("sudo-secretspec");
+        assert_eq!(group.get_program(), OsStr::new("/usr/sbin/groupadd"));
+        assert_eq!(
+            group.get_args().collect::<Vec<_>>(),
+            ["--system", "sudo-secretspec"].map(OsStr::new)
+        );
+        let user = linux_useradd_command(
+            "sudo-secretspec",
+            "sudo-secretspec",
+            Path::new("/var/lib/sudo-secretspec"),
+        );
+        assert_eq!(user.get_program(), OsStr::new("/usr/sbin/useradd"));
+        assert_eq!(
+            user.get_args().collect::<Vec<_>>(),
+            [
+                "--system",
+                "--gid",
+                "sudo-secretspec",
+                "--home-dir",
+                "/var/lib/sudo-secretspec",
+                "--no-create-home",
+                "--shell",
+                "/usr/sbin/nologin",
+                "sudo-secretspec"
+            ]
+            .map(OsStr::new)
+        );
+    }
+
+    #[test]
+    fn includedir_check_recognizes_directives_but_not_comments_or_other_paths() {
+        for line in [
+            "@includedir /etc/sudoers.d",
+            "  #includedir\t/etc/sudoers.d\n",
+            "@includedir \"/etc/sudoers.d/\" # local rules",
+        ] {
+            assert!(sudoers_includes_dropins(line), "{line}");
+        }
+        for line in [
+            "# @includedir /etc/sudoers.d",
+            "# includedir /etc/sudoers.d",
+            "@include /etc/sudoers.d",
+            "@includedir /etc/sudoers.d-other",
+            "@includedir",
+            "@includedir /etc/sudoers.d unexpected",
+        ] {
+            assert!(!sudoers_includes_dropins(line), "{line}");
+        }
+    }
+
+    #[test]
+    fn vault_realpath_requires_one_direct_child_of_the_platform_parent() {
+        let parent = Path::new("/var/lib");
+        assert!(validate_vault_realpath(Path::new("/var/lib/sudo-secretspec"), parent).is_ok());
+        for path in [
+            "/var/lib",
+            "/var/lib/..",
+            "/var/lib/outer/vault",
+            "/private/var/db/sudo-secretspec",
+        ] {
+            assert!(
+                validate_vault_realpath(Path::new(path), parent).is_err(),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn linux_artifacts_keep_the_public_client_separate_from_the_broker() {
+        let artifacts = installed_artifacts_for_host(platform::Host::Linux);
+        assert_eq!(
+            artifacts[0],
+            (PathBuf::from("/usr/local/bin/sudo-secretspec"), 0o755)
+        );
+        assert_ne!(artifacts[0].0, artifacts[1].0);
+    }
+
+    #[test]
+    fn linux_self_install_refusal_points_to_extracted_release_media() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = media_root(tmp.path());
+        let err = resolve_media_for_host(
+            platform::Host::Linux,
+            &root,
+            &root.join("libexec/sudo-secretspec"),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("./libexec/sudo-secretspec install --declarations"),
+            "{err}"
+        );
+        assert!(!err.to_string().contains("brew"), "{err}");
+    }
+
+    #[test]
+    fn nixos_policy_grants_broker_verbs_only() {
         // The declared boundary has no public client path (no Touch ID, no
         // imperative installer), so the Linux text omits the `timestamp_timeout=0`
         // client line and the macOS-only `doctor` grants, and grants exactly the
         // mediated broker verbs plus the read-only `audit-verify`. The force and
         // destroy verbs stay un-granted for the same reason as on macOS.
-        let text = linux_sudoers_text("dann", "sudo-secretspec").unwrap();
+        let text = nixos_sudoers_text("dann", "sudo-secretspec").unwrap();
         for verb in BROKER_VERBS {
             assert!(
                 text.contains(&format!(
@@ -1668,7 +2308,7 @@ mod tests {
     }
 
     #[test]
-    fn linux_sudoers_text_refuses_non_principal_identities() {
+    fn nixos_sudoers_text_refuses_non_principal_identities() {
         // M1: the operator and service user reach the sudoers text verbatim, so
         // a config author who writes `ALL`, `root`, a group, a uid, or an
         // injected rule would emit a policy that `visudo -c` happily accepts.
@@ -1684,15 +2324,15 @@ mod tests {
             "-dann",
         ] {
             assert!(
-                linux_sudoers_text(bad, "sudo-secretspec").is_err(),
+                nixos_sudoers_text(bad, "sudo-secretspec").is_err(),
                 "operator {bad:?} must be refused"
             );
         }
         assert!(
-            linux_sudoers_text("dann", "ALL").is_err(),
+            nixos_sudoers_text("dann", "ALL").is_err(),
             "service user ALL must be refused"
         );
-        assert!(linux_sudoers_text("dann", "sudo-secretspec").is_ok());
+        assert!(nixos_sudoers_text("dann", "sudo-secretspec").is_ok());
     }
 
     #[test]
@@ -1817,7 +2457,10 @@ mod tests {
         let req = InstallRequest::from_cli(Some(PathBuf::from("/dev/null")), false, false);
         fs::write(
             &config,
-            config_toml(&req, Path::new("/private/var/db/sudo-secretspec")),
+            config_toml(
+                &req,
+                &Path::new(platform::VAULT_REAL_PARENT).join("sudo-secretspec"),
+            ),
         )
         .unwrap();
 
@@ -1867,14 +2510,16 @@ mod tests {
             r#"
 engine = "/usr/local/libexec/sudo-secretspec"
 audit_helper = "/usr/local/libexec/sudo-secretspec"
-vault = "/var/db/{vault}"
-vault_realpath = "/private/var/db/{vault}"
+vault = "{vault_parent}/{vault}"
+vault_realpath = "{vault_real_parent}/{vault}"
 declarations = "/usr/local/share/sudo-secretspec/secretspec.toml"
 service_user = "{user}"
 service_group = "{group}"
 profile = "default"
 adopted_vault = true
-"#
+"#,
+            vault_parent = platform::VAULT_PARENT,
+            vault_real_parent = platform::VAULT_REAL_PARENT,
         )
     }
 
@@ -1893,8 +2538,8 @@ adopted_vault = true
         // A reinstall must follow the installed config, not the older directory.
         let (_tmp, config) = write_config(&installed_config(
             "sudo-secretspec",
-            "_sudo_secretspec",
-            "_sudo_secretspec",
+            DEFAULT_USER,
+            DEFAULT_GROUP,
         ));
 
         let found = detect_existing_vault(&config, |_| true).unwrap();
@@ -1918,7 +2563,10 @@ adopted_vault = true
 
         let found = detect_existing_vault(&config, |_| true).unwrap();
 
-        assert_eq!(found.vault, PathBuf::from(LEGACY_VAULT));
+        assert_eq!(
+            found.vault,
+            Path::new(platform::VAULT_PARENT).join("stayturgid-secrets")
+        );
         assert_eq!(found.service_user, LEGACY_USER);
         assert_eq!(found.service_group, LEGACY_GROUP);
         // Origin, not path, is what decides automatic adoption: this IS the
@@ -1958,8 +2606,8 @@ adopted_vault = true
         // pin the installer to a directory that no longer exists.
         let (_tmp, config) = write_config(&installed_config(
             "sudo-secretspec",
-            "_sudo_secretspec",
-            "_sudo_secretspec",
+            DEFAULT_USER,
+            DEFAULT_GROUP,
         ));
 
         let found = detect_existing_vault(&config, |p| p == Path::new(LEGACY_VAULT));

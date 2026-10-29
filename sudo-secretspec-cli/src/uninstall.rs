@@ -19,15 +19,39 @@ use thiserror::Error;
 
 use crate::drift::parse_manifest;
 use crate::install::{PREFIX, SUDOERS_DIR, installed_artifacts, prune_snapshots};
+use crate::platform::{self, Host};
 
-/// Lowest and highest uid/gid the installer will allocate for the service
+/// Lowest and highest uid/gid the macOS installer will allocate for the service
 /// identity (`install::ensure_service_group`, `install::ensure_service_user`).
+/// Linux has no such window; see [`check_linux_service_identity`].
 ///
 /// `--remove-service-user` refuses anything outside this window. An adopted
 /// identity can be an ordinary account — the deployed configuration on the
 /// development host adopts group `staff` — and deleting one of those because a
 /// configuration file named it would be far worse than declining to.
 const SERVICE_ID_RANGE: std::ops::RangeInclusive<u32> = 400..=499;
+
+/// Highest id Debian's `base-passwd` reserves for static system accounts
+/// (`root`, `daemon`, `www-data`, ...). A service identity the installer
+/// created with `useradd --system` always lands above it, so anything at or
+/// below it is somebody else's account and `uid` 0 can never qualify.
+const LINUX_STATIC_ID_CEILING: u32 = 99;
+
+/// `SYS_UID_MAX`/`SYS_GID_MAX` when `/etc/login.defs` names neither them nor
+/// `UID_MIN`/`GID_MIN`: `login.defs(5)` defines the maximum as the regular
+/// minimum (default 1000) minus one.
+const LINUX_DEFAULT_SYS_ID_MAX: u32 = 999;
+
+/// Absolute, never resolved through `PATH`. `passwd` ships both in `/usr/sbin`
+/// on Debian (`/sbin` is a symlink to it on a merged-usr system).
+const USERDEL: &str = "/usr/sbin/userdel";
+const GROUPDEL: &str = "/usr/sbin/groupdel";
+/// The local account databases `userdel`/`groupdel` edit. Read directly rather
+/// than through NSS so the check judges exactly what is about to be deleted:
+/// an LDAP or NIS account of the same name is not removable by them anyway.
+const PASSWD_DB: &str = "/etc/passwd";
+const GROUP_DB: &str = "/etc/group";
+const LOGIN_DEFS: &str = "/etc/login.defs";
 
 #[derive(Debug, Error)]
 pub enum UninstallError {
@@ -177,6 +201,7 @@ fn require_root() -> Result<(), UninstallError> {
 /// Remove the boundary. Returns Ok(()) on success.
 pub fn run(req: UninstallRequest) -> Result<(), UninstallError> {
     require_root()?;
+    let host = platform::host();
 
     // Read before anything is unlinked. The configuration names the vault and
     // service identity the opt-in flags act on, and it is itself an owned
@@ -206,7 +231,7 @@ pub fn run(req: UninstallRequest) -> Result<(), UninstallError> {
         _ => None,
     };
     if let (true, Some(layout)) = (req.remove_service_user, &layout) {
-        check_service_identity(&layout.service_user, &layout.service_group)?;
+        check_service_identity(host, &layout.service_user, &layout.service_group)?;
     }
 
     let prefix = PathBuf::from(PREFIX);
@@ -290,11 +315,21 @@ pub fn run(req: UninstallRequest) -> Result<(), UninstallError> {
         println!("purged_vault={}", vault_real.display());
     }
     if let (true, Some(layout)) = (req.remove_service_user, &layout) {
-        remove_service_identity(&layout.service_user, &layout.service_group)?;
+        remove_service_identity(host, &layout.service_user, &layout.service_group)?;
         println!(
             "removed_service_identity={}:{}",
             layout.service_user, layout.service_group
         );
+        // `useradd --system` hands out the highest free id, so the numeric ids
+        // just released are the likeliest to be reused. Files left behind keep
+        // them, and the next account to receive one would own the vault.
+        if host == Host::Linux && vault_real.is_none() {
+            eprintln!(
+                "warning: the preserved vault {} stays owned by the numeric uid/gid of the \
+                 removed service account; a later account given the same ids would own it",
+                layout.vault.display()
+            );
+        }
     }
 
     println!("uninstalled sudo-secretspec");
@@ -340,6 +375,18 @@ pub fn run(req: UninstallRequest) -> Result<(), UninstallError> {
 ///
 /// Split from the deletion so [`run`] can settle it before it unlinks anything.
 fn resolve_purgeable_vault(vault: &Path) -> Result<PathBuf, UninstallError> {
+    resolve_purgeable_vault_under(vault, Path::new(platform::VAULT_REAL_PARENT))
+}
+
+/// [`resolve_purgeable_vault`] against an explicit protected database root.
+///
+/// The root is `/private/var/db` on macOS and `/var/lib` on Linux
+/// ([`platform::VAULT_REAL_PARENT`]); taking it as a parameter lets each be
+/// exercised without owning either directory.
+fn resolve_purgeable_vault_under(
+    vault: &Path,
+    real_parent: &Path,
+) -> Result<PathBuf, UninstallError> {
     let meta = fs::symlink_metadata(vault)
         .map_err(|e| UninstallError::Denied(format!("vault is missing or unreadable: {e}")))?;
     if meta.file_type().is_symlink() || !meta.is_dir() {
@@ -353,14 +400,52 @@ fn resolve_purgeable_vault(vault: &Path) -> Result<PathBuf, UninstallError> {
     // A direct child of the protected database root and nothing else — not the
     // root itself, and not something nested deeper that a doctored
     // configuration could point at.
-    if real.parent() != Some(Path::new("/private/var/db")) {
+    if real.parent() != Some(real_parent) {
         return Err(UninstallError::Denied(format!(
-            "vault resolves to {}, which is not a direct child of /private/var/db; refusing to \
-             purge it",
-            real.display()
+            "vault resolves to {}, which is not a direct child of {}; refusing to purge it",
+            real.display(),
+            real_parent.display()
         )));
     }
     Ok(real)
+}
+
+/// Refusal for a host whose service account is declared rather than installed.
+fn declared_identity_refusal() -> UninstallError {
+    UninstallError::Denied(
+        platform::lifecycle_refusal_for(Host::NixOs, platform::DEFAULT_BROKER_PATH, "uninstall")
+            .unwrap_or_default(),
+    )
+}
+
+/// Refuse any identity that does not look like one this installer created.
+///
+/// Dispatches on the running host: macOS judges directory-service records,
+/// ordinary Linux judges the local `passwd`/`group` files. Split from
+/// [`remove_service_identity`] so [`run`] can settle it before it unlinks
+/// anything.
+fn check_service_identity(host: Host, user: &str, group: &str) -> Result<(), UninstallError> {
+    match host {
+        Host::MacOs => check_macos_service_identity(user, group),
+        Host::Linux => {
+            let passwd = read_account_db(PASSWD_DB)?;
+            let group_db = read_account_db(GROUP_DB)?;
+            // Absent `login.defs` just means the documented defaults apply.
+            let login_defs = fs::read_to_string(LOGIN_DEFS).unwrap_or_default();
+            check_linux_service_identity(user, group, &passwd, &group_db, &login_defs)
+        }
+        Host::NixOs => Err(declared_identity_refusal()),
+    }
+}
+
+/// Delete the service user and group, once [`check_service_identity`] has
+/// allowed it.
+fn remove_service_identity(host: Host, user: &str, group: &str) -> Result<(), UninstallError> {
+    match host {
+        Host::MacOs => remove_macos_service_identity(user, group),
+        Host::Linux => remove_linux_service_identity(user, group),
+        Host::NixOs => Err(declared_identity_refusal()),
+    }
 }
 
 /// Look up a numeric id from the local directory service.
@@ -378,19 +463,14 @@ fn directory_id(record: &str, key: &str) -> Option<u32> {
         .and_then(|s| s.parse().ok())
 }
 
-/// Refuse any identity that does not look like one this installer created.
-///
-/// The test is a leading underscore plus an id inside [`SERVICE_ID_RANGE`],
-/// which is exactly what `install::ensure_service_user` and
-/// `ensure_service_group` allocate. An install that *adopted* an existing
-/// identity therefore declines here rather than deleting an account that
-/// predates it and may still have dependents: the deployed configuration on the
-/// development host adopts `_secretspec:staff`, where the group is an ordinary
-/// system group and the user's other consumer is the legacy stayturgid wrapper.
-///
-/// Split from [`remove_service_identity`] so [`run`] can settle it before it
-/// unlinks anything.
-fn check_service_identity(user: &str, group: &str) -> Result<(), UninstallError> {
+/// macOS: a leading underscore plus an id inside [`SERVICE_ID_RANGE`], which is
+/// exactly what `install::ensure_service_user` and `ensure_service_group`
+/// allocate. An install that *adopted* an existing identity therefore declines
+/// here rather than deleting an account that predates it and may still have
+/// dependents: the deployed configuration on the development host adopts
+/// `_secretspec:staff`, where the group is an ordinary system group and the
+/// user's other consumer is the legacy stayturgid wrapper.
+fn check_macos_service_identity(user: &str, group: &str) -> Result<(), UninstallError> {
     for (name, record, key) in [
         (user, format!("/Users/{user}"), "UniqueID"),
         (group, format!("/Groups/{group}"), "PrimaryGroupID"),
@@ -418,9 +498,7 @@ fn check_service_identity(user: &str, group: &str) -> Result<(), UninstallError>
     Ok(())
 }
 
-/// Delete the service user and group, once [`check_service_identity`] has
-/// allowed it.
-fn remove_service_identity(user: &str, group: &str) -> Result<(), UninstallError> {
+fn remove_macos_service_identity(user: &str, group: &str) -> Result<(), UninstallError> {
     for (record, key) in [
         (format!("/Users/{user}"), "UniqueID"),
         (format!("/Groups/{group}"), "PrimaryGroupID"),
@@ -434,6 +512,243 @@ fn remove_service_identity(user: &str, group: &str) -> Result<(), UninstallError
         if !status.success() {
             return Err(UninstallError::Denied(format!("failed to delete {record}")));
         }
+    }
+    Ok(())
+}
+
+fn read_account_db(path: &str) -> Result<String, UninstallError> {
+    fs::read_to_string(path).map_err(|e| {
+        UninstallError::Denied(format!(
+            "cannot read {path} to vet the service identity before removing it: {e}"
+        ))
+    })
+}
+
+/// Debian's `NAME_REGEX` shape, minus the trailing `$`: lower-case letter or
+/// underscore, then letters, digits, `_` or `-`, at most 32 bytes. The names
+/// come from a root-owned file, but they are handed to `userdel`/`groupdel` as
+/// argv, so one that could parse as an option (`-f`) or name a different
+/// account never reaches them.
+fn linux_account_name_valid(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    name.len() <= 32
+        && (first.is_ascii_lowercase() || first == '_')
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+}
+
+/// Split one `/etc/passwd` row into `(name, uid, primary gid)`.
+fn passwd_row(line: &str) -> Option<(&str, u32, u32)> {
+    let mut fields = line.split(':');
+    let name = fields.next()?;
+    let _password = fields.next()?;
+    let uid = fields.next()?.parse().ok()?;
+    let gid = fields.next()?.parse().ok()?;
+    Some((name, uid, gid))
+}
+
+/// `(uid, primary gid)` of the local account `name`.
+fn passwd_entry(passwd: &str, name: &str) -> Option<(u32, u32)> {
+    passwd
+        .lines()
+        .filter_map(passwd_row)
+        .find(|(row_name, _, _)| *row_name == name)
+        .map(|(_, uid, gid)| (uid, gid))
+}
+
+/// A local `/etc/group` row: its id and listed (supplementary) members.
+struct GroupEntry {
+    gid: u32,
+    members: Vec<String>,
+}
+
+fn group_entry(group_db: &str, name: &str) -> Option<GroupEntry> {
+    group_db.lines().find_map(|line| {
+        let mut fields = line.split(':');
+        if fields.next()? != name {
+            return None;
+        }
+        let _password = fields.next()?;
+        let gid: u32 = fields.next()?.parse().ok()?;
+        let members = fields
+            .next()
+            .unwrap_or("")
+            .split(',')
+            .filter(|member| !member.is_empty())
+            .map(str::to_owned)
+            .collect();
+        Some(GroupEntry { gid, members })
+    })
+}
+
+/// Accounts other than `except` whose primary group is `gid`.
+fn other_primary_members<'a>(passwd: &'a str, gid: u32, except: &str) -> Vec<&'a str> {
+    passwd
+        .lines()
+        .filter_map(passwd_row)
+        .filter(|(name, _, primary)| *primary == gid && *name != except)
+        .map(|(name, _, _)| name)
+        .collect()
+}
+
+/// A `login.defs` number: decimal, `0x` hex, or leading-`0` octal.
+fn parse_login_defs_number(raw: &str) -> Option<u32> {
+    if let Some(hex) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
+        u32::from_str_radix(hex, 16).ok()
+    } else if let Some(octal) = raw.strip_prefix('0').filter(|rest| !rest.is_empty()) {
+        u32::from_str_radix(octal, 8).ok()
+    } else {
+        raw.parse().ok()
+    }
+}
+
+fn login_defs_value(login_defs: &str, key: &str) -> Option<u32> {
+    login_defs.lines().find_map(|line| {
+        let line = line.trim();
+        if line.starts_with('#') {
+            return None;
+        }
+        let mut fields = line.split_whitespace();
+        if fields.next()? != key {
+            return None;
+        }
+        parse_login_defs_number(fields.next()?)
+    })
+}
+
+/// Highest id `useradd --system` allocates: `max_key` (`SYS_UID_MAX`), else the
+/// regular minimum (`UID_MIN`) minus one, else [`LINUX_DEFAULT_SYS_ID_MAX`] —
+/// the order `login.defs(5)` documents.
+fn linux_system_id_max(login_defs: &str, max_key: &str, regular_min_key: &str) -> u32 {
+    login_defs_value(login_defs, max_key)
+        .or_else(|| {
+            login_defs_value(login_defs, regular_min_key).map(|regular| regular.saturating_sub(1))
+        })
+        .unwrap_or(LINUX_DEFAULT_SYS_ID_MAX)
+}
+
+fn linux_id_in_system_range(id: u32, system_max: u32) -> bool {
+    id > LINUX_STATIC_ID_CEILING && id <= system_max
+}
+
+/// Linux counterpart of [`check_macos_service_identity`], over the text of
+/// the local account databases so every rule is testable without root.
+///
+/// Linux has no hidden-id window like macOS's 400-499, so "this installer
+/// created it" is established from what a dedicated service account looks
+/// like instead: a valid account name; ids above the static `base-passwd`
+/// range and within `SYS_UID_MAX`/`SYS_GID_MAX`; a user whose primary group is
+/// the named service group; and a group with no other members and no other
+/// account using it as primary. An adopted account — `www-data`, a login
+/// user, a group shared with other services — fails at least one of these and
+/// declines, because deleting one on the strength of a configuration file
+/// naming it is far worse than declining to.
+///
+/// An identity that is already absent is not an error.
+fn check_linux_service_identity(
+    user: &str,
+    group: &str,
+    passwd: &str,
+    group_db: &str,
+    login_defs: &str,
+) -> Result<(), UninstallError> {
+    for (kind, name) in [("user", user), ("group", group)] {
+        if !linux_account_name_valid(name) {
+            return Err(UninstallError::Denied(format!(
+                "the configured service {kind} name {name:?} is not a valid account name; \
+                 refusing to pass it to userdel/groupdel"
+            )));
+        }
+    }
+    let uid_max = linux_system_id_max(login_defs, "SYS_UID_MAX", "UID_MIN");
+    let gid_max = linux_system_id_max(login_defs, "SYS_GID_MAX", "GID_MIN");
+    let service_group = group_entry(group_db, group);
+
+    if let Some((uid, primary_gid)) = passwd_entry(passwd, user) {
+        if !linux_id_in_system_range(uid, uid_max) {
+            return Err(UninstallError::Denied(format!(
+                "user {user} has uid {uid}, outside the {}-{uid_max} system range this installer \
+                 allocates from, so it was not created here; remove it by hand if that is really \
+                 what you want",
+                LINUX_STATIC_ID_CEILING + 1
+            )));
+        }
+        if service_group.as_ref().map(|entry| entry.gid) != Some(primary_gid) {
+            return Err(UninstallError::Denied(format!(
+                "user {user} has primary gid {primary_gid}, which is not group {group}; a \
+                 dedicated service account is created with that group as its own, so this one was \
+                 adopted rather than created here, and you should remove it by hand if that is \
+                 really what you want"
+            )));
+        }
+    }
+
+    if let Some(entry) = &service_group {
+        if !linux_id_in_system_range(entry.gid, gid_max) {
+            return Err(UninstallError::Denied(format!(
+                "group {group} has gid {}, outside the {}-{gid_max} system range this installer \
+                 allocates from, so it was not created here; remove it by hand if that is really \
+                 what you want",
+                entry.gid,
+                LINUX_STATIC_ID_CEILING + 1
+            )));
+        }
+        if let Some(member) = entry.members.iter().find(|member| member.as_str() != user) {
+            return Err(UninstallError::Denied(format!(
+                "group {group} also has member {member}; it is shared rather than dedicated to \
+                 this service, so remove it by hand if that is really what you want"
+            )));
+        }
+        if let Some(other) = other_primary_members(passwd, entry.gid, user).first() {
+            return Err(UninstallError::Denied(format!(
+                "account {other} uses group {group} as its primary group; it is shared rather \
+                 than dedicated to this service, so remove it by hand if that is really what you \
+                 want"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Program and argv that delete the local account `name`. Never `-f` (which
+/// removes a group still in use) and never `-r` (which would delete a home
+/// directory this installer does not own); the name is validated by
+/// [`check_linux_service_identity`] before it gets here.
+fn linux_userdel_command(name: &str) -> (&'static str, Vec<String>) {
+    (USERDEL, vec![name.to_owned()])
+}
+
+/// Program and argv that delete the local group `name`; see
+/// [`linux_userdel_command`].
+fn linux_groupdel_command(name: &str) -> (&'static str, Vec<String>) {
+    (GROUPDEL, vec![name.to_owned()])
+}
+
+fn run_account_command(command: (&'static str, Vec<String>)) -> Result<(), UninstallError> {
+    let (program, args) = command;
+    let status = Command::new(program).args(&args).status()?;
+    if !status.success() {
+        return Err(UninstallError::Denied(format!(
+            "failed to run {program} {}",
+            args.join(" ")
+        )));
+    }
+    Ok(())
+}
+
+/// Delete the user, then the group. The group is looked up again after the
+/// user is gone: with `USERGROUPS_ENAB yes`, Debian's default, `userdel`
+/// already removes a same-named group that has no other members, and
+/// `groupdel` on a group that no longer exists would fail the whole uninstall
+/// for nothing.
+fn remove_linux_service_identity(user: &str, group: &str) -> Result<(), UninstallError> {
+    if passwd_entry(&read_account_db(PASSWD_DB)?, user).is_some() {
+        run_account_command(linux_userdel_command(user))?;
+    }
+    if group_entry(&read_account_db(GROUP_DB)?, group).is_some() {
+        run_account_command(linux_groupdel_command(group))?;
     }
     Ok(())
 }
@@ -575,8 +890,11 @@ mod tests {
         fs::create_dir(&vault).unwrap();
 
         let err = resolve_purgeable_vault(&vault)
-            .expect_err("a vault outside /private/var/db must be refused");
-        assert!(err.to_string().contains("/private/var/db"), "{err}");
+            .expect_err("a vault outside the protected database root must be refused");
+        assert!(
+            err.to_string().contains(platform::VAULT_REAL_PARENT),
+            "{err}"
+        );
         assert!(vault.is_dir(), "the directory must survive the refusal");
     }
 
@@ -595,9 +913,10 @@ mod tests {
 
     /// An adopted group is an ordinary system group. Nothing about the name
     /// says this installer made it, so `--remove-service-user` declines.
+    #[cfg(target_os = "macos")]
     #[test]
     fn an_identity_without_the_service_naming_is_never_deleted() {
-        let err = check_service_identity("_no_such_user_for_this_test", "staff")
+        let err = check_macos_service_identity("_no_such_user_for_this_test", "staff")
             .expect_err("an ordinary system group must be refused");
         assert!(err.to_string().contains("underscore"), "{err}");
     }
@@ -605,22 +924,206 @@ mod tests {
     /// The naming alone is not enough: plenty of macOS system accounts carry a
     /// leading underscore. `_www` is uid 70, far below the range the installer
     /// allocates from, so it cannot be one of ours.
+    #[cfg(target_os = "macos")]
     #[test]
     fn an_identity_outside_the_allocated_id_range_is_never_deleted() {
-        let err = check_service_identity("_www", "_www")
+        let err = check_macos_service_identity("_www", "_www")
             .expect_err("a system account outside the allocated range must be refused");
         assert!(err.to_string().contains("outside the"), "{err}");
     }
 
     /// An identity that is already gone is not an error — there is nothing to
     /// delete and nothing to object to.
+    #[cfg(target_os = "macos")]
     #[test]
     fn an_absent_identity_is_not_an_error() {
-        check_service_identity(
+        check_macos_service_identity(
             "_no_such_user_for_this_test",
             "_no_such_group_for_this_test",
         )
         .expect("an identity that does not exist needs no removal");
+    }
+
+    /// A Debian-shaped account database: the installer's own account at the
+    /// top of the system range, next to a static system account, a login user
+    /// and root.
+    const DEBIAN_PASSWD: &str = "root:x:0:0:root:/root:/bin/bash\n\
+        www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin\n\
+        alice:x:1000:1000:Alice:/home/alice:/bin/bash\n\
+        sudo-secretspec:x:998:998::/var/lib/sudo-secretspec:/usr/sbin/nologin\n";
+    const DEBIAN_GROUP: &str = "root:x:0:\n\
+        www-data:x:33:\n\
+        alice:x:1000:\n\
+        sudo-secretspec:x:998:\n";
+    const DEBIAN_LOGIN_DEFS: &str = "# comment\nUID_MIN\t\t1000\nUID_MAX 60000\nGID_MIN 1000\n";
+
+    fn linux_check(
+        user: &str,
+        group: &str,
+        passwd: &str,
+        group_db: &str,
+    ) -> Result<(), UninstallError> {
+        check_linux_service_identity(user, group, passwd, group_db, DEBIAN_LOGIN_DEFS)
+    }
+
+    #[test]
+    fn linux_removes_the_dedicated_service_identity() {
+        linux_check(
+            "sudo-secretspec",
+            "sudo-secretspec",
+            DEBIAN_PASSWD,
+            DEBIAN_GROUP,
+        )
+        .expect("a system-range account with its own group is one this installer created");
+    }
+
+    #[test]
+    fn linux_absent_identity_is_not_an_error() {
+        linux_check("sudo-secretspec", "sudo-secretspec", "", "")
+            .expect("an identity that does not exist needs no removal");
+        // The group can outlive the user (userdel only drops it with the user).
+        let group_only = "sudo-secretspec:x:998:\n";
+        linux_check("sudo-secretspec", "sudo-secretspec", "", group_only)
+            .expect("a dedicated group without its user is still removable");
+    }
+
+    /// An adopted ordinary account is never deleted just because the
+    /// configuration named it: a login user, a static system account and root
+    /// all fall outside the range `useradd --system` allocates from.
+    #[test]
+    fn linux_accounts_outside_the_system_range_are_never_deleted() {
+        for name in ["alice", "www-data", "root"] {
+            let err = linux_check(name, name, DEBIAN_PASSWD, DEBIAN_GROUP)
+                .expect_err("an account outside the system range must be refused");
+            assert!(err.to_string().contains("outside the"), "{name}: {err}");
+        }
+    }
+
+    /// An adopted identity whose group is not the one named: the user lives in
+    /// the system range but its primary group is `users` (gid 100).
+    #[test]
+    fn linux_user_whose_primary_group_is_not_the_service_group_is_refused() {
+        let passwd = "sudo-secretspec:x:998:100::/nonexistent:/usr/sbin/nologin\n";
+        let err = linux_check("sudo-secretspec", "sudo-secretspec", passwd, DEBIAN_GROUP)
+            .expect_err("an adopted user must be refused");
+        assert!(err.to_string().contains("primary gid"), "{err}");
+    }
+
+    #[test]
+    fn linux_shared_group_is_never_deleted() {
+        let with_member = "sudo-secretspec:x:998:alice\n";
+        let err = linux_check(
+            "sudo-secretspec",
+            "sudo-secretspec",
+            DEBIAN_PASSWD,
+            with_member,
+        )
+        .expect_err("a group with another member is not dedicated");
+        assert!(err.to_string().contains("also has member alice"), "{err}");
+
+        // Another account's primary group: groupdel would refuse it halfway,
+        // after the user was already gone.
+        let passwd = format!("{DEBIAN_PASSWD}svc:x:997:998::/nonexistent:/usr/sbin/nologin\n");
+        let err = linux_check("sudo-secretspec", "sudo-secretspec", &passwd, DEBIAN_GROUP)
+            .expect_err("a group another account uses as primary is not dedicated");
+        assert!(err.to_string().contains("account svc"), "{err}");
+    }
+
+    /// The range is the host's own: `SYS_UID_MAX` wins, then `UID_MIN - 1`.
+    #[test]
+    fn linux_system_range_follows_login_defs() {
+        let check = |defs: &str| {
+            check_linux_service_identity(
+                "sudo-secretspec",
+                "sudo-secretspec",
+                DEBIAN_PASSWD,
+                DEBIAN_GROUP,
+                defs,
+            )
+        };
+        check("").expect("uid 998 is inside the documented 999 default");
+        check("SYS_UID_MAX 0x3e7\nSYS_GID_MAX 999\n").expect("hex values are numbers");
+        let err = check("SYS_UID_MAX 499\n").expect_err("998 is above an explicit maximum");
+        assert!(err.to_string().contains("outside the 100-499"), "{err}");
+        let err = check("UID_MIN 500\n").expect_err("no SYS_UID_MAX: the maximum is UID_MIN - 1");
+        assert!(err.to_string().contains("outside the 100-499"), "{err}");
+        let err = check("GID_MIN 500\n").expect_err("the gid range is derived on its own");
+        assert!(err.to_string().contains("gid 998"), "{err}");
+    }
+
+    /// Names reach `userdel`/`groupdel` as argv, so one that parses as an
+    /// option, or is not an account name at all, never gets there.
+    #[test]
+    fn linux_invalid_account_names_are_refused() {
+        let too_long = "a".repeat(33);
+        for bad in ["", "-f", "Root", "a b", "x:y", too_long.as_str()] {
+            let err = linux_check(bad, "sudo-secretspec", DEBIAN_PASSWD, DEBIAN_GROUP)
+                .expect_err("an invalid name must be refused");
+            assert!(
+                err.to_string().contains("not a valid account name"),
+                "{bad:?}: {err}"
+            );
+            let err = linux_check("sudo-secretspec", bad, DEBIAN_PASSWD, DEBIAN_GROUP)
+                .expect_err("an invalid name must be refused");
+            assert!(
+                err.to_string().contains("not a valid account name"),
+                "{bad:?}: {err}"
+            );
+        }
+    }
+
+    /// Absolute program, the bare name and nothing else: no `-f` (removes a
+    /// group still in use) and no `-r` (removes a home directory).
+    #[test]
+    fn linux_removal_commands_are_absolute_and_carry_only_the_name() {
+        assert_eq!(
+            linux_userdel_command("sudo-secretspec"),
+            ("/usr/sbin/userdel", vec!["sudo-secretspec".to_string()])
+        );
+        assert_eq!(
+            linux_groupdel_command("sudo-secretspec"),
+            ("/usr/sbin/groupdel", vec!["sudo-secretspec".to_string()])
+        );
+    }
+
+    /// A NixOS service account is declared by the module; uninstall never
+    /// reaches for it, and says where to change it.
+    #[test]
+    fn nixos_identity_is_never_touched_by_uninstall() {
+        let err = check_service_identity(Host::NixOs, "sudo-secretspec", "sudo-secretspec")
+            .expect_err("NixOS declares its service account");
+        assert!(
+            err.to_string().contains("services.sudo-secretspec"),
+            "{err}"
+        );
+        let err = remove_service_identity(Host::NixOs, "sudo-secretspec", "sudo-secretspec")
+            .expect_err("NixOS declares its service account");
+        assert!(
+            err.to_string().contains("services.sudo-secretspec"),
+            "{err}"
+        );
+    }
+
+    /// The protected database root is the platform's: purging only ever
+    /// deletes a direct child of it.
+    #[test]
+    fn purge_accepts_only_a_direct_child_of_the_database_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let vault = root.join("sudo-secretspec");
+        fs::create_dir(&vault).unwrap();
+        assert_eq!(resolve_purgeable_vault_under(&vault, &root).unwrap(), vault);
+
+        let nested = root.join("nested/sudo-secretspec");
+        fs::create_dir_all(&nested).unwrap();
+        let err = resolve_purgeable_vault_under(&nested, &root)
+            .expect_err("a vault nested below a child must be refused");
+        assert!(err.to_string().contains("not a direct child"), "{err}");
+
+        let other = tempfile::tempdir().unwrap();
+        let err = resolve_purgeable_vault_under(&vault, &fs::canonicalize(other.path()).unwrap())
+            .expect_err("a vault under some other root must be refused");
+        assert!(err.to_string().contains("not a direct child"), "{err}");
     }
 
     #[test]

@@ -21,6 +21,7 @@ use thiserror::Error;
 
 use crate::audit;
 use crate::config::Config;
+use crate::platform::{self, Host};
 
 #[derive(Debug, Error)]
 pub enum DriftError {
@@ -54,7 +55,11 @@ pub struct Layout {
 }
 
 impl Layout {
-    fn from_config(cfg: Config, config_path: PathBuf) -> Self {
+    /// `host` decides where the public client lives: macOS derives it from the
+    /// configured prefix (`<prefix>/bin`), Linux uses the fixed
+    /// [`platform::client_path`] because the broker's prefix (`/usr`) is not
+    /// where the client goes (`/usr/local/bin`, on the caller's real `PATH`).
+    fn from_config(cfg: Config, config_path: PathBuf, host: Host) -> Self {
         // Prefer deriving the install prefix from the configured engine path.
         // Single-binary installs place the privileged binary under libexec and
         // the public client under bin.
@@ -67,6 +72,10 @@ impl Layout {
         let libexec = prefix.join("libexec");
         let bin = prefix.join("bin");
         let share = prefix.join("share").join("sudo-secretspec");
+        let client = match host {
+            Host::MacOs => bin.join("sudo-secretspec"),
+            Host::NixOs | Host::Linux => PathBuf::from(platform::client_path(host)),
+        };
 
         Self {
             vault: cfg.vault,
@@ -79,8 +88,8 @@ impl Layout {
             // privileged binary; keep a distinct field for compatibility.
             audit: cfg.audit_helper,
             broker: libexec.join("sudo-secretspec"),
-            client: bin.join("sudo-secretspec"),
-            checker: bin.join("sudo-secretspec"),
+            client: client.clone(),
+            checker: client,
             retired: share.join("sudo-secretspec-retired.toml"),
             guidance: share.join("AI-GUIDANCE.md"),
             sudoers: PathBuf::from(crate::platform::SUDOERS_FILE),
@@ -148,6 +157,44 @@ const SEARCH_DIRS: &[&str] = &[
     "/bin",
     "/sbin",
 ];
+
+/// Linux counterpart of [`SEARCH_DIRS`]: the directories Debian's default
+/// `secure_path` names, which is where the installed client (`/usr/local/bin`)
+/// and a distro-packaged or hand-copied one (`/usr/bin`, `/bin`) would live.
+/// Fixed for the same reason as the macOS list; there is no Homebrew or
+/// MacPorts prefix to scan.
+const LINUX_SEARCH_DIRS: &[&str] = &[
+    "/usr/local/bin",
+    "/usr/local/sbin",
+    "/usr/bin",
+    "/usr/sbin",
+    "/bin",
+    "/sbin",
+];
+
+/// The fixed shadow-scan directories for `host`.
+fn fixed_search_dirs(host: Host) -> &'static [&'static str] {
+    match host {
+        Host::MacOs => SEARCH_DIRS,
+        Host::NixOs | Host::Linux => LINUX_SEARCH_DIRS,
+    }
+}
+
+/// Package-manager prefixes that may hold a staged bootstrap copy on `host`.
+///
+/// Empty on Linux: the release artifact is installed by running it directly,
+/// and no package manager re-points a keg there, so there is nothing to probe
+/// and nothing macOS-shaped to stat.
+fn media_prefixes(host: Host) -> &'static [&'static str] {
+    match host {
+        Host::MacOs => MEDIA_PREFIXES,
+        Host::NixOs | Host::Linux => &[],
+    }
+}
+
+/// The main sudoers file on Linux, which decides whether the `sudoers.d`
+/// drop-in the installer writes is read at all.
+const MAIN_SUDOERS: &str = "/etc/sudoers";
 
 /// Inputs `inspect` cannot obtain for itself from inside the privileged process.
 #[derive(Debug, Clone, Default)]
@@ -219,6 +266,13 @@ fn finding(code: &str, path: Option<&Path>, detail: impl Into<String>) -> Findin
 
 /// Load and validate the protected TOML configuration at `path`.
 pub fn load_config(path: &Path) -> Result<Layout, DriftError> {
+    load_config_for_host(path, platform::host())
+}
+
+/// [`load_config`] with the host given rather than detected, so tests (and any
+/// caller that already knows) pin the Linux or macOS layout without depending
+/// on the machine they run on.
+pub fn load_config_for_host(path: &Path, host: Host) -> Result<Layout, DriftError> {
     // `O_NOFOLLOW`: refuse to follow a symlink. This function is also used by
     // the privileged `doctor`, and a symlinked config could redirect a root
     // read at an arbitrary file (e.g. `doctor --config /tmp/link`). The failure
@@ -230,7 +284,7 @@ pub fn load_config(path: &Path) -> Result<Layout, DriftError> {
     let mut content = String::new();
     std::io::Read::read_to_string(&mut file, &mut content)?;
     let cfg = Config::parse(&content)?;
-    Ok(Layout::from_config(cfg, path.to_path_buf()))
+    Ok(Layout::from_config(cfg, path.to_path_buf(), host))
 }
 
 fn owner_name(uid: u32) -> String {
@@ -286,7 +340,55 @@ fn metadata_owner_group_mode(path: &Path) -> std::io::Result<(String, String, u3
     ))
 }
 
-fn has_extended_acl(path: &Path) -> bool {
+/// Does `path` carry a POSIX ACL? Two extended attributes hold one on Linux:
+/// `system.posix_acl_access` (applies to the path) and
+/// `system.posix_acl_default` (inherited by new children of a directory). The
+/// kernel drops the attribute when the ACL is only the owner/group/other bits,
+/// so presence means a genuinely extended ACL.
+///
+/// No subprocess: `getfacl` lives in an optional package and resolving it would
+/// be one more binary a root `doctor` has to trust. `ENODATA` is "no such
+/// attribute" and `ENOTSUP` is "this filesystem has no ACLs", both a clean
+/// answer of none. Any other failure is "cannot tell", reported as present,
+/// which is what the macOS probe does when `ls` fails.
+#[cfg(target_os = "linux")]
+fn has_posix_acl(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return true;
+    };
+    for name in [c"system.posix_acl_access", c"system.posix_acl_default"] {
+        // SAFETY: both strings are valid and NUL-terminated; a null buffer with
+        // size 0 asks only for the attribute's length and writes nothing.
+        let len =
+            unsafe { libc::lgetxattr(c_path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) };
+        if len >= 0 {
+            return true;
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::ENODATA) | Some(libc::ENOTSUP) => {}
+            _ => return true,
+        }
+    }
+    false
+}
+
+/// Only Linux has this probe; a macOS build never reaches it for a macOS host.
+/// "Cannot tell" is reported as present, the conservative answer.
+#[cfg(not(target_os = "linux"))]
+fn has_posix_acl(_path: &Path) -> bool {
+    true
+}
+
+/// Does `path` carry an extended ACL, by the means `host` has?
+fn has_extended_acl(host: Host, path: &Path) -> bool {
+    match host {
+        Host::MacOs => has_macos_acl(path),
+        Host::NixOs | Host::Linux => has_posix_acl(path),
+    }
+}
+
+fn has_macos_acl(path: &Path) -> bool {
     let output = Command::new("/bin/ls")
         .args(["-lde", &path.display().to_string()])
         .output();
@@ -303,6 +405,7 @@ fn check_protected_file(
     owner: &str,
     group: &str,
     mode: u32,
+    host: Host,
     findings: &mut Vec<Finding>,
 ) {
     if path.is_symlink() {
@@ -322,7 +425,7 @@ fn check_protected_file(
                     format!("expected {owner}:{group}:{mode:o}, got {o}:{g}:{m:o}"),
                 ));
             }
-            if has_extended_acl(path) {
+            if has_extended_acl(host, path) {
                 findings.push(finding(
                     "ACL_PRESENT",
                     Some(path),
@@ -338,44 +441,90 @@ fn check_protected_file(
     }
 }
 
-fn check_ancestor_chain(path: &Path, findings: &mut Vec<Finding>) {
+/// The directories above `resolved` that must be root-only, nearest first.
+///
+/// macOS stops after `/private` or `/usr` (everything above is the sealed
+/// system volume) and never looks at `/` itself, exactly as before. Linux has
+/// no sealed volume: every directory up to and including `/` can rename the
+/// next one down, so the walk does not stop early.
+fn ancestor_dirs(host: Host, resolved: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut current = resolved;
+    while let Some(parent) = current.parent() {
+        let reached_top = match host {
+            Host::MacOs => parent == Path::new("/"),
+            Host::NixOs | Host::Linux => parent.as_os_str().is_empty(),
+        };
+        if reached_top {
+            break;
+        }
+        dirs.push(parent.to_path_buf());
+        current = parent;
+        // macOS stops once it has judged `/private` or `/usr`.
+        if host == Host::MacOs && matches!(parent.to_str(), Some("/private" | "/usr")) {
+            break;
+        }
+    }
+    dirs
+}
+
+/// Judge one ancestor from the facts about it: root-owned, and not writable by
+/// group or world. `owner_mode` is `None` when it could not be read, which is
+/// not judged here (the ancestor is then not a finding, as before).
+///
+/// Pure so every verdict is testable without a root-owned directory. A sticky
+/// bit does not excuse a world-writable ancestor: the rule is about who can
+/// substitute entries on the path to a root-executed file.
+fn judge_ancestor(
+    host: Host,
+    parent: &Path,
+    is_symlink: bool,
+    owner_mode: Option<(&str, u32)>,
+) -> Vec<Finding> {
+    let mut out = Vec::new();
+    // Accept the conventional macOS alias roots only as leaf public names;
+    // validation always walks the resolved private chain. Linux has no such
+    // aliases: a symlinked ancestor there is a redirection.
+    let macos_alias = host == Host::MacOs
+        && matches!(parent.to_string_lossy().as_ref(), "/var" | "/etc" | "/tmp");
+    if is_symlink && !macos_alias {
+        out.push(finding(
+            "ANCESTOR_SYMLINK",
+            Some(parent),
+            "protected ancestor must not be a symlink",
+        ));
+    }
+    if let Some((owner, mode)) = owner_mode
+        && (owner != "root" || mode & 0o022 != 0)
+    {
+        out.push(finding(
+            "REMOVABLE_ANCESTOR",
+            Some(parent),
+            "ancestor is not root-owned or is group/world-writable",
+        ));
+    }
+    out
+}
+
+fn check_ancestor_chain(path: &Path, host: Host, findings: &mut Vec<Finding>) {
     // Validate the resolved path's parents for root ownership and non-writability.
     let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let mut current = resolved.as_path();
-    while let Some(parent) = current.parent() {
-        if parent == Path::new("/") {
-            break;
-        }
-        // Accept the conventional macOS alias roots only as leaf public names;
-        // validation always walks the resolved private chain.
-        if parent.is_symlink()
-            && !matches!(parent.to_string_lossy().as_ref(), "/var" | "/etc" | "/tmp")
-        {
+    for parent in ancestor_dirs(host, &resolved) {
+        let facts = metadata_owner_group_mode(&parent).ok();
+        findings.extend(judge_ancestor(
+            host,
+            &parent,
+            parent.is_symlink(),
+            facts
+                .as_ref()
+                .map(|(owner, _group, mode)| (owner.as_str(), *mode)),
+        ));
+        if facts.is_some() && has_extended_acl(host, &parent) {
             findings.push(finding(
-                "ANCESTOR_SYMLINK",
-                Some(parent),
-                "protected ancestor must not be a symlink",
+                "ACL_PRESENT",
+                Some(&parent),
+                "extended ACL present on ancestor",
             ));
-        }
-        if let Ok((o, _g, m)) = metadata_owner_group_mode(parent) {
-            if o != "root" || m & 0o022 != 0 {
-                findings.push(finding(
-                    "REMOVABLE_ANCESTOR",
-                    Some(parent),
-                    "ancestor is not root-owned or is group/world-writable",
-                ));
-            }
-            if has_extended_acl(parent) {
-                findings.push(finding(
-                    "ACL_PRESENT",
-                    Some(parent),
-                    "extended ACL present on ancestor",
-                ));
-            }
-        }
-        current = parent;
-        if parent == Path::new("/private") || parent == Path::new("/usr") {
-            break;
         }
     }
 }
@@ -411,8 +560,8 @@ pub(crate) fn parse_manifest(path: &Path) -> Vec<(String, PathBuf)> {
 /// appends. Relative entries are dropped: `PATH` may legitimately contain them,
 /// but resolving one inside a root process would depend on its working
 /// directory, which the caller also controls.
-fn search_dirs(caller_path: Option<&OsStr>) -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = SEARCH_DIRS.iter().map(PathBuf::from).collect();
+fn search_dirs_for_host(host: Host, caller_path: Option<&OsStr>) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = fixed_search_dirs(host).iter().map(PathBuf::from).collect();
     if let Some(path) = caller_path {
         dirs.extend(std::env::split_paths(path).filter(|p| p.is_absolute()));
     }
@@ -532,7 +681,12 @@ fn classify_candidate(
 /// prefix and the brew prefix are the same `/usr/local`, and those two paths
 /// are what keep the staged copy and the installed boundary distinct there.
 pub fn media_candidates() -> Vec<PathBuf> {
-    MEDIA_PREFIXES
+    media_candidates_for_host(platform::host())
+}
+
+/// [`media_candidates`] for an explicit `host`.
+pub fn media_candidates_for_host(host: Host) -> Vec<PathBuf> {
+    media_prefixes(host)
         .iter()
         .map(|p| PathBuf::from(p).join("opt/sudo-secretspec/libexec/sudo-secretspec"))
         .filter(|p| p.is_file())
@@ -814,10 +968,98 @@ fn check_sudoers_neighbours(layout: &Layout, findings: &mut Vec<Finding>) {
     }
 }
 
+/// A `@include`/`#include`(`dir`) line's directive kind and target, or `None`
+/// for any other line.
+///
+/// Both spellings are real: sudo before 1.9.1 knows only `#includedir` (where
+/// the `#` does *not* start a comment), and current Debian ships
+/// `@includedir`. The directive must be followed by whitespace, so `# includedir`
+/// (a comment) and `#includedirx` are not matches.
+fn include_directive(line: &str) -> Option<(bool, &str)> {
+    for (prefix, is_dir) in [
+        ("@includedir", true),
+        ("#includedir", true),
+        ("@include", false),
+        ("#include", false),
+    ] {
+        if let Some(rest) = line.strip_prefix(prefix)
+            && rest.starts_with(char::is_whitespace)
+        {
+            let target = rest.trim();
+            let target = target
+                .strip_prefix('"')
+                .and_then(|t| t.strip_suffix('"'))
+                .unwrap_or(target);
+            return Some((is_dir, target));
+        }
+    }
+    None
+}
+
+/// Does the main sudoers text `text` make sudo read the drop-in `file` in
+/// `dir`: either by including the directory or by including the file itself?
+///
+/// Only the main file is consulted. A drop-in reached through yet another
+/// include chain is reported as missing; that is a false positive worth the
+/// plain, auditable rule, because the failure it guards against is silent:
+/// sudo accepts the file's syntax and then never applies a line of it.
+fn sudoers_reads_dropin(text: &str, dir: &Path, file: &Path) -> bool {
+    text.lines()
+        .filter_map(|line| include_directive(line.trim()))
+        .any(|(is_dir, target)| {
+            let target = Path::new(target);
+            if is_dir {
+                target == dir
+            } else {
+                target == file
+            }
+        })
+}
+
+/// Report an installed policy that sudo will never read because the main
+/// sudoers file does not include its directory.
+///
+/// Linux only: Debian's stock `/etc/sudoers` includes `/etc/sudoers.d`, but an
+/// operator or a hardening script can remove that line, and then every grant
+/// the installer wrote is inert while `visudo -c` stays green. An unreadable
+/// main file (the unprivileged best-effort `doctor`) is "cannot tell" and says
+/// nothing; a missing one is reported, because without it sudo has no policy
+/// at all.
+fn check_main_sudoers_includes(main: &Path, layout: &Layout, findings: &mut Vec<Finding>) {
+    let Some(dir) = layout.sudoers.parent() else {
+        return;
+    };
+    let detail = match fs::read_to_string(main) {
+        Ok(text) if sudoers_reads_dropin(&text, dir, &layout.sudoers) => return,
+        Ok(_) => format!(
+            "the main sudoers file does not include {}, so sudo never reads the installed \
+             policy and none of its grants apply; add `@includedir {}` (or `#includedir {}` \
+             on sudo older than 1.9.1) with visudo",
+            dir.display(),
+            dir.display(),
+            dir.display()
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            "the main sudoers file does not exist, so sudo has no policy and never reads the \
+             installed drop-in"
+                .to_string()
+        }
+        Err(_) => return,
+    };
+    findings.push(finding("SUDOERS_INCLUDEDIR_MISSING", Some(main), detail));
+}
+
 /// Inspect the live installation described by `layout`.
 ///
 /// This never repairs and never opens secret-bearing file contents for parsing.
 pub fn inspect(layout: &Layout, opts: &InspectOptions) -> Report {
+    inspect_for_host(platform::host(), layout, opts)
+}
+
+/// [`inspect`] for an explicit `host`: the owner group of root-owned files, the
+/// ACL probe, the ancestor walk, the shadow-scan directories, `visudo`'s path
+/// and the main-sudoers include check all follow it.
+pub fn inspect_for_host(host: Host, layout: &Layout, opts: &InspectOptions) -> Report {
     let mut findings = Vec::new();
 
     // Config file itself.
@@ -826,9 +1068,10 @@ pub fn inspect(layout: &Layout, opts: &InspectOptions) -> Report {
         &layout.service_user,
         &layout.service_group,
         0o444,
+        host,
         &mut findings,
     );
-    check_ancestor_chain(&layout.config, &mut findings);
+    check_ancestor_chain(&layout.config, host, &mut findings);
 
     // Installed binaries / shared assets.
     let root_artifacts = vec![(&layout.client, 0o755), (&layout.sudoers, 0o440)];
@@ -843,8 +1086,15 @@ pub fn inspect(layout: &Layout, opts: &InspectOptions) -> Report {
         service_artifacts.push((decl, 0o444));
     }
     for (path, mode) in root_artifacts {
-        check_protected_file(path, "root", "wheel", mode, &mut findings);
-        check_ancestor_chain(path, &mut findings);
+        check_protected_file(
+            path,
+            "root",
+            platform::root_group(host),
+            mode,
+            host,
+            &mut findings,
+        );
+        check_ancestor_chain(path, host, &mut findings);
     }
     for (path, mode) in service_artifacts {
         check_protected_file(
@@ -852,9 +1102,10 @@ pub fn inspect(layout: &Layout, opts: &InspectOptions) -> Report {
             &layout.service_user,
             &layout.service_group,
             mode,
+            host,
             &mut findings,
         );
-        check_ancestor_chain(path, &mut findings);
+        check_ancestor_chain(path, host, &mut findings);
     }
 
     // Which binary would actually run, not just whether the installed one is intact.
@@ -865,7 +1116,7 @@ pub fn inspect(layout: &Layout, opts: &InspectOptions) -> Report {
         .and_then(|name| path_winner(caller_path, name));
     check_client_shadowing(
         layout,
-        &search_dirs(caller_path),
+        &search_dirs_for_host(host, caller_path),
         winner.as_deref(),
         &mut findings,
     );
@@ -907,7 +1158,7 @@ pub fn inspect(layout: &Layout, opts: &InspectOptions) -> Report {
     // in `doctor --json`. Anything consuming the report as JSON — which is what
     // AI-GUIDANCE tells automation to do — failed to parse it.
     if layout.sudoers.exists() {
-        let checked = Command::new("/usr/sbin/visudo")
+        let checked = Command::new(platform::visudo_path(host))
             .args(["-c", "-f"])
             .arg(&layout.sudoers)
             .output();
@@ -919,6 +1170,10 @@ pub fn inspect(layout: &Layout, opts: &InspectOptions) -> Report {
                 "visudo rejected the sudoers policy",
             )),
         }
+    }
+
+    if host == Host::Linux {
+        check_main_sudoers_includes(Path::new(MAIN_SUDOERS), layout, &mut findings);
     }
 
     // Neighbours in the same directory that sudo is silently not applying.
@@ -941,6 +1196,7 @@ pub fn inspect(layout: &Layout, opts: &InspectOptions) -> Report {
             &layout.service_user,
             &layout.service_group,
             0o700,
+            host,
             &mut findings,
         );
     }
@@ -956,7 +1212,7 @@ pub fn inspect(layout: &Layout, opts: &InspectOptions) -> Report {
                 layout.vault_realpath.display()
             ),
         )),
-        Ok(resolved) => check_ancestor_chain(&resolved, &mut findings),
+        Ok(resolved) => check_ancestor_chain(&resolved, host, &mut findings),
         Err(_) => findings.push(finding(
             "VAULT_UNRESOLVABLE",
             Some(&layout.vault),
@@ -1032,6 +1288,7 @@ pub fn inspect(layout: &Layout, opts: &InspectOptions) -> Report {
                     &layout.service_user,
                     &layout.service_group,
                     0o600,
+                    host,
                     &mut findings,
                 );
             }
@@ -1412,7 +1669,10 @@ service_group = "_sudo_secretspec"
 
     #[test]
     fn caller_path_can_only_widen_the_scan() {
-        let dirs = search_dirs(Some(OsStr::new("/opt/mine/bin:relative/bin:/usr/bin")));
+        let dirs = search_dirs_for_host(
+            Host::MacOs,
+            Some(OsStr::new("/opt/mine/bin:relative/bin:/usr/bin")),
+        );
         for fixed in SEARCH_DIRS {
             assert!(
                 dirs.iter().any(|d| d == Path::new(fixed)),
@@ -1432,7 +1692,10 @@ service_group = "_sudo_secretspec"
 
     #[test]
     fn no_caller_path_means_the_fixed_list_only() {
-        assert_eq!(search_dirs(None).len(), SEARCH_DIRS.len());
+        assert_eq!(
+            search_dirs_for_host(Host::MacOs, None).len(),
+            SEARCH_DIRS.len()
+        );
     }
 
     /// Write `name` into `dir` and make it executable, as an installed client is.
@@ -1813,5 +2076,251 @@ service_group = "_sudo_secretspec"
             adopted_vault: false,
             installed_version: None,
         }
+    }
+
+    // ---- Linux (Debian) layout ------------------------------------------------
+
+    #[test]
+    fn root_owned_artifacts_expect_root_root_on_linux_and_root_wheel_on_macos() {
+        // Ownership cannot be forged without root, so the expectation is read
+        // from the mismatch text of a file the test user owns. A root test
+        // runner would own it as root:root and see no mismatch at all.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let tmp = tempdir().unwrap();
+        let layout = layout_for(tmp.path());
+        executable(tmp.path(), "client");
+        let client = layout.client.display().to_string();
+        let expected = |host: Host| {
+            inspect_for_host(host, &layout, &InspectOptions::default())
+                .findings
+                .into_iter()
+                .find(|f| {
+                    f.code == "METADATA_MISMATCH" && f.path.as_deref() == Some(client.as_str())
+                })
+                .expect("the client is owned by the test user, not root")
+                .detail
+        };
+        let linux = expected(Host::Linux);
+        assert!(linux.starts_with("expected root:root:755"), "{linux}");
+        let macos = expected(Host::MacOs);
+        assert!(macos.starts_with("expected root:wheel:755"), "{macos}");
+    }
+
+    #[test]
+    fn the_linux_ancestor_walk_reaches_root_and_the_macos_walk_stops_where_it_did() {
+        assert_eq!(
+            ancestor_dirs(Host::Linux, Path::new("/usr/local/bin/sudo-secretspec")),
+            ["/usr/local/bin", "/usr/local", "/usr", "/"].map(PathBuf::from)
+        );
+        assert_eq!(
+            ancestor_dirs(Host::Linux, Path::new("/var/lib/sudo-secretspec")),
+            ["/var/lib", "/var", "/"].map(PathBuf::from)
+        );
+        // Unchanged macOS behaviour: `/` is never judged, and the walk ends
+        // after `/private` or `/usr`.
+        assert_eq!(
+            ancestor_dirs(Host::MacOs, Path::new("/private/var/db/sudo-secretspec")),
+            ["/private/var/db", "/private/var", "/private"].map(PathBuf::from)
+        );
+        assert_eq!(
+            ancestor_dirs(Host::MacOs, Path::new("/usr/local/bin/sudo-secretspec")),
+            ["/usr/local/bin", "/usr/local", "/usr"].map(PathBuf::from)
+        );
+    }
+
+    #[test]
+    fn a_clean_linux_chain_passes_and_every_way_of_being_replaceable_is_flagged() {
+        for dir in [
+            "/etc",
+            "/var/lib",
+            "/usr",
+            "/usr/local",
+            "/usr/local/bin",
+            "/",
+        ] {
+            let found = judge_ancestor(Host::Linux, Path::new(dir), false, Some(("root", 0o755)));
+            assert!(found.is_empty(), "{dir}: {found:?}");
+        }
+        let codes = |owner: &str, mode: u32, symlink: bool| {
+            judge_ancestor(
+                Host::Linux,
+                Path::new("/usr/local/bin"),
+                symlink,
+                Some((owner, mode)),
+            )
+            .into_iter()
+            .map(|f| f.code)
+            .collect::<Vec<_>>()
+        };
+        // Debian ships `/usr/local` as root:staff 2775; the group-writable bit
+        // lets any `staff` member replace the client root is asked to run.
+        assert_eq!(codes("root", 0o775, false), ["REMOVABLE_ANCESTOR"]);
+        assert_eq!(codes("root", 0o757, false), ["REMOVABLE_ANCESTOR"]);
+        assert_eq!(codes("operator", 0o755, false), ["REMOVABLE_ANCESTOR"]);
+        assert_eq!(codes("root", 0o755, true), ["ANCESTOR_SYMLINK"]);
+        // `/etc` is an accepted public alias on macOS only.
+        let etc = Path::new("/etc");
+        assert_eq!(
+            judge_ancestor(Host::Linux, etc, true, Some(("root", 0o755))).len(),
+            1
+        );
+        assert!(judge_ancestor(Host::MacOs, etc, true, Some(("root", 0o755))).is_empty());
+    }
+
+    #[test]
+    fn the_main_sudoers_file_must_include_the_dropin_directory_in_either_spelling() {
+        let dir = Path::new("/etc/sudoers.d");
+        let file = Path::new("/etc/sudoers.d/sudo-secretspec");
+        // `@includedir` is current Debian's; `#includedir` is every sudo before
+        // 1.9.1, where the `#` is not a comment.
+        for line in [
+            "@includedir /etc/sudoers.d",
+            "#includedir /etc/sudoers.d",
+            "@includedir /etc/sudoers.d/",
+            "@includedir \"/etc/sudoers.d\"",
+            "  #includedir\t/etc/sudoers.d  ",
+            "@include /etc/sudoers.d/sudo-secretspec",
+        ] {
+            let text = format!("Defaults env_reset\n{line}\n");
+            assert!(sudoers_reads_dropin(&text, dir, file), "{line}");
+        }
+        for line in [
+            "# includedir /etc/sudoers.d",
+            "#includedir /etc/other.d",
+            "@includedirx /etc/sudoers.d",
+            "@include /etc/sudoers.d/someone-else",
+            "Defaults secure_path=\"@includedir /etc/sudoers.d\"",
+        ] {
+            let text = format!("Defaults env_reset\n{line}\n");
+            assert!(!sudoers_reads_dropin(&text, dir, file), "{line}");
+        }
+        assert!(!sudoers_reads_dropin("", dir, file));
+    }
+
+    #[test]
+    fn a_policy_sudo_never_reads_is_a_hard_finding_and_an_unreadable_main_file_is_not() {
+        let tmp = tempdir().unwrap();
+        let mut layout = layout_for(tmp.path());
+        layout.sudoers = PathBuf::from("/etc/sudoers.d/sudo-secretspec");
+        let run = |main: &Path| {
+            let mut findings = Vec::new();
+            check_main_sudoers_includes(main, &layout, &mut findings);
+            findings
+        };
+
+        let wired = tmp.path().join("sudoers-wired");
+        fs::write(&wired, "Defaults env_reset\n@includedir /etc/sudoers.d\n").unwrap();
+        assert!(run(&wired).is_empty());
+
+        let bare = tmp.path().join("sudoers-bare");
+        fs::write(&bare, "Defaults env_reset\nroot ALL=(ALL:ALL) ALL\n").unwrap();
+        let found = run(&bare);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].code, "SUDOERS_INCLUDEDIR_MISSING");
+        // The grants are inert without it, so `doctor` must fail, not advise.
+        assert!(!found[0].advisory);
+        assert!(
+            found[0].detail.contains("/etc/sudoers.d"),
+            "{}",
+            found[0].detail
+        );
+
+        let absent = run(&tmp.path().join("absent"));
+        assert_eq!(absent.len(), 1, "{absent:?}");
+        assert_eq!(absent[0].code, "SUDOERS_INCLUDEDIR_MISSING");
+
+        // Unreadable is "cannot tell" (the unprivileged best-effort run), not
+        // a claim about the policy. Root reads any file, so skip it there.
+        if unsafe { libc::geteuid() } != 0 {
+            let locked = tmp.path().join("sudoers-locked");
+            fs::write(&locked, "Defaults env_reset\n").unwrap();
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+            assert!(run(&locked).is_empty());
+        }
+    }
+
+    #[test]
+    fn the_linux_shadow_scan_covers_the_linux_path_and_nothing_homebrew_shaped() {
+        let caller = OsStr::new("/home/op/.cargo/bin:/home/op/.local/bin:/usr/bin");
+        let dirs = search_dirs_for_host(Host::Linux, Some(caller));
+        for fixed in [
+            "/usr/local/bin",
+            "/usr/local/sbin",
+            "/usr/bin",
+            "/usr/sbin",
+            "/bin",
+            "/sbin",
+        ] {
+            assert!(dirs.contains(&PathBuf::from(fixed)), "missing {fixed}");
+        }
+        // A copy in the operator's own bin directories is exactly the shadow
+        // this scan exists to find; the caller's PATH widens the fixed list.
+        assert!(dirs.contains(&PathBuf::from("/home/op/.cargo/bin")));
+        assert!(dirs.contains(&PathBuf::from("/home/op/.local/bin")));
+        assert_eq!(
+            dirs.iter().filter(|d| *d == Path::new("/usr/bin")).count(),
+            1
+        );
+        assert!(!dirs.iter().any(|d| d.starts_with("/opt/homebrew")));
+        // macOS keeps its Homebrew directories.
+        assert!(
+            search_dirs_for_host(Host::MacOs, None)
+                .iter()
+                .any(|d| d == Path::new("/opt/homebrew/bin"))
+        );
+    }
+
+    #[test]
+    fn linux_looks_for_no_package_manager_media() {
+        assert!(media_candidates_for_host(Host::Linux).is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_plain_file_and_directory_carry_no_posix_acl() {
+        let tmp = tempdir().unwrap();
+        let file = tmp.path().join("plain");
+        fs::write(&file, "x").unwrap();
+        assert!(!has_extended_acl(Host::Linux, &file));
+        assert!(!has_extended_acl(Host::Linux, tmp.path()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_linux_config_yields_the_debian_layout_with_a_client_apart_from_the_broker() {
+        // `Config::parse` checks the vault and service identity against the
+        // compile-time platform, so this only parses on a Linux build.
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("sudo-secretspec.toml");
+        fs::write(
+            &path,
+            r#"
+engine = "/usr/libexec/sudo-secretspec"
+audit_helper = "/usr/libexec/sudo-secretspec"
+vault = "/var/lib/sudo-secretspec"
+vault_realpath = "/var/lib/sudo-secretspec"
+declarations = "/usr/share/sudo-secretspec/secretspec.toml"
+service_user = "sudo-secretspec"
+service_group = "sudo-secretspec"
+"#,
+        )
+        .unwrap();
+        let layout = load_config_for_host(&path, Host::Linux).unwrap();
+        assert_eq!(
+            layout.client,
+            PathBuf::from("/usr/local/bin/sudo-secretspec")
+        );
+        assert_eq!(layout.broker, PathBuf::from("/usr/libexec/sudo-secretspec"));
+        assert_ne!(layout.client, layout.broker);
+        assert_eq!(
+            layout.guidance,
+            PathBuf::from("/usr/share/sudo-secretspec/AI-GUIDANCE.md")
+        );
+        assert_eq!(
+            layout.sudoers,
+            PathBuf::from("/etc/sudoers.d/sudo-secretspec")
+        );
     }
 }

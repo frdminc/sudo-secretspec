@@ -133,6 +133,17 @@ BOTTLE_WATCH_SECONDS = 110 * 60
 # The workflow uploads the bottle and its JSON as this artifact on every run.
 BOTTLE_WORKFLOW = "sudo-release.yml"
 BOTTLE_ARTIFACT = "sudo-secretspec-bottle"
+LINUX_ARTIFACT = "sudo-secretspec-linux-x86_64"
+LINUX_TARGET = "x86_64-unknown-linux-gnu"
+LINUX_MEDIA_FILES = {
+    "libexec/sudo-secretspec",
+    "share/sudo-secretspec/AI-GUIDANCE.md",
+    "share/sudo-secretspec/sudo-secretspec-retired.toml",
+    "share/sudo-secretspec/skills/sudo-secretspec/SKILL.md",
+    "README.md",
+    "LICENSE",
+    "INSTALL.txt",
+}
 # The sha256 of the source archive the CI build compiled, shipped in the artifact
 # so it can be compared with the archive hashed here for the formula.
 SOURCE_SHA_FILE = "source.sha256"
@@ -1268,6 +1279,125 @@ def verify_attestation(artifact: Path, *, source_ref: str, source_digest: str) -
         ) from error
 
 
+def linux_asset_name(release: Release) -> str:
+    return f"sudo-secretspec-{release.version}-{LINUX_TARGET}.tar.gz"
+
+
+def validate_linux_media(release: Release, tarball: Path) -> None:
+    """Accept only the installer media's ordinary files before safe extraction.
+
+    Unlike source archives, installer media needs no links. Reject duplicate
+    members, special bits and unexpected paths before the data filter can
+    normalise them or extraction can overwrite a previous member.
+    """
+    prefix = linux_asset_name(release).removesuffix(".tar.gz")
+    files = {f"{prefix}/{name}" for name in LINUX_MEDIA_FILES}
+    directories = {prefix}
+    for name in files:
+        directories.update(str(p) for p in Path(name).parents if str(p) != ".")
+    seen = set()
+    try:
+        with tarfile.open(tarball, "r:gz") as archive:
+            for member in archive:
+                name = member.name
+                _require(name not in seen, f"duplicate Linux media member: {name}")
+                seen.add(name)
+                mode = 0o755 if name.endswith("/libexec/sudo-secretspec") else 0o644
+                _require(
+                    (member.isdir() and name in directories and member.mode == 0o755)
+                    or (member.isfile() and name in files and member.mode == mode),
+                    f"unsafe Linux media member: {name}",
+                )
+                _require(
+                    member.uid == 0 and member.gid == 0,
+                    f"non-root Linux media owner: {name}",
+                )
+        _require(files <= seen, "Linux media is missing required installer files")
+        tree = extracted_tree(tarball, prefix=prefix)
+        _require(
+            tree is not None and set(tree) == LINUX_MEDIA_FILES,
+            "Linux media failed safe extraction or has an unexpected layout",
+        )
+    except (tarfile.TarError, OSError, EOFError, ValueError) as error:
+        raise ReleaseError(f"cannot validate Linux installer media: {error}") from error
+
+
+def fetch_linux(release: Release, dest: Path, *, dry_run: bool) -> list[Path]:
+    """Verify the tag's Linux media and its published copies before finishing.
+
+    The same workflow/ref/commit provenance requirements as the bottle apply,
+    including to the checksum file. Never trust its filename as a path or glob.
+    """
+    if dry_run:
+        log(
+            f"[dry-run] verify {LINUX_ARTIFACT} and its release assets on {release.tag}"
+        )
+        return []
+    sha = output(["git", "rev-parse", f"{release.tag}^{{commit}}"])
+    run_id = find_run(release.tag, sha, workflow=BOTTLE_WORKFLOW)
+    watch_run(
+        run_id, "the Linux release run did not pass", timeout_s=BOTTLE_WATCH_SECONDS
+    )
+    run(
+        ["gh", "run", "download", str(run_id), "-R", FORK_REPO]
+        + ["-n", LINUX_ARTIFACT, "-D", str(dest)]
+    )
+    name = linux_asset_name(release)
+    names = [name, f"{name}.sha256"]
+    _require(
+        sorted(p.name for p in dest.iterdir()) == sorted(names),
+        "Linux artifact must contain exactly the tarball and its checksum",
+    )
+    paths = [dest / n for n in names]
+    for path in paths:
+        _require(
+            path.is_file() and not path.is_symlink(), "Linux artifact is not a file"
+        )
+        verify_attestation(
+            path, source_ref=f"refs/tags/{release.tag}", source_digest=sha
+        )
+    tarball, checksum = paths
+    # Exactly one sha256sum record, with a known bare basename. This excludes
+    # traversal, absolute paths, extra records and gh --pattern metacharacters.
+    record = checksum.read_text(encoding="utf-8")
+    match = re.fullmatch(r"([0-9a-f]{64})  ([A-Za-z0-9][A-Za-z0-9._+-]*)\n", record)
+    _require(
+        match is not None and match[2] == name, "unsafe Linux checksum filename/record"
+    )
+    _require(file_sha256(tarball) == match[1], "Linux tarball checksum mismatch")
+    validate_linux_media(release, tarball)
+    published = json.loads(
+        output(
+            ["gh", "release", "view", release.tag, "-R", FORK_REPO, "--json", "assets"]
+        )
+    )
+    asset_names = [asset.get("name") for asset in published["assets"]]
+    _require(
+        all(asset_names.count(n) == 1 for n in names),
+        "Linux assets missing or duplicated on the published release",
+    )
+    with tempfile.TemporaryDirectory(prefix="sudo-secretspec-linux-assets-") as work:
+        for path in paths:
+            asset_dir = Path(work) / path.name
+            asset_dir.mkdir()
+            run(
+                ["gh", "release", "download", release.tag, "-R", FORK_REPO]
+                + ["--pattern", path.name, "-D", str(asset_dir)]
+            )
+            _require(
+                sorted(p.name for p in asset_dir.iterdir()) == [path.name],
+                f"unexpected downloaded Linux release asset: {path.name}",
+            )
+            landed = asset_dir / path.name
+            _require(
+                landed.is_file()
+                and not landed.is_symlink()
+                and file_sha256(landed) == file_sha256(path),
+                f"published Linux asset differs from CI artifact: {path.name}",
+            )
+    return paths
+
+
 def fetch_bottle(release: Release, dest: Path, *, dry_run: bool) -> list[Path]:
     """Wait for the tag's bottle job and download its JSON into `dest`.
 
@@ -1825,6 +1955,10 @@ def _release_body(
     """
     with interrupt_cleanup(release, state):
         create_tag_and_release(release, notes, state, dry_run=args.dry_run)
+        # Linux is required even when the operator skips Homebrew or chooses
+        # a local bottle fallback: neither option changes Linux publication.
+        with tempfile.TemporaryDirectory(prefix="sudo-secretspec-linux-") as work:
+            fetch_linux(release, Path(work), dry_run=args.dry_run)
         if not args.skip_homebrew:
             with tempfile.TemporaryDirectory(prefix="sudo-secretspec-bottle-") as work:
                 # Wait for the bottle before the tap moves: a failed bottle then
