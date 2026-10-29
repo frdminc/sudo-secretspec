@@ -1,0 +1,114 @@
+name: Linux CI
+
+# Overlay-only on ci/base. Port of .forgejo/workflows/ci.yml; no loopback-port-shim
+# (GitHub runners are not libkrun). sudo-secretspec-cli is macOS-only, so the
+# macos job runs it plus packaging/release.py's own suite: together the two jobs
+# are the release gate (release.py ci_gate, 2026-10-18).
+
+on:
+  push:
+    branches: ['ci/run/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: linux (fmt, clippy, build, test, features, package)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system deps and Rust
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libsqlite3-dev pkg-config
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh
+          sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          . "$HOME/.cargo/env"
+          rustup toolchain install --profile minimal
+          rustup component add rustfmt clippy
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-registry-v1-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-registry-v1-
+      - name: Install SOPS 3.13.2
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /usr/local/bin/sops https://github.com/getsops/sops/releases/download/v3.13.2/sops-v3.13.2.linux.amd64
+          sudo chmod 0755 /usr/local/bin/sops
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run Clippy
+        run: cargo clippy --workspace --exclude secretspec-php-native --exclude sudo-secretspec-cli
+      - name: Build secretspec
+        run: cargo build -p secretspec --locked
+      - name: Run tests
+        run: cargo test --workspace --exclude secretspec-php-native --exclude sudo-secretspec-cli
+      - name: Check each provider feature standalone
+        run: |
+          set -euo pipefail
+          for feature in cli keyring keeper gcsm awssm vault openbao infisical bws akv aac sops bw; do
+            echo "== feature $feature"
+            cargo check --package secretspec --no-default-features --features "$feature"
+          done
+      - name: Verify the published crate contains its schema fixture
+        run: |
+          set -euo pipefail
+          fixture="secretspec/src/fixtures/resolution-report.schema.json"
+          cmp schema/resolution-report.schema.json "$fixture"
+          cargo package --package secretspec --list |
+            grep -Fx 'src/fixtures/resolution-report.schema.json'
+
+  macos:
+    name: macos (companion crate, release helper, formula)
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      # Same steps as sudo-release.yml, which fires only on tags and PRs.
+      # Homebrew's SQLite, not rusqlite's `bundled`, which can hang in build scripts.
+      - name: Install focused test dependencies
+        run: |
+          python -m pip install pytest ruff
+          brew install sqlite
+      - name: Test downstream companion crate
+        env:
+          PKG_CONFIG_PATH: /opt/homebrew/opt/sqlite/lib/pkgconfig
+          LIBRARY_PATH: /opt/homebrew/opt/sqlite/lib
+        run: cargo test -p sudo-secretspec-cli --locked
+      # Emit the installable CLI binary so a hotfix can be installed on the Mac
+      # without a full release ceremony (C1 privileged-config fix, 2026-10-28).
+      # Same Homebrew-SQLite env as the test step above (rusqlite is not
+      # `bundled` here, matching release.py's own build).
+      - name: Build release binary
+        env:
+          PKG_CONFIG_PATH: /opt/homebrew/opt/sqlite/lib/pkgconfig
+          LIBRARY_PATH: /opt/homebrew/opt/sqlite/lib
+        run: cargo build --release -p sudo-secretspec-cli --locked
+      - name: Upload release binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: sudo-secretspec-macos
+          path: target/release/sudo-secretspec
+          if-no-files-found: error
+          retention-days: 7
+      - name: Test release helper
+        run: |
+          python -m ruff check packaging tests/sudo_packaging
+          python -m ruff format --check packaging tests/sudo_packaging
+          python -m pytest tests/sudo_packaging -q
+      - name: Check formula style and syntax
+        run: |
+          ruby -c packaging/homebrew/sudo-secretspec.rb
+          brew style packaging/homebrew/sudo-secretspec.rb
