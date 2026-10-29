@@ -2301,7 +2301,9 @@ BETA = { description = "second", required = false }
         // sudoers verb and not client routing.
         let _guard = EXECUTE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (_vault, cfg) = execute_fixture();
-        fixture_secrets(&cfg).set("ALPHA", Some("a1".into())).unwrap();
+        fixture_secrets(&cfg)
+            .set("ALPHA", Some("a1".into()))
+            .unwrap();
 
         let mut all = broker_op("source-restore");
         all.all = true;

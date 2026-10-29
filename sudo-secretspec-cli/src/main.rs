@@ -384,14 +384,16 @@ fn main() {
         Cmd::PrintSudoers {
             operator,
             service_user,
-        } => match sudo_secretspec_cli::install::sudoers_text_for_platform(&operator, &service_user)
-        {
-            Ok(text) => print!("{text}"),
-            Err(message) => {
-                eprintln!("sudo-secretspec: {message}");
-                std::process::exit(2);
+        } => {
+            match sudo_secretspec_cli::install::sudoers_text_for_platform(&operator, &service_user)
+            {
+                Ok(text) => print!("{text}"),
+                Err(message) => {
+                    eprintln!("sudo-secretspec: {message}");
+                    std::process::exit(2);
+                }
             }
-        },
+        }
     }
 }
 
@@ -1112,10 +1114,7 @@ fn doctor(
     // NOPASSWD root `doctor` echoed an arbitrary file's contents.
     if !unprivileged {
         if let Some(cfg) = &config {
-            let is_default = match (
-                Path::new(CONFIG_PATH).canonicalize(),
-                cfg.canonicalize(),
-            ) {
+            let is_default = match (Path::new(CONFIG_PATH).canonicalize(), cfg.canonicalize()) {
                 (Ok(installed), Ok(given)) => installed == given,
                 _ => false,
             };

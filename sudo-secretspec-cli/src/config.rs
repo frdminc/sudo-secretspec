@@ -81,15 +81,14 @@ impl Config {
             }
         }
         let vault_name = direct_child(&self.vault, Path::new(platform::VAULT_PARENT))?;
-        let real_name = direct_child(
-            &self.vault_realpath,
-            Path::new(platform::VAULT_REAL_PARENT),
-        )?;
+        let real_name = direct_child(&self.vault_realpath, Path::new(platform::VAULT_REAL_PARENT))?;
         if vault_name != real_name {
             return Err(ConfigError::Invalid("vault and resolved vault must match"));
         }
-        if !valid_service_identity(&self.service_user, platform::SERVICE_USER_REQUIRES_UNDERSCORE)
-            || !valid_service_identity(&self.service_group, false)
+        if !valid_service_identity(
+            &self.service_user,
+            platform::SERVICE_USER_REQUIRES_UNDERSCORE,
+        ) || !valid_service_identity(&self.service_group, false)
         {
             return Err(ConfigError::Invalid("invalid service identity"));
         }
