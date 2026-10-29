@@ -1365,21 +1365,26 @@ mod tests {
         assert_eq!(restore_verb(false, false), "source-restore");
     }
 
-    // The privileged `doctor` config check. Ownership cannot be forged in an
-    // unprivileged test, so the root-owned acceptance branch is exercised by
-    // the live verification, not here: these prove the service-user-owned and
-    // refusal branches, which is exactly the case the C1 fix got wrong.
+    // Test the service-user-owned and refusal branches even when CI runs as
+    // root: otherwise root ownership masks both of the cases the C1 fix covers.
     #[test]
     fn privileged_config_accepts_service_user_ownership() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("config.toml");
-        std::fs::write(&file, "engine = \"/usr/local/libexec/sudo-secretspec\"\n").unwrap();
+        std::fs::write(
+            &file,
+            format!("engine = \"{}\"\n", platform::DEFAULT_BROKER_PATH),
+        )
+        .unwrap();
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o444)).unwrap();
+        if unsafe { libc::geteuid() } == 0 {
+            std::os::unix::fs::chown(&file, Some(65534), None).unwrap();
+        }
 
         let my_uid = std::fs::symlink_metadata(&file).unwrap().uid();
-        assert!(my_uid != 0, "test must run unprivileged");
+        assert_ne!(my_uid, 0, "fixture must have an unprivileged owner");
 
         assert_eq!(assert_privileged_config(&file, Some(my_uid)), Ok(()));
     }
@@ -1391,8 +1396,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("config.toml");
         std::fs::write(&file, "x = 1\n").unwrap();
+        if unsafe { libc::geteuid() } == 0 {
+            std::os::unix::fs::chown(&file, Some(65534), None).unwrap();
+        }
 
         let my_uid = std::fs::symlink_metadata(&file).unwrap().uid();
+        assert_ne!(my_uid, 0, "fixture must have an unprivileged owner");
 
         // No service user at all: only root is accepted.
         assert_eq!(

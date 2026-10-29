@@ -114,7 +114,9 @@ ok 'doctor accepts the Debian layout'
 # client must still be reported as a shadow by doctor.
 [[ $(stat -c '%a %U:%G' /usr/local/bin) == "$local_before" ]]
 install -m755 /usr/bin/sudo-secretspec /usr/local/bin/sudo-secretspec
-must_fail 'doctor with earlier PATH client' /usr/bin/sudo-secretspec doctor
+must_fail 'doctor with earlier PATH client' /usr/bin/sudo-secretspec doctor > "$work/shadow.txt" 2>&1
+cat "$work/shadow.txt"
+grep -F 'CLIENT_SHADOWED' "$work/shadow.txt"
 rm /usr/local/bin/sudo-secretspec
 [[ $(stat -c '%a %U:%G' /usr/local/bin) == "$local_before" ]]
 /usr/bin/sudo-secretspec doctor
@@ -126,7 +128,9 @@ must_fail 'service user lookup after purge' getent passwd sudo-secretspec
 must_fail 'service group lookup after purge' getent group sudo-secretspec
 ok 'fresh purge removes vault and service identity'
 groupadd --system sudo-secretspec
-must_fail 'fresh install with pre-existing group' install_boundary
+must_fail 'fresh install with pre-existing group' install_boundary > "$work/group-denied.txt" 2>&1
+cat "$work/group-denied.txt"
+grep -F -- '--adopt-existing' "$work/group-denied.txt"
 absent /etc/sudo-secretspec.toml
 absent /var/lib/sudo-secretspec
 groupdel sudo-secretspec

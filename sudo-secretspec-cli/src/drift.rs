@@ -57,8 +57,8 @@ pub struct Layout {
 impl Layout {
     /// `host` decides where the public client lives: macOS derives it from the
     /// configured prefix (`<prefix>/bin`), Linux uses the fixed
-    /// [`platform::client_path`] because the broker's prefix (`/usr`) is not
-    /// where the public client goes (`/usr/bin` on ordinary Linux).
+    /// [`platform::client_path`] independently of the configured engine prefix
+    /// (`/usr/bin` on ordinary Linux, the system profile on NixOS).
     fn from_config(cfg: Config, config_path: PathBuf, host: Host) -> Self {
         // Prefer deriving the install prefix from the configured engine path.
         // Single-binary installs place the privileged binary under libexec and

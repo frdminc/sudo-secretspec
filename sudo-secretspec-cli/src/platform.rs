@@ -19,9 +19,9 @@
 //!
 //! The other constants are deliberately not overridable. The vault location is
 //! validated against [`VAULT_PARENT`] by `config.rs`, so changing one without
-//! the other would silently loosen that check; the install prefix, sudoers
-//! directory and service identity only matter to the macOS installer, which
-//! does not run anywhere else.
+//! the other would silently loosen that check. The install prefix, sudoers
+//! directory and service identity describe the imperative macOS/Linux layout;
+//! the NixOS module manages its boundary declaratively.
 //!
 //! macOS values are byte-identical to what `main.rs`, `broker.rs`, `install.rs`
 //! and `drift.rs` hard-coded before this module existed.
