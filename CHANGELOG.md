@@ -25,6 +25,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Storing into an undeclared name used to fail part-way through the store loop
   with `broker: Secret 'NAME' is not defined in profile 'default'`; that error
   now also names the fix (`add NAME --optional`, or re-run with `--declare`).
+- `sudo-secretspec` builds and runs on NixOS (Linux). Per-OS paths, the service
+  identity rules and compile-time overrides (`SUDO_SECRETSPEC_SUDO`,
+  `SUDO_SECRETSPEC_BROKER_PATH`, `SUDO_SECRETSPEC_CONFIG_PATH`) live in one
+  `platform` module; macOS paths are unchanged. `add`, `set`, `get`, `run`,
+  `restore` and the other broker-backed commands work through the same
+  `sudo` + sudoers boundary. `install`, `uninstall`, `rollback` and `doctor`
+  are macOS-only and refuse on Linux, pointing at the NixOS module.
+- A Nix flake (`flake.nix`) with `packages.<system>.sudo-secretspec` and
+  `nixosModules.default` (`services.sudo-secretspec`), which declares the
+  `sudo-secretspec` service user, the immutable broker store path (baked in at
+  compile time, not a `/run` symlink), the vault under `/var/lib`, the
+  root-owned `/etc/sudo-secretspec.toml` and the NOPASSWD sudoers rules.
 
 ### Fixed
 

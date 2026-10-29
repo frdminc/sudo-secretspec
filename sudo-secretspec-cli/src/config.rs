@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+use crate::platform;
+
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -78,13 +80,15 @@ impl Config {
                 return Err(ConfigError::Invalid("managed paths must not contain '..'"));
             }
         }
-        let vault_name = direct_child(&self.vault, Path::new("/var/db"))?;
-        let real_name = direct_child(&self.vault_realpath, Path::new("/private/var/db"))?;
+        let vault_name = direct_child(&self.vault, Path::new(platform::VAULT_PARENT))?;
+        let real_name = direct_child(&self.vault_realpath, Path::new(platform::VAULT_REAL_PARENT))?;
         if vault_name != real_name {
             return Err(ConfigError::Invalid("vault and resolved vault must match"));
         }
-        if !valid_service_identity(&self.service_user, true)
-            || !valid_service_identity(&self.service_group, false)
+        if !valid_service_identity(
+            &self.service_user,
+            platform::SERVICE_USER_REQUIRES_UNDERSCORE,
+        ) || !valid_service_identity(&self.service_group, false)
         {
             return Err(ConfigError::Invalid("invalid service identity"));
         }
@@ -116,6 +120,16 @@ fn direct_child<'a>(path: &'a Path, parent: &Path) -> Result<&'a std::ffi::OsStr
     if components.next().is_some() {
         return Err(ConfigError::Invalid("vault must be one direct child"));
     }
+    // A `.` or `..` component slips past the "one direct child" check and would
+    // let a config author aim the vault at `/var/lib` itself (`.`) or its
+    // parent (`..`); the module's tmpfiles rule would then re-own a system
+    // state directory on every activation. Refuse the traversal components.
+    if matches!(
+        name,
+        std::path::Component::CurDir | std::path::Component::ParentDir
+    ) {
+        return Err(ConfigError::Invalid("vault name must not be '.' or '..'"));
+    }
     Ok(name.as_os_str())
 }
 
@@ -134,12 +148,19 @@ fn valid_profile_name(value: &str) -> bool {
 }
 
 fn valid_service_identity(value: &str, require_underscore: bool) -> bool {
-    if value.is_empty() || value.len() > 31 || (require_underscore && !value.starts_with('_')) {
+    // The superuser is never a service identity. macOS got this for free from
+    // the mandatory underscore; Linux has no such prefix, so say it outright.
+    if value == "root"
+        || value.is_empty()
+        || value.len() > 31
+        || (require_underscore && !value.starts_with('_'))
+    {
         return false;
     }
     value.bytes().enumerate().all(|(index, byte)| match byte {
         b'a'..=b'z' | b'_' => true,
         b'0'..=b'9' => index > 0,
+        b'-' => platform::SERVICE_IDENTITY_ALLOWS_HYPHEN && index > 0,
         _ => false,
     })
 }

@@ -48,7 +48,10 @@ pub fn run(snapshot: &Path) -> Result<(), RollbackError> {
     require_root()?;
     let snapshot = fs::canonicalize(snapshot)
         .map_err(|e| RollbackError::Denied(format!("invalid snapshot path: {e}")))?;
-    let prefix = PathBuf::from("/usr/local/libexec/sudo-secretspec-rollback-");
+    let prefix = PathBuf::from(format!(
+        "{}/libexec/sudo-secretspec-rollback-",
+        crate::install::PREFIX
+    ));
     if !snapshot
         .to_string_lossy()
         .starts_with(prefix.to_string_lossy().as_ref())

@@ -62,7 +62,7 @@ impl Layout {
             .engine
             .parent()
             .and_then(Path::parent)
-            .unwrap_or_else(|| Path::new("/usr/local"))
+            .unwrap_or_else(|| Path::new(crate::platform::PREFIX))
             .to_path_buf();
         let libexec = prefix.join("libexec");
         let bin = prefix.join("bin");
@@ -83,7 +83,7 @@ impl Layout {
             checker: bin.join("sudo-secretspec"),
             retired: share.join("sudo-secretspec-retired.toml"),
             guidance: share.join("AI-GUIDANCE.md"),
-            sudoers: PathBuf::from("/private/etc/sudoers.d/sudo-secretspec"),
+            sudoers: PathBuf::from(crate::platform::SUDOERS_FILE),
             source_manifest: share.join("MANIFEST.sha256"),
             config: config_path,
             adopted_vault: cfg.adopted_vault,

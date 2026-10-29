@@ -6,18 +6,10 @@ use std::process::Command;
 
 use clap::{Parser, Subcommand};
 
-/// Absolute path to sudo. Never resolve this through `PATH`: the caller
-/// controls the environment, and a planted `sudo` earlier in `PATH` would
-/// silently satisfy every broker call with forged values and no audit event.
-const SUDO: &str = "/usr/bin/sudo";
-
-/// Installed path of the privileged broker. The sudoers policy grants
-/// NOPASSWD execution of this path, so when the running binary *is* this
-/// path it may only serve the operations that policy is meant to expose.
-const BROKER_PATH: &str = "/usr/local/libexec/sudo-secretspec";
-
-/// Installed protected configuration, written by `install`.
-const CONFIG_PATH: &str = "/usr/local/etc/sudo-secretspec.toml";
+// Absolute paths for `sudo`, the privileged broker and the protected config.
+// They come from `platform` (per-OS defaults, compile-time overrides) and are
+// never resolved through `PATH` or the caller's environment.
+use sudo_secretspec_cli::platform::{self, BROKER_PATH, CONFIG_PATH, SUDO};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -228,6 +220,21 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<OsString>,
     },
+    /// Print the sudoers policy for this platform's boundary.
+    ///
+    /// Consumed by the NixOS module (import-from-derivation) so the module's
+    /// sudoers text and the compiled-in broker path cannot drift. Runs as the
+    /// public client, never through the broker, so it is outside the privileged
+    /// allowlist. Reads nothing, writes only stdout.
+    #[command(hide = true, name = "print-sudoers")]
+    PrintSudoers {
+        /// Operator granted the NOPASSWD broker rules.
+        #[arg(long)]
+        operator: String,
+        /// Service user the broker runs as.
+        #[arg(long)]
+        service_user: String,
+    },
 }
 
 /// True when this process is the installed privileged broker, i.e. it was
@@ -266,8 +273,9 @@ fn main() {
     {
         eprintln!(
             "sudo-secretspec: the privileged broker path serves only __broker and doctor;\n\
-             run install/rollback through /usr/local/bin/sudo-secretspec so they require\n\
-             interactive authentication"
+             run install/rollback through {} so they require\n\
+             interactive authentication",
+            platform::CLIENT_PATH
         );
         std::process::exit(2);
     }
@@ -347,6 +355,7 @@ fn main() {
         ),
         Cmd::AuditVerify => audit_verify(),
         Cmd::Rollback { snapshot } => {
+            require_imperative_installer("rollback");
             if unsafe { libc::geteuid() } != 0 {
                 let status = Command::new(SUDO)
                     .arg(self_exe())
@@ -372,6 +381,29 @@ fn main() {
                 std::process::exit(code);
             }
         }
+        Cmd::PrintSudoers {
+            operator,
+            service_user,
+        } => {
+            match sudo_secretspec_cli::install::sudoers_text_for_platform(&operator, &service_user)
+            {
+                Ok(text) => print!("{text}"),
+                Err(message) => {
+                    eprintln!("sudo-secretspec: {message}");
+                    std::process::exit(2);
+                }
+            }
+        }
+    }
+}
+
+/// Boundary lifecycle (`install`, `uninstall`, `rollback`) and `doctor`'s
+/// layout checks describe the macOS/Homebrew install. Anywhere else they
+/// refuse, and say where the boundary is managed instead.
+fn require_imperative_installer(command: &str) {
+    if let Some(message) = platform::lifecycle_refusal(command) {
+        eprintln!("sudo-secretspec: {message}");
+        std::process::exit(2);
     }
 }
 
@@ -504,6 +536,7 @@ fn run_install(
     profile: Option<String>,
     non_interactive: bool,
 ) {
+    require_imperative_installer("install");
     // Before anything else, and before elevating: an install that would copy
     // the installed boundary onto itself is refused here rather than after the
     // operator has authenticated. `install::run` repeats this check as root and
@@ -645,6 +678,7 @@ fn run_uninstall(
     config: Option<PathBuf>,
     non_interactive: bool,
 ) {
+    require_imperative_installer("uninstall");
     // Confirm here, while still unprivileged and still attached to the
     // operator's terminal. The elevated re-exec below passes
     // `--non-interactive`, so this is the only place a prompt can happen —
@@ -751,7 +785,7 @@ fn get_service_user() -> String {
     } else {
         // Fallback to the default if config is missing or unparseable.
         // It shouldn't get here because we only call this when installed.
-        "_sudo_secretspec".to_string()
+        platform::DEFAULT_USER.to_string()
     }
 }
 
@@ -1067,6 +1101,7 @@ fn doctor(
     caller_path: Option<OsString>,
     available_build: Option<sudo_secretspec_cli::AvailableBuild>,
 ) {
+    require_imperative_installer("doctor");
     // `sudo` replaces PATH with the policy's secure_path, so the shadow check
     // has to be told what the caller's PATH was before elevating. Trust the
     // ambient value only while still unprivileged.
@@ -1079,10 +1114,7 @@ fn doctor(
     // NOPASSWD root `doctor` echoed an arbitrary file's contents.
     if !unprivileged {
         if let Some(cfg) = &config {
-            let is_default = match (
-                Path::new(CONFIG_PATH).canonicalize(),
-                cfg.canonicalize(),
-            ) {
+            let is_default = match (Path::new(CONFIG_PATH).canonicalize(), cfg.canonicalize()) {
                 (Ok(installed), Ok(given)) => installed == given,
                 _ => false,
             };
