@@ -229,19 +229,19 @@ in
     # The whole policy — the `Defaults!` line *and* the operator's NOPASSWD
     # grant lines — comes from `sudoersText`, the IFD derivation that runs the
     # binary's own `print-sudoers`. `security.sudo.extraConfig` is
-    # `types.lines`, merged by plain `concatStringsSep "\n"` with no
-    # `sortProperties` pass, so `mkOrder`/`mkAfter` carry no weight here; what
-    # actually orders it is nixpkgs' `sudo.nix`, which appends `extraConfig`
-    # LAST — after the stock `%wheel` `extraRules` block. sudoers is
-    # last-match-wins, so these grants are the final lines and take effect over
-    # `%wheel`'s password prompt. The only residual is ordering against a
-    # *second* module that also sets `extraConfig`: nixpkgs emits both in the
-    # order its `concatStringsSep` sees them, and whichever lands later wins.
-    # That is an availability-only risk (a later rule could re-prompt for a
-    # verb), never an escalation — it cannot add a grant this module did not
-    # already emit. There is no `timestamp_timeout=0` line and no `doctor` grant
-    # on Linux: the former has no client path to attach to, the latter refuses
-    # on Linux.
-    security.sudo.extraConfig = builtins.readFile sudoersText;
+    # `types.lines`; `lib.mkAfter` sorts this definition after other modules'
+    # `extraConfig` lines (nixpkgs runs `sortProperties` whenever any
+    # definition carries `_type == "order"`, before the type's merge), and
+    # nixpkgs' `sudo.nix` appends `extraConfig` LAST — after the stock `%wheel`
+    # `extraRules` block. sudoers is last-match-wins, so these grants are the
+    # final lines and take effect over `%wheel`'s password prompt. The only
+    # residual is ordering against a *second* module that also sets
+    # `extraConfig` with `mkAfter` (or a later `mkOrder`): whichever sorts
+    # later wins. That is an availability-only risk (a later rule could
+    # re-prompt for a verb), never an escalation — it cannot add a grant this
+    # module did not already emit. There is no `timestamp_timeout=0` line and
+    # no `doctor` grant on Linux: the former has no client path to attach to,
+    # the latter refuses on Linux.
+    security.sudo.extraConfig = lib.mkAfter (builtins.readFile sudoersText);
   };
 }
