@@ -23,7 +23,7 @@ use crate::config::Config;
 // Paths
 // ---------------------------------------------------------------------------
 
-const CONFIG_PATH: &str = "/usr/local/etc/sudo-secretspec.toml";
+const CONFIG_PATH: &str = crate::platform::CONFIG_PATH;
 
 // ---------------------------------------------------------------------------
 // Broker CLI (sub-parser for __broker)

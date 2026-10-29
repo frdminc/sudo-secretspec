@@ -13,6 +13,8 @@ use std::process::Command;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::platform;
+
 /// Vault belonging to the retired `stayturgid` `_secretspec` wrapper.
 ///
 /// Adoptable, because a host that has only ever run the wrapper still keeps its
@@ -24,15 +26,15 @@ const LEGACY_VAULT: &str = "/var/db/stayturgid-secrets";
 const LEGACY_USER: &str = "_secretspec";
 const LEGACY_GROUP: &str = "staff";
 
-pub(crate) const PREFIX: &str = "/usr/local";
-const CONFIG_PATH: &str = "/usr/local/etc/sudo-secretspec.toml";
-const SUDOERS_PATH: &str = "/private/etc/sudoers.d/sudo-secretspec";
+pub(crate) const PREFIX: &str = platform::PREFIX;
+const CONFIG_PATH: &str = platform::CONFIG_PATH;
+const SUDOERS_PATH: &str = platform::SUDOERS_FILE;
 /// Any file installed under here is a sudo policy and must be validated before
 /// it is allowed to take effect.
-pub(crate) const SUDOERS_DIR: &str = "/private/etc/sudoers.d";
-const DEFAULT_VAULT: &str = "/var/db/sudo-secretspec";
-const DEFAULT_USER: &str = "_sudo_secretspec";
-const DEFAULT_GROUP: &str = "_sudo_secretspec";
+pub(crate) const SUDOERS_DIR: &str = platform::SUDOERS_DIR;
+const DEFAULT_VAULT: &str = platform::DEFAULT_VAULT;
+const DEFAULT_USER: &str = platform::DEFAULT_USER;
+const DEFAULT_GROUP: &str = platform::DEFAULT_GROUP;
 /// Manifest profile assumed when the operator does not name one.
 const DEFAULT_PROFILE: &str = "default";
 /// Directory-name prefix for rollback snapshots under `<PREFIX>/libexec`.

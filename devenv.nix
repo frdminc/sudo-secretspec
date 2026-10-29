@@ -122,8 +122,9 @@
     clippy.settings.offline = false;
   };
 
-  # sudo-secretspec-cli is a macOS-only downstream companion and does not build
-  # on Linux; run its suite with `cargo test -p sudo-secretspec-cli` on macOS.
+  # sudo-secretspec-cli builds on Linux (see flake.nix), but its test suite is
+  # macOS-shaped (macOS paths, a real sudo and service accounts); run it with
+  # `cargo test -p sudo-secretspec-cli` on macOS.
   enterTest = ''
     cargo test --all --exclude sudo-secretspec-cli
   '';

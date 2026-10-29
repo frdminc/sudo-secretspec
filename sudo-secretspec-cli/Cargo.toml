@@ -33,5 +33,7 @@ uuid.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 
-[target.'cfg(target_os = "macos")'.dependencies]
+# Every call site is POSIX (geteuid, getuid, umask, chown, lchown, isatty,
+# getpwuid, getpwnam, getgrgid), identical on macOS and Linux.
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"

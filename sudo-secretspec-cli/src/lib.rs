@@ -4,6 +4,7 @@ pub mod config;
 pub mod drift;
 pub mod history;
 pub mod install;
+pub mod platform;
 pub mod rollback;
 pub mod uninstall;
 
