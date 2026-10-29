@@ -16,9 +16,6 @@
   sqlite,
   # NixOS has no /usr/bin/sudo: the setuid wrapper lives in /run/wrappers/bin.
   sudoPath ? "/run/wrappers/bin/sudo",
-  # Stable, root-owned symlink maintained by the NixOS module (tmpfiles).
-  # sudoers grants NOPASSWD on this path; it resolves to `libexec/` below.
-  brokerPath ? "/run/sudo-secretspec/broker",
   # Root-owned 0444 file written by the NixOS module.
   configPath ? "/etc/sudo-secretspec.toml",
 }:
@@ -58,22 +55,25 @@ rustPlatform.buildRustPackage {
 
   env = lib.optionalAttrs stdenv.hostPlatform.isLinux {
     SUDO_SECRETSPEC_SUDO = sudoPath;
-    SUDO_SECRETSPEC_BROKER_PATH = brokerPath;
+    # The broker path is the store path of the `libexec/` copy, baked at build
+    # time. There is deliberately no `/run` symlink: a sudoers rule on a
+    # mutable symlink could be repointed, whereas the store path is immutable.
+    SUDO_SECRETSPEC_BROKER_PATH = "${builtins.placeholder "out"}/libexec/sudo-secretspec";
     SUDO_SECRETSPEC_CONFIG_PATH = configPath;
   };
 
   # The public client and the privileged broker must be DIFFERENT paths.
   # `main` refuses everything but `__broker`/`doctor` when
   # canonicalize(current_exe()) == canonicalize(BROKER_PATH), so that the
-  # NOPASSWD path cannot serve `install`/`rollback`. If the broker symlink
-  # pointed at `bin/sudo-secretspec`, the operator's own client would resolve
-  # to the same store path and refuse every command. A second copy under
-  # `libexec/` keeps the two identities apart without changing that check.
+  # NOPASSWD path cannot serve `install`/`rollback`. If the broker path were
+  # `bin/sudo-secretspec`, the operator's own client would resolve to the same
+  # store path and refuse every command. A second copy under `libexec/` keeps
+  # the two identities apart without changing that check.
   postInstall = ''
     install -D -m755 "$out/bin/sudo-secretspec" "$out/libexec/sudo-secretspec"
   '';
 
-  passthru = { inherit sudoPath brokerPath configPath; };
+  passthru = { inherit sudoPath configPath; };
 
   meta = {
     description = "Privilege-separated SecretSpec companion (sudo + sudoers boundary)";

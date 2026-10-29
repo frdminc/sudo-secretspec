@@ -5,6 +5,15 @@
 # on macOS (`install.rs`): service account, protected config, vault directory,
 # sudoers policy. The imperative `install`/`uninstall`/`rollback`/`doctor`
 # commands refuse on Linux and point here.
+#
+# `doctor` — and its drift/layout checks — is a macOS-only diagnostic. Its
+# checks are macOS-shaped (a real `/bin/ls`, a `sudoers.d` `#include` line,
+# root-owned `/etc/static`, Homebrew paths) and have no NixOS equivalent, so
+# the Linux binary refuses it via `platform::lifecycle_refusal`. The declared
+# boundary has no drift checker instead: the broker is an immutable store path
+# (not a mutable `/run` symlink), and `systemd.tmpfiles` re-asserts the vault
+# owner/mode and the config file owner/mode on every activation, so the
+# equivalent guarantee is "a rebuild is the only way anything changes".
 self:
 {
   config,
@@ -18,30 +27,29 @@ let
   inherit (lib) mkOption mkEnableOption mkIf types;
 
   # Single source of truth: the paths compiled into the package.
-  broker = cfg.package.passthru.brokerPath;
+  #
+  # `broker` is the `libexec/` copy in the store — a distinct regular file from
+  # the public client at `bin/`, so `main`'s canonical-path identity check can
+  # tell the NOPASSWD broker apart from the operator's client. The flake bakes
+  # `platform::BROKER_PATH` to exactly this store path (`SUDO_SECRETSPEC_BROKER_PATH`
+  # in package.nix), so `broker` here and the path `print-sudoers` emits agree.
+  broker = "${cfg.package}/libexec/sudo-secretspec";
   configPath = cfg.package.passthru.configPath;
-  brokerTarget = "${cfg.package}/libexec/sudo-secretspec";
 
-  # Same verbs, same `--*` argument glob as `install.rs`'s `sudoers_text()`.
-  # `source-restore-force` and `source-destroy` are deliberately absent: with
-  # no line they fall through to the operator's ordinary password-prompted
-  # sudo, which is what makes them "authenticated" operations.
-  globbedVerbs = [
-    "source-add"
-    "source-set"
-    "source-delete"
-    "source-undeclare"
-    "source-get"
-    "source-check"
-    "source-export"
-    "source-template-check"
-    "source-schema"
-    "source-restore"
-  ];
-  nopasswd = command: {
-    inherit command;
-    options = [ "NOPASSWD" ];
-  };
+  # The sudoers policy is emitted by the same binary that enforces it, through
+  # the hidden `print-sudoers` subcommand (`install.rs::linux_sudoers_text`).
+  # Import-from-derivation means the module's sudoers text and the compiled-in
+  # broker path can never drift apart: when the package changes, the text is
+  # regenerated from the new binary. `OPERATOR`/`SERVICE_USER` reach the command
+  # as derivation env, never through shell interpolation, so a hostile operator
+  # or service-user string cannot break out of the builder command.
+  sudoersText = pkgs.runCommand "sudo-secretspec-sudoers"
+    {
+      OPERATOR = cfg.operator;
+      SERVICE_USER = cfg.serviceUser;
+    }
+    ''"${cfg.package}/bin/sudo-secretspec" print-sudoers \
+        --operator "$OPERATOR" --service-user "$SERVICE_USER" > "$out"'';
 
   identity = "[a-z_][a-z0-9_-]{0,30}"; # config.rs `valid_service_identity` (Linux)
   tomlFormat = pkgs.formats.toml { };
@@ -178,12 +186,6 @@ in
     };
 
     systemd.tmpfiles.rules = [
-      # Parent is root-owned and non-writable, so nobody can swap the symlink.
-      "d ${builtins.dirOf broker} 0755 root root -"
-      # Stable name for sudoers; `L+` re-points it on every rebuild. The target
-      # is the `libexec/` copy, whose canonical path equals the broker's own
-      # `current_exe()` and differs from the public client's (see package.nix).
-      "L+ ${broker} - - - - ${brokerTarget}"
       # `d` re-asserts owner and mode on an existing directory every run; the
       # broker refuses anything but 0700 owned by the service user.
       "d ${cfg.vault} 0700 ${cfg.serviceUser} ${cfg.serviceGroup} -"
@@ -195,23 +197,13 @@ in
       "z ${manifest} 0600 ${cfg.serviceUser} ${cfg.serviceGroup} -"
     ];
 
-    # `install.rs` also sets `timestamp_timeout=0` on the *client* path. That
-    # only guards the client's own `sudo client install|uninstall|rollback`,
-    # which do not exist on Linux, so there is nothing to attach it to.
-    security.sudo.extraConfig = ''
-      Defaults!${broker} env_reset,env_keep-="HOME",secure_path=/run/current-system/sw/bin:/run/wrappers/bin,umask=0077,always_set_home
-    '';
-
-    # After the stock `%wheel` rule: sudoers is last-match-wins, so the
-    # NOPASSWD lines must come later to take effect.
-    security.sudo.extraRules = lib.mkAfter [
-      {
-        users = [ cfg.operator ];
-        runAs = cfg.serviceUser;
-        commands =
-          map (verb: nopasswd "${broker} __broker ${verb} --*") globbedVerbs
-          ++ [ (nopasswd "${broker} __broker audit-verify") ];
-      }
-    ];
+    # The whole policy — the `Defaults!` line *and* the operator's NOPASSWD
+    # grant lines — comes from `sudoersText`, the IFD derivation that runs the
+    # binary's own `print-sudoers`. `extraConfig` is appended by NixOS after the
+    # stock `%wheel` rule, and sudoers is last-match-wins, so the NOPASSWD
+    # grants take effect over `%wheel`'s password prompt. There is no
+    # `timestamp_timeout=0` line and no `doctor` grant on Linux: the former has
+    # no client path to attach to, the latter refuses on Linux.
+    security.sudo.extraConfig = builtins.readFile sudoersText;
   };
 }
