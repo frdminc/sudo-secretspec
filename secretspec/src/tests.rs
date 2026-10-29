@@ -2917,6 +2917,7 @@ fn test_set_with_undefined_secret() {
 #[test]
 fn test_set_with_undefined_secret_error_display_is_not_double_wrapped() {
     let project_config = Config {
+        defaults: None,
         project: Project {
             name: "test_project".to_string(),
             ..Default::default()
@@ -2950,6 +2951,7 @@ fn test_set_with_undefined_secret_error_display_is_not_double_wrapped() {
 
     let global_config = GlobalConfig {
         defaults: GlobalDefaults {
+            retry: None,
             provider: Some("env".to_string()),
             profile: None,
             providers: None,
@@ -2958,7 +2960,7 @@ fn test_set_with_undefined_secret_error_display_is_not_double_wrapped() {
     };
 
     let spec = Secrets::new(project_config, Some(global_config), None, None);
-    let result = spec.set("UNDEFINED_SECRET", Some("test_value".to_string()));
+    let result = spec.set_text("UNDEFINED_SECRET", "test_value");
 
     let rendered = result.unwrap_err().to_string();
     assert!(
