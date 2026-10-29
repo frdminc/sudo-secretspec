@@ -29,7 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 # Relative path -> exact number of downstream-version references it carries.
 STAMP_SITES = {
-    Path("Cargo.toml"): 3,
+    Path("Cargo.toml"): 5,
     Path("secretspec-derive/Cargo.toml"): 1,
     Path("sudo-secretspec-cli/Cargo.toml"): 1,
 }

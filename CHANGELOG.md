@@ -154,6 +154,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The downstream build now carries upstream SecretSpec 0.21.1 and its
+  unreleased `main`, and is versioned `0.21.1-sudo.N`. `sudo-secretspec`
+  emits its JSON Schema through `Spec::schema_json` and edits the runtime
+  manifest through upstream's format-preserving `SpecBuilder`; the fork-only
+  `manifest-edit` and `codegen-schema` crate features are removed.
+
+- The `sqlite` provider stores values as exact bytes, so binary secrets round
+  trip. A database created by an earlier build keeps its text-typed value
+  column and is still written as text; a non-UTF-8 value is refused there
+  rather than failing with a storage-class error.
+
 - A vault written by an older version is now refused with an explanation
   instead of being upgraded in place. In-place upgrades have been removed: the
   only vault that needed one has been rebuilt, and silently rewriting a secret

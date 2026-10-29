@@ -4317,7 +4317,7 @@ dependencies = [
 
 [[package]]
 name = "libsecretspec"
-version = "0.21.1"
+version = "0.21.1-sudo.1"
 dependencies = [
  "secretspec",
  "serde_json",
@@ -6355,7 +6355,7 @@ dependencies = [
 
 [[package]]
 name = "secretspec"
-version = "0.21.1"
+version = "0.21.1-sudo.1"
 dependencies = [
  "age",
  "async-trait",
@@ -6437,7 +6437,7 @@ dependencies = [
 
 [[package]]
 name = "secretspec-derive"
-version = "0.21.1"
+version = "0.21.1-sudo.1"
 dependencies = [
  "http 1.4.0",
  "insta",
@@ -6453,7 +6453,7 @@ dependencies = [
 
 [[package]]
 name = "secretspec-ipc"
-version = "0.21.1"
+version = "0.21.1-sudo.1"
 dependencies = [
  "async-trait",
  "jsonschema",
@@ -6469,7 +6469,7 @@ dependencies = [
 
 [[package]]
 name = "secretspec-ipc-conformance"
-version = "0.21.1"
+version = "0.21.1-sudo.1"
 dependencies = [
  "async-trait",
  "cc",
@@ -6486,7 +6486,7 @@ dependencies = [
 
 [[package]]
 name = "secretspec-node-native"
-version = "0.21.1"
+version = "0.21.1-sudo.1"
 dependencies = [
  "napi",
  "napi-build",
@@ -6496,7 +6496,7 @@ dependencies = [
 
 [[package]]
 name = "secretspec-php-native"
-version = "0.21.1"
+version = "0.21.1-sudo.1"
 dependencies = [
  "ext-php-rs",
  "secretspec",
@@ -6504,7 +6504,7 @@ dependencies = [
 
 [[package]]
 name = "secretspec-py-native"
-version = "0.21.1"
+version = "0.21.1-sudo.1"
 dependencies = [
  "pyo3",
  "secretspec",
@@ -7048,7 +7048,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "sudo-secretspec-cli"
-version = "0.21.1"
+version = "0.21.1-sudo.1"
 dependencies = [
  "clap",
  "dotenv-ng",

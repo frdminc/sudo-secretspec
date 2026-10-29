@@ -13,7 +13,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.21.1"
+version = "0.21.1-sudo.1"
 edition = "2024"
 
 [workspace.dependencies]
@@ -68,9 +68,9 @@ azure_identity = "1.0.0"
 azure_security_keyvault_secrets = "1.0.0"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
-secretspec-derive = { version = "0.21.1", path = "./secretspec-derive" }
-secretspec = { version = "0.21.1", path = "./secretspec" }
-secretspec-core = { package = "secretspec", version = "0.21.1", path = "./secretspec" }
+secretspec-derive = { version = "0.21.1-sudo.1", path = "./secretspec-derive" }
+secretspec = { version = "0.21.1-sudo.1", path = "./secretspec" }
+secretspec-core = { package = "secretspec", version = "0.21.1-sudo.1", path = "./secretspec" }
 rand = "0.10"
 # rPGP 0.20's public generation API uses Rand 0.8's traits. Keep the older
 # version under an explicit alias until rPGP moves to the current Rand API.
@@ -96,7 +96,7 @@ async-trait = "0.1"
 futures-util = "0.3"
 tokio-util = { version = "0.7", features = ["rt"] }
 zeroize = { version = "1.8", features = ["derive"] }
-secretspec-ipc = { version = "0.21.1", path = "./secretspec-ipc" }
+secretspec-ipc = { version = "0.21.1-sudo.1", path = "./secretspec-ipc" }
 aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys"] }
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
 x509-parser = { version = "0.18", features = ["verify-aws"] }

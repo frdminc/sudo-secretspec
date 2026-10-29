@@ -41,7 +41,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
-UPSTREAM_VERSION = "0.19.1"
+UPSTREAM_VERSION = "0.21.1"
 UPSTREAM_TAG = f"v{UPSTREAM_VERSION}"
 FORK_REPO = "frdminc/sudo-secretspec"
 UPSTREAM_REPO = "cachix/secretspec"
@@ -63,10 +63,12 @@ VERSION_RE = re.compile(
     rf"^{re.escape(UPSTREAM_VERSION)}-{DOWNSTREAM_SUFFIX}\.([1-9][0-9]*)$"
 )
 # Any downstream version, anywhere in a file. Used to restamp the formula.
-# Both spellings, because a formula carried over from before the rename still
-# names the old one and has to be restamped rather than silently left behind.
+# Both spellings and any upstream base, because a formula carried over from
+# before the rename (djbclark) or from an older upstream (0.19.1-sudo.N before
+# the 0.21.1 merge) still names the old one and has to be restamped rather than
+# silently left behind.
 ANY_VERSION_RE = re.compile(
-    rf"{re.escape(UPSTREAM_VERSION)}-(?:{DOWNSTREAM_SUFFIX}|djbclark)\.[0-9]+"
+    rf"[0-9]+\.[0-9]+\.[0-9]+-(?:{DOWNSTREAM_SUFFIX}|djbclark)\.[0-9]+"
 )
 # Places the formula names its own version: the source `url`, the explicit
 # `version` stanza, and both `brew test` assertions. Pinned as a count so that

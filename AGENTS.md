@@ -27,12 +27,14 @@ This repository is a fork. In addition to upstream SecretSpec:
   feature branches, no PRs. If asked to work on "main" or "master", that means
   `sudo-main`.
 - `main` exists only as the upstream mirror. Do not develop on it, and do not
-  merge it into `sudo-main` without being asked: it carries post-0.19.1
-  upstream work intended for a future release.
-- Version scheme: `0.19.1-sudo.N`, where `N` is the downstream serial. Releases
-  through `v0.19.1-djbclark.3` used the older `-djbclark.N` form; the tags
-  remain, but new work uses `-sudo.N`. The `djbclark` in those tag names is the
-  old *version* serial, unrelated to the org move below — do not rewrite them.
+  merge it into `sudo-main` without being asked: it carries upstream work
+  intended for a future release.
+- Version scheme: `0.21.1-sudo.N`, where `N` is the downstream serial (since
+  the 2026-10-29 merge of upstream 0.21.1; before it, `0.19.1-sudo.1` through
+  `0.19.1-sudo.30`). Releases through `v0.19.1-djbclark.3` used the older
+  `-djbclark.N` form; the tags remain, but new work uses `-sudo.N`. The
+  `djbclark` in those tag names is the old *version* serial, unrelated to the
+  org move below — do not rewrite them.
 - The fork moved from the `djbclark` user to the `frdminc` org on 2026-08-15.
   GitHub redirects the old URLs, so stale references keep working and will not
   announce themselves; prefer `frdminc/...` everywhere. Note that `djbclark`
