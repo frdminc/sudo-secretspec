@@ -60,6 +60,13 @@ pub enum SecretSpecError {
     NoProviderConfigured,
     #[error("Provider backend '{0}' not found")]
     ProviderNotFound(String),
+    #[error(
+        "Provider backend '{provider}' is not available because the '{feature}' feature was not enabled when SecretSpec was built"
+    )]
+    ProviderFeatureDisabled {
+        provider: String,
+        feature: &'static str,
+    },
     /// Callers build the full sentence themselves (e.g. "Secret 'X' is not
     /// defined in profile 'Y'. Available secrets: ..."), so this must not add
     /// its own "Secret '...' not found" wrapper around it -- that wrapping
@@ -76,6 +83,10 @@ pub enum SecretSpecError {
     #[error("Prompted value for secret '{0}' cannot be empty")]
     PromptValueEmpty(String),
     #[error(
+        "Secret '{0}' would be produced and stored, and this session may not write to a provider"
+    )]
+    ProducedValueWriteRefused(String),
+    #[error(
         "Composed secret '{0}' is derived from other secrets and has no stored value to change"
     )]
     ComposedSecretReadOnly(String),
@@ -83,6 +94,14 @@ pub enum SecretSpecError {
         "Secret '{0}' uses `extract` and is read-only; update its containing document in the source provider instead"
     )]
     ExtractedSecretReadOnly(String),
+    #[error("Secret '{name}' is derived from '{from}' and is read-only; change '{from}' instead")]
+    DerivedSecretReadOnly { name: String, from: String },
+    #[error("Secret '{name}': credential `{role}` {reason}")]
+    CredentialInvalid {
+        name: String,
+        role: String,
+        reason: String,
+    },
     #[error("Failed to compose secret: {0}")]
     CompositionFailed(String),
     #[error("No secretspec.toml found in current or any parent directory")]
@@ -91,8 +110,31 @@ pub enum SecretSpecError {
     ExtendedConfigNotFound(String),
     #[error("Project name not found in secretspec.toml")]
     NoProjectName,
+    /// A provider diagnostic retaining its typed backend cause (0.22+).
+    #[error("{message}")]
+    ProviderBackend {
+        message: String,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+    /// Structured retry advice supplied by a provider (0.22+).
+    #[error("{source}")]
+    ProviderTransient {
+        #[source]
+        source: Box<SecretSpecError>,
+        retry_after: Option<std::time::Duration>,
+        exhausted: bool,
+    },
+    /// A shared initialization failure, retaining its classification (0.22+).
+    #[error("{0}")]
+    SharedProvider(#[source] std::sync::Arc<SecretSpecError>),
     #[error("Provider operation failed: {0}")]
     ProviderOperationFailed(String),
+    #[error("Provider protocol error: {kind}")]
+    ProviderProtocol {
+        kind: secretspec_ipc::ErrorKind,
+        interaction: Option<secretspec_ipc::InteractionReference>,
+    },
     #[error("User interaction error: {0}")]
     InquireError(#[from] inquire::InquireError),
     #[error("JSON error: {0}")]
@@ -114,6 +156,10 @@ pub enum SecretSpecError {
         encoding: &'static str,
         reason: String,
     },
+    /// A secret's bytes cannot be used where text is required, such as an
+    /// inline `String` value or a process environment (0.21+).
+    #[error("Secret '{name}' is not usable as text: {reason}")]
+    SecretNotText { name: String, reason: String },
     #[error(
         "Accessing secrets requires a reason. Provide one with --reason \"<why you are accessing \
          these secrets>\", the SECRETSPEC_REASON environment variable, or Secrets::with_reason() in \
@@ -131,6 +177,9 @@ impl SecretSpecError {
     /// secret names, provider URIs, or backend detail that must not reach the log.
     pub fn kind(&self) -> &'static str {
         match self {
+            Self::ProviderTransient { source, .. } => source.kind(),
+            Self::SharedProvider(source) => source.kind(),
+            Self::ProviderBackend { .. } => "provider_operation_failed",
             SecretSpecError::Io(_) => "io",
             SecretSpecError::Toml(_) => "toml",
             SecretSpecError::UnsupportedRevision(_) => "unsupported_revision",
@@ -140,17 +189,22 @@ impl SecretSpecError {
             SecretSpecError::Dotenv(_) | SecretSpecError::DotenvRender(_) => "dotenv",
             SecretSpecError::NoProviderConfigured => "no_provider_configured",
             SecretSpecError::ProviderNotFound(_) => "provider_not_found",
+            SecretSpecError::ProviderFeatureDisabled { .. } => "provider_feature_disabled",
             SecretSpecError::SecretNotFound(_) => "secret_not_found",
             SecretSpecError::RequiredSecretMissing(_) => "required_secret_missing",
             SecretSpecError::PromptUnavailable(_) => "prompt_unavailable",
             SecretSpecError::PromptValueEmpty(_) => "prompt_value_empty",
+            SecretSpecError::ProducedValueWriteRefused(_) => "produced_value_write_refused",
             SecretSpecError::ComposedSecretReadOnly(_) => "composed_secret_read_only",
             SecretSpecError::ExtractedSecretReadOnly(_) => "extracted_secret_read_only",
+            SecretSpecError::DerivedSecretReadOnly { .. } => "derived_secret_read_only",
+            SecretSpecError::CredentialInvalid { .. } => "credential_invalid",
             SecretSpecError::CompositionFailed(_) => "composition_failed",
             SecretSpecError::NoManifest => "no_manifest",
             SecretSpecError::ExtendedConfigNotFound(_) => "extended_config_not_found",
             SecretSpecError::NoProjectName => "no_project_name",
             SecretSpecError::ProviderOperationFailed(_) => "provider_operation_failed",
+            SecretSpecError::ProviderProtocol { kind, .. } => kind.as_str(),
             SecretSpecError::InquireError(_) => "inquire",
             SecretSpecError::Json(_) => "json",
             SecretSpecError::InvalidProfile(_) => "invalid_profile",
@@ -159,7 +213,29 @@ impl SecretSpecError {
             SecretSpecError::ValidationFailed(_) => "validation_failed",
             SecretSpecError::GenerationFailed(_) => "generation_failed",
             SecretSpecError::DecodeFailed { .. } => "decode_failed",
+            SecretSpecError::SecretNotText { .. } => "secret_not_text",
             SecretSpecError::ReasonRequired => "reason_required",
+        }
+    }
+
+    /// Protocol error kind, including through shared/retry failures (0.22+).
+    pub fn protocol_kind(&self) -> Option<secretspec_ipc::ErrorKind> {
+        match self {
+            Self::ProviderProtocol { kind, .. } => Some(*kind),
+            Self::ProviderTransient { source, .. } => source.protocol_kind(),
+            Self::SharedProvider(source) => source.protocol_kind(),
+            _ => None,
+        }
+    }
+
+    /// Opaque pending interaction associated with a provider failure, when
+    /// the provider supplied one (SecretSpec 0.21+).
+    pub fn interaction(&self) -> Option<&secretspec_ipc::InteractionReference> {
+        match self {
+            Self::ProviderProtocol { interaction, .. } => interaction.as_ref(),
+            Self::ProviderTransient { source, .. } => source.interaction(),
+            Self::SharedProvider(source) => source.interaction(),
+            _ => None,
         }
     }
 }
@@ -237,6 +313,13 @@ mod tests {
                 "provider_not_found",
             ),
             (
+                SecretSpecError::ProviderFeatureDisabled {
+                    provider: "vault".into(),
+                    feature: "vault",
+                },
+                "provider_feature_disabled",
+            ),
+            (
                 SecretSpecError::SecretNotFound("X".into()),
                 "secret_not_found",
             ),
@@ -261,6 +344,13 @@ mod tests {
                 "extracted_secret_read_only",
             ),
             (
+                SecretSpecError::DerivedSecretReadOnly {
+                    name: "X".into(),
+                    from: "Y".into(),
+                },
+                "derived_secret_read_only",
+            ),
+            (
                 SecretSpecError::CompositionFailed("too large".into()),
                 "composition_failed",
             ),
@@ -273,6 +363,13 @@ mod tests {
             (
                 SecretSpecError::ProviderOperationFailed("nope".into()),
                 "provider_operation_failed",
+            ),
+            (
+                SecretSpecError::ProviderProtocol {
+                    kind: secretspec_ipc::ErrorKind::InteractionRequired,
+                    interaction: None,
+                },
+                "interaction_required",
             ),
             (
                 SecretSpecError::InvalidProfile("ghost".into()),
@@ -293,6 +390,13 @@ mod tests {
                     reason: "invalid length".into(),
                 },
                 "decode_failed",
+            ),
+            (
+                SecretSpecError::SecretNotText {
+                    name: "VALUE".into(),
+                    reason: "it contains a NUL byte".into(),
+                },
+                "secret_not_text",
             ),
             (SecretSpecError::ReasonRequired, "reason_required"),
         ];

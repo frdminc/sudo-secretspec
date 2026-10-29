@@ -89,6 +89,7 @@ impl ProviderUrl {
         feature = "aac",
         feature = "infisical",
         feature = "openbao",
+        feature = "setec",
         feature = "vault",
         test
     ))]
@@ -115,6 +116,16 @@ impl ProviderUrl {
     /// explicitly empty one.
     pub(crate) fn has_query(&self) -> bool {
         self.0.query().is_some()
+    }
+
+    #[cfg(any(feature = "doppler", feature = "ejson", feature = "setec", test))]
+    pub(crate) fn has_fragment(&self) -> bool {
+        self.0.fragment().is_some()
+    }
+
+    #[cfg(any(feature = "doppler", feature = "ejson", test))]
+    pub(crate) fn has_port(&self) -> bool {
+        self.0.port().is_some()
     }
 
     /// Percent-encode a value for use in a URI path or host component (e.g., in

@@ -1,78 +1,35 @@
-import type {PluginOption} from "vite";
 import { readFileSync } from "node:fs";
 import { defineConfig } from "astro/config";
 import starlight from "@astrojs/starlight";
-import starlightLlmsTxt from "starlight-llms-txt";
+import starlightLlmActions from "starlight-llm-actions";
 import starlightBlog from "starlight-blog";
-import { terminalCopyPlugin } from "./src/lib/terminal-copy.mjs";
+import { siteKitAstro } from "@cachix/site-kit/astro";
+import { siteKitStarlight } from "@cachix/site-kit/starlight";
+import { siteBlogOptions } from "@cachix/site-kit/starlight/blog";
+import { siteLlmActionsOptions } from "@cachix/site-kit/starlight/llms";
+import { preserveHeadingIdPlugin } from "./src/lib/preserve-heading-id.mjs";
 
 const rustSdkBasicExample = readFileSync(
   new URL("../secretspec-derive/examples/basic.rs", import.meta.url),
   "utf8",
 ).trim();
 
-// Dev-only: `astro dev` (what `devenv up` runs) does not execute worker.js, so
-// /api/github would 404 and the release/star pills would stay hidden locally.
-// Mirror the worker's GitHub proxy here so both populate during development.
-// Production is unaffected — it is served by worker.js.
-const devGitHubApi: PluginOption = {
-  name: "dev-github-api",
-  apply: "serve",
-  enforce: "pre",
-  configureServer(server) {
-    server.middlewares.use("/api/github", async (_req, res) => {
-      let stars = null;
-      let release = null;
-      try {
-        const headers = { "User-Agent": "secretspec-docs" };
-        const [repoResponse, releaseResponse] = await Promise.all([
-          fetch("https://api.github.com/repos/cachix/secretspec", { headers }),
-          fetch("https://api.github.com/repos/cachix/secretspec/releases/latest", { headers }),
-        ]);
-        if (repoResponse.ok) {
-          const data = await repoResponse.json();
-          if (typeof data.stargazers_count === "number") stars = data.stargazers_count;
-        }
-        if (releaseResponse.ok) {
-          const data = await releaseResponse.json();
-          if (typeof data.tag_name === "string") release = data.tag_name;
-        }
-      } catch {
-        // Degrade to null values — the corresponding pills stay hidden.
-      }
-      res.setHeader("Content-Type", "application/json");
-      res.end(JSON.stringify({ stars, release }));
-    });
-  },
-};
-
-// https://astro.build/config
 export default defineConfig({
   site: "https://secretspec.dev/",
+  markdown: {
+    remarkPlugins: [preserveHeadingIdPlugin],
+  },
   redirects: {
     "/reference/adding-providers": "/development/adding-providers",
     "/ci": "/ci/github-actions",
   },
-  vite: {
-    plugins: [devGitHubApi],
-  },
   integrations: [
+    siteKitAstro({ github: { repository: "cachix/secretspec" } }),
     starlight({
-      expressiveCode: {
-        plugins: [terminalCopyPlugin()],
-      },
       plugins: [
-        starlightBlog({
-          title: "Blog",
-          authors: {
-            domen: {
-              name: "Domen Kožar",
-              url: "https://github.com/domenkozar",
-            },
-          },
-        }),
-        starlightLlmsTxt({
-          description: `SecretSpec is a declarative secrets manager for development workflows. It separates secret **declaration** from secret **storage**: commit a \`secretspec.toml\` that declares what secrets your application needs, while the actual values live in a secure provider (system keyring, 1Password, Vault, etc.).
+        siteKitStarlight(),
+        starlightBlog(siteBlogOptions()),
+        starlightLlmActions(siteLlmActionsOptions(`SecretSpec is a declarative secrets manager for development workflows. It separates secret **declaration** from secret **storage**: commit a \`secretspec.toml\` that declares what secrets your application needs, while the actual values live in a secure provider (system keyring, 1Password, Vault, etc.).
 
 SecretSpec answers three questions for every project:
 
@@ -127,8 +84,8 @@ $ secretspec import dotenv://.env.production
 
 ## Providers
 
-Values can be resolved from: keyring (default), KeePass KDBX (0.17+), dotenv files, plaintext file directories (0.19+), SQLite databases (0.20+), environment variables, systemd service credentials (0.17+), 1Password, Gopass (0.15+), LastPass, Dashlane (0.18+, read-only), Pass, Proton Pass, Passbolt (0.19+), Keeper Secrets Manager (0.18+), Google Cloud Secret Manager, AWS Secrets Manager, AWS Systems Manager Parameter Store (0.18+), Scaleway Secret Manager (0.17+), HashiCorp Vault, OpenBao (0.17+), Bitwarden Password Manager (0.18+), Bitwarden Secrets Manager, Azure Key Vault, Azure App Configuration (0.20+), Infisical (0.16+), age (0.17+), or SOPS (0.17+). Fly.io application secrets can be published through the write-only fly provider (0.20+). The null provider (0.19+) uses manifest defaults, ephemeral generation, or ephemeral run prompts without storage.`,
-        }),
+Values can be resolved from: keyring (default), KeePass KDBX (0.17+), dotenv files, plaintext file directories (0.19+), SQLite databases (0.22+), EJSON files (0.20+, read-only), environment variables, systemd service credentials (0.17+), 1Password, Gopass (0.15+), LastPass, Dashlane (0.18+, read-only), Pass, Proton Pass, Passbolt (0.19+), Keeper Secrets Manager (0.18+), Doppler (0.21+), Google Cloud Secret Manager, AWS Secrets Manager, AWS Systems Manager Parameter Store (0.18+), Scaleway Secret Manager (0.17+), Tailscale Setec (0.21+), HashiCorp Vault, OpenBao (0.17+), Bitwarden Password Manager (0.18+), Bitwarden Secrets Manager, Azure Key Vault, Azure App Configuration (0.20+), Infisical (0.16+), age (0.17+), SOPS (0.17+), or Kubernetes (0.20+). Fly.io application secrets and Cloudflare Secrets Store entries can be published through the write-only fly and cloudflare providers (0.20+). The null provider (0.19+) uses manifest defaults, ephemeral generation, or ephemeral run prompts without storage.`,
+        )),
       ],
       title: "SecretSpec",
       head: [
@@ -173,10 +130,6 @@ Values can be resolved from: keyring (default), KeePass KDBX (0.17+), dotenv fil
           },
         },
       ],
-      components: {
-        Hero: "./src/overrides/Hero.astro",
-        SocialIcons: "./src/overrides/SocialIcons.astro",
-      },
       logo: {
         light: "./src/assets/logo.svg",
         dark: "./src/assets/logo-dark.svg",
@@ -279,9 +232,14 @@ Values can be resolved from: keyring (default), KeePass KDBX (0.17+), dotenv fil
             {
               label: "SQLite",
               slug: "providers/sqlite",
-              badge: { text: "0.20+", variant: "note" },
+              badge: { text: "0.22+", variant: "note" },
             },
             { label: "Environment Variables", slug: "providers/env" },
+            {
+              label: "EJSON",
+              slug: "providers/ejson",
+              badge: { text: "0.20+", variant: "note" },
+            },
             {
               label: "Null",
               slug: "providers/null",
@@ -295,6 +253,11 @@ Values can be resolved from: keyring (default), KeePass KDBX (0.17+), dotenv fil
             {
               label: "Fly.io Secrets",
               slug: "providers/fly",
+              badge: { text: "0.20+", variant: "note" },
+            },
+            {
+              label: "Cloudflare Secrets Store",
+              slug: "providers/cloudflare",
               badge: { text: "0.20+", variant: "note" },
             },
             { label: "Pass", slug: "providers/pass" },
@@ -315,6 +278,11 @@ Values can be resolved from: keyring (default), KeePass KDBX (0.17+), dotenv fil
               label: "Keeper Secrets Manager",
               slug: "providers/keeper",
               badge: { text: "0.18+", variant: "note" },
+            },
+            {
+              label: "Doppler",
+              slug: "providers/doppler",
+              badge: { text: "0.21+", variant: "note" },
             },
             {
               label: "Gopass",
@@ -338,6 +306,11 @@ Values can be resolved from: keyring (default), KeePass KDBX (0.17+), dotenv fil
               label: "Scaleway Secret Manager",
               slug: "providers/scaleway",
               badge: { text: "0.17+", variant: "note" },
+            },
+            {
+              label: "Tailscale Setec",
+              slug: "providers/setec",
+              badge: { text: "0.21+", variant: "note" },
             },
             {
               label: "Vault",
@@ -381,6 +354,35 @@ Values can be resolved from: keyring (default), KeePass KDBX (0.17+), dotenv fil
               label: "SOPS",
               slug: "providers/sops",
               badge: { text: "0.17+", variant: "note" },
+            },
+            {
+              label: "Kubernetes",
+              slug: "providers/kubernetes",
+              badge: { text: "0.20+", variant: "note" },
+            },
+          ],
+        },
+        {
+          label: "Integrations",
+          items: [
+            {
+              label: "Git credentials",
+              slug: "integrations/git",
+              badge: { text: "0.20+", variant: "note" },
+            },
+            {
+              label: "Docker credentials",
+              slug: "integrations/docker",
+              badge: { text: "0.20+", variant: "note" },
+            },
+            {
+              label: "Claude Code",
+              slug: "integrations/claude-code",
+              badge: { text: "0.21+", variant: "note" },
+            },
+            {
+              label: "Adding an Integration",
+              slug: "integrations/adding",
             },
           ],
         },
@@ -432,6 +434,16 @@ Values can be resolved from: keyring (default), KeePass KDBX (0.17+), dotenv fil
               slug: "sdk/swift",
               badge: { text: "0.18+", variant: "note" },
             },
+            {
+              label: "JVM",
+              slug: "sdk/jvm",
+              badge: { text: "0.20+", variant: "note" },
+            },
+            {
+              label: "Elixir",
+              slug: "sdk/elixir",
+              badge: { text: "0.22+", variant: "note" },
+            },
           ],
         },
         {
@@ -451,6 +463,28 @@ Values can be resolved from: keyring (default), KeePass KDBX (0.17+), dotenv fil
               slug: "reference/provider-credentials",
               badge: { text: "0.15+", variant: "note" },
             },
+            {
+              label: "IPC protocols",
+              badge: { text: "0.21+", variant: "note" },
+              items: [
+                {
+                  label: "Architecture",
+                  slug: "reference/ipc-architecture",
+                },
+                {
+                  label: "Wire protocol",
+                  slug: "reference/ipc-wire",
+                },
+                {
+                  label: "Resolution protocol",
+                  slug: "reference/resolver-protocol",
+                },
+                {
+                  label: "Provider protocol",
+                  slug: "reference/provider-protocol",
+                },
+              ],
+            },
           ],
         },
         {
@@ -463,6 +497,11 @@ Values can be resolved from: keyring (default), KeePass KDBX (0.17+), dotenv fil
             {
               label: "Adding an SDK",
               slug: "development/sdks",
+            },
+            {
+              label: "Implementing IPC",
+              slug: "development/ipc-implementation",
+              badge: { text: "0.21+", variant: "note" },
             },
           ],
         },

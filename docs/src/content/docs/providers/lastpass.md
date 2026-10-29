@@ -3,7 +3,8 @@ title: LastPass Provider
 description: LastPass password manager integration
 ---
 
-The LastPass provider integrates with LastPass password manager for secure cloud-based secret storage.
+The [LastPass](https://www.lastpass.com/) provider integrates with LastPass
+password manager for secure cloud-based secret storage.
 
 ## At a glance
 
@@ -90,6 +91,10 @@ DATABASE_URL = { description = "Database URL", providers = ["team"] }
 ```
 
 ## Storage model
+
+> **Changed in version 0.21:** Values containing NUL bytes are rejected before
+> writing because the LastPass CLI would silently truncate them. Declare
+> `encoding = "base64"` to store these values without data loss.
 
 By default, each secret maps to an item named
 `secretspec/{project}/{profile}/{key}`. A custom `item_template` replaces that

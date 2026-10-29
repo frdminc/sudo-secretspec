@@ -5,14 +5,15 @@
 //! an implementation detail in `config`; callers construct the same model with
 //! [`SpecBuilder`], [`Profile`], and [`Secret`].
 
+use crate::compiled_spec::CompiledSpec;
 use crate::config::{
-    Config, GenerateConfig, GenerateOptions, NativeAddress, Profile as ConfigProfile,
-    ProfileDefaults, Project, ProviderAlias, RequireReason, Scope, Secret as ConfigSecret,
-    SecretEncoding, SecretExtract,
+    Config, CredentialBinding, GenerateConfig, GenerateOptions, NativeAddress,
+    Profile as ConfigProfile, ProfileDefaults, Project, ProjectDefaults, ProviderAlias,
+    RequireReason, Scope, Secret as ConfigSecret, SecretEncoding, SecretExtract,
 };
 use crate::error::{Result, SecretSpecError};
-use crate::manifest::CompiledSpec;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -25,18 +26,16 @@ use std::str::FromStr;
 /// Available starting with SecretSpec 0.20.
 #[derive(Debug, Clone)]
 pub struct Spec {
+    /// Effective configuration after applying inheritance.
     pub(crate) config: Config,
     pub(crate) compiled: CompiledSpec,
     pub(crate) base_dir: Option<PathBuf>,
-    /// The exact text this spec was parsed from, when there is one.
-    ///
-    /// The **root document only**, never the merged result of `extends`:
-    /// [`Config::try_from`] folds parents into the child, so retaining the
-    /// merged text and writing it back would silently inline every inherited
-    /// declaration into a file that had only referenced them.
-    ///
-    /// `None` for a [`SpecBuilder`]-built spec, which was never text.
+    /// Unmerged declarations from the root spec.
+    pub(crate) root_config: Option<Config>,
+    /// Exact root document text when builder edits can preserve it.
     pub(crate) source: Option<String>,
+    /// Root profile tables created by builder edits and removable on undo.
+    pub(crate) synthesized_profiles: HashSet<String>,
 }
 
 impl Spec {
@@ -62,7 +61,8 @@ impl Spec {
                     .to_string(),
             ));
         }
-        let mut spec = Self::from_config_document(config)?;
+        let mut spec = Self::from_config_document(config.clone())?;
+        spec.root_config = Some(config);
         spec.source = Some(source.to_string());
         Ok(spec)
     }
@@ -84,18 +84,35 @@ impl Spec {
             .map(|profile| profile.secrets.keys().map(String::as_str))
     }
 
+    /// Emit a JSON Schema for this specification's typed shape.
+    ///
+    /// `None` emits the union `SecretSpec`, which is safe for any profile.
+    /// `Some(profile)` emits that profile's effective fields, including fields
+    /// inherited from `default`.
+    ///
+    /// This reads declarations only and never resolves secret values or contacts
+    /// a provider.
+    ///
+    /// Available starting with SecretSpec 0.20.
+    pub fn schema_json(&self, profile: Option<&str>) -> Result<String> {
+        crate::codegen::schema::emit(&crate::codegen::build_ir(self), profile)
+            .map_err(SecretSpecError::InvalidProfile)
+    }
+
     /// Consume this validated specification and reopen its declarations for editing.
     ///
     /// [`SpecBuilder::build`] validates and compiles the edited declarations into a
     /// new `Spec`. The original `Spec` is consumed so its declarations and compiled
-    /// view can never drift apart. Use [`Self::to_builder`] to retain it.
+    /// view can never drift apart. Secret edits to a TOML-backed spec preserve its
+    /// comments and ordering. Use [`Self::to_builder`] to retain it.
     pub fn into_builder(self) -> SpecBuilder {
         self.into()
     }
 
     /// Copy this validated specification into a builder for editing.
     ///
-    /// The original `Spec` remains unchanged. Prefer [`Self::into_builder`] when it
+    /// The original `Spec` remains unchanged. Secret edits to a TOML-backed spec
+    /// preserve its comments and ordering. Prefer [`Self::into_builder`] when it
     /// is no longer needed.
     pub fn to_builder(&self) -> SpecBuilder {
         self.into()
@@ -112,7 +129,9 @@ impl Spec {
             config,
             compiled,
             base_dir: None,
+            root_config: None,
             source: None,
+            synthesized_profiles: HashSet::new(),
         })
     }
 
@@ -120,131 +139,25 @@ impl Spec {
         (self.config, self.compiled)
     }
 
-    /// This spec's exact backing text, when the byte-exactness guarantee holds.
+    /// The exact root TOML retained from parsing and format-preserving edits.
     ///
-    /// `Spec::from_toml(s)?.preserved_text() == Some(s)`, and for a spec loaded
-    /// from a path this is the root file's own bytes — not the merged result of
-    /// `extends`.
-    ///
-    /// `None` for a [`SpecBuilder`]-built spec, which never had a document.
-    /// That is why this and [`Self::to_toml`] are separate methods: a single
-    /// renderer whose exactness depended on hidden state would silently hand a
-    /// regenerated document to exactly the callers who needed the original.
+    /// This is `None` for specs built directly in Rust or after a builder
+    /// operation without format-preserving behavior.
     ///
     /// Available starting with SecretSpec 0.20.
     pub fn preserved_text(&self) -> Option<&str> {
         self.source.as_deref()
     }
 
-    /// Render these declarations as freshly formatted TOML.
+    /// Render the root specification as freshly formatted TOML. Inherited
+    /// declarations remain in their parent specs rather than being inlined.
     ///
-    /// Always available, and never byte-exact: key order, whitespace, and
-    /// comments come from the serializer, not from any original document. Use
-    /// [`Self::preserved_text`] when the original formatting matters.
+    /// Use [`Self::preserved_text`] when comments and original ordering matter.
     ///
     /// Available starting with SecretSpec 0.20.
     pub fn to_toml(&self) -> Result<String> {
-        toml::to_string_pretty(&self.config)
+        toml::to_string_pretty(self.root_config.as_ref().unwrap_or(&self.config))
             .map_err(|error| SecretSpecError::InvalidSpec(error.to_string()))
-    }
-
-    /// Whether `profile` declares `name` in this spec's own source text.
-    ///
-    /// Scoped to the retained document, so a declaration this spec only sees
-    /// through `extends` reads as absent — the question being answered is "is
-    /// this name editable here", which is what [`Self::remove_secret_from_text`]
-    /// can act on. [`Self::secrets`] answers the inherited-inclusive question.
-    ///
-    /// Parsed, not searched. A substring test would match the name inside a
-    /// comment or another secret's description, and would do so silently.
-    /// `false` for a spec with no source text, and for one whose text does not
-    /// parse — callers needing to distinguish those should check
-    /// [`Self::preserved_text`] first.
-    ///
-    /// Available starting with SecretSpec 0.20.
-    #[cfg(feature = "manifest-edit")]
-    pub fn declares_secret_in_text(&self, profile: &str, name: &str) -> bool {
-        self.source.as_deref().is_some_and(|source| {
-            crate::manifest_edit::declares_secret(source, profile, name).unwrap_or(false)
-        })
-    }
-
-    /// Add one declaration, returning a new fully revalidated `Spec` whose text
-    /// differs from this one's only by that declaration.
-    ///
-    /// Everything else in the document survives byte for byte: comments, key
-    /// order, quoting, and any syntax the semantic model does not represent.
-    ///
-    /// The new spec's `config` and `compiled` views are re-derived by reparsing
-    /// the edited text through the same validated path every other `Spec` goes
-    /// through, rather than being mutated in parallel with it. There is one
-    /// synchronization point instead of one per method, so the text and the
-    /// semantic view cannot disagree — and an edit that produces an invalid
-    /// spec fails here rather than at some later load.
-    ///
-    /// Errors when this spec has no source text (see [`Self::preserved_text`]),
-    /// when `profile` already declares `name`, or when the result would not
-    /// validate.
-    ///
-    /// Available starting with SecretSpec 0.20.
-    #[cfg(feature = "manifest-edit")]
-    pub fn add_secret_to_text(&self, profile: &str, name: &str, secret: Secret) -> Result<Self> {
-        let source = self.editable_source()?;
-        let edited = crate::manifest_edit::add_secret_value_to_manifest(
-            source,
-            profile,
-            name,
-            &secret.config,
-        )
-        .map_err(|error| SecretSpecError::InvalidSpec(error.to_string()))?;
-        self.reparse(edited)
-    }
-
-    /// Remove one declaration, returning a new fully revalidated `Spec`.
-    ///
-    /// The inverse of [`Self::add_secret_to_text`] and byte-exact in the same
-    /// way: adding a declaration and then removing it restores the original
-    /// document exactly, which is what makes an "undo" usable by callers that
-    /// compare manifests as bytes rather than semantically.
-    ///
-    /// Removing a name the profile does not declare *in this text* is an error
-    /// rather than a silent no-op — including a name it inherits through
-    /// `extends`, which is declared in the parent and cannot be edited here.
-    ///
-    /// Available starting with SecretSpec 0.20.
-    #[cfg(feature = "manifest-edit")]
-    pub fn remove_secret_from_text(&self, profile: &str, name: &str) -> Result<Self> {
-        let source = self.editable_source()?;
-        let edited = crate::manifest_edit::remove_secret_from_manifest(source, profile, name)
-            .map_err(|error| SecretSpecError::InvalidSpec(error.to_string()))?;
-        self.reparse(edited)
-    }
-
-    #[cfg(feature = "manifest-edit")]
-    fn editable_source(&self) -> Result<&str> {
-        self.source.as_deref().ok_or_else(|| {
-            SecretSpecError::InvalidSpec(
-                "this spec has no source text to edit; it was built with Spec::builder".to_string(),
-            )
-        })
-    }
-
-    /// Rebuild from edited text, preserving this spec's inheritance context.
-    ///
-    /// `Spec::from_toml` cannot serve here: it rejects a non-empty
-    /// `project.extends`, having no location to resolve the paths against. This
-    /// spec does have one — `base_dir`, recorded when it was loaded — so the
-    /// reparse resolves inheritance exactly as the original load did.
-    #[cfg(feature = "manifest-edit")]
-    fn reparse(&self, edited: String) -> Result<Self> {
-        let config = match self.base_dir.as_deref() {
-            Some(base_dir) => Config::from_text_in(&edited, base_dir)?,
-            None => Config::from_str(&edited)?,
-        };
-        let mut spec = Self::from_config_document(config)?;
-        spec.base_dir = self.base_dir.clone();
-        spec.source = Some(edited);
-        Ok(spec)
     }
 }
 
@@ -271,18 +184,24 @@ impl TryFrom<&Path> for Spec {
     ///
     /// Relative `extends` paths are resolved from the file that declares them.
     fn try_from(path: &Path) -> Result<Self> {
-        let mut spec = Self::from_config_document(Config::try_from(path)?)?;
+        // Keep the caller's lexical path (including symlink location) while
+        // making it independent from subsequent working-directory changes.
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()?.join(path)
+        };
+        let config = Config::try_from(path.as_path())?;
+        let source = std::fs::read_to_string(&path)?;
+        let root_config = Config::from_str(&source)?;
+        let mut spec = Self::from_config_document(config)?;
         spec.base_dir = Some(
             path.parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| PathBuf::from(".")),
+                .expect("an absolute spec path always has a parent")
+                .to_path_buf(),
         );
-        // Read the root file again rather than reusing the loader's merged
-        // result: `config` above is every ancestor folded together, and the
-        // text has to stay the one document a caller could write back.
-        // A file that parsed but cannot be re-read leaves `source` unset, which
-        // degrades editing to unavailable rather than failing the load.
-        spec.source = std::fs::read_to_string(path).ok();
+        spec.root_config = Some(root_config);
+        spec.source = Some(source);
         Ok(spec)
     }
 }
@@ -294,6 +213,9 @@ impl TryFrom<&Path> for Spec {
 pub struct SpecBuilder {
     config: Config,
     base_dir: Option<PathBuf>,
+    root_config: Option<Config>,
+    source: Option<String>,
+    synthesized_profiles: HashSet<String>,
     errors: Vec<String>,
 }
 
@@ -306,28 +228,49 @@ impl SpecBuilder {
                     ..Project::default()
                 },
                 profiles: HashMap::new(),
+                defaults: None,
                 providers: None,
                 scopes: None,
             },
             base_dir: None,
+            root_config: None,
+            source: None,
+            synthesized_profiles: HashSet::new(),
             errors: Vec::new(),
         }
     }
 
     /// Set the policy for requiring an access reason.
+    ///
+    /// This semantic edit clears any retained source document.
     pub fn require_reason(mut self, policy: RequireReason) -> Self {
-        self.config.project.require_reason = Some(policy);
+        self.source = None;
+        self.declarations_mut().project.require_reason = Some(policy);
+        self.refresh_effective_config();
         self
     }
 
     /// Add a secret to the `default` profile.
+    ///
+    /// When this builder came from parsed TOML, the declaration is added without
+    /// reformatting the rest of the document.
     pub fn secret(mut self, name: impl Into<String>, secret: Secret) -> Self {
+        let name = name.into();
+        if self.try_edit_source(|source| {
+            crate::spec_edit::add_secret(source, "default", &name, &secret.config)
+        }) {
+            return self;
+        }
+
+        let mut errors = Vec::new();
         let profile = self
-            .config
+            .declarations_mut()
             .profiles
             .entry("default".to_string())
             .or_default();
-        insert_secret(profile, name.into(), secret, &mut self.errors, "default");
+        insert_secret(profile, name, secret, &mut errors, "default");
+        self.errors.extend(errors);
+        self.refresh_effective_config();
         self
     }
 
@@ -336,7 +279,8 @@ impl SpecBuilder {
     /// This is the edit-oriented counterpart to [`Self::secret`], which creates
     /// the `default` profile when needed. A missing profile or an existing
     /// declaration is reported by [`Self::build`] rather than silently creating
-    /// or replacing it.
+    /// or replacing it. When editing parsed TOML, an inherited declaration can
+    /// be overridden locally without inlining its parent document.
     pub fn add_secret(
         mut self,
         profile: impl Into<String>,
@@ -345,12 +289,28 @@ impl SpecBuilder {
     ) -> Self {
         let profile = profile.into();
         let name = name.into();
-        let Some(declarations) = self.config.profiles.get_mut(&profile) else {
+        if !self.config.profiles.contains_key(&profile) {
             self.errors.push(format!(
                 "cannot add secret '{name}': profile '{profile}' does not exist"
             ));
             return self;
-        };
+        }
+        let synthesized_profile = !self.declarations().profiles.contains_key(&profile);
+        let error_count = self.errors.len();
+        if self.try_edit_source(|source| {
+            crate::spec_edit::add_secret(source, &profile, &name, &secret.config)
+        }) {
+            if synthesized_profile && self.errors.len() == error_count {
+                self.synthesized_profiles.insert(profile);
+            }
+            return self;
+        }
+
+        let declarations = self
+            .declarations_mut()
+            .profiles
+            .entry(profile.clone())
+            .or_default();
         if declarations.secrets.contains_key(&name) {
             self.errors.push(format!(
                 "cannot add secret '{name}': profile '{profile}' already contains that declaration"
@@ -358,13 +318,18 @@ impl SpecBuilder {
             return self;
         }
         declarations.secrets.insert(name, secret.config);
+        if synthesized_profile {
+            self.synthesized_profiles.insert(profile);
+        }
+        self.refresh_effective_config();
         self
     }
 
     /// Replace an existing declaration in one profile.
     ///
     /// The replacement is not applied when either the profile or declaration is
-    /// absent; [`Self::build`] reports the collected edit error.
+    /// absent; [`Self::build`] reports the collected edit error. In parsed TOML,
+    /// the declaration keeps its position and unrelated formatting is preserved.
     pub fn replace_secret(
         mut self,
         profile: impl Into<String>,
@@ -373,7 +338,13 @@ impl SpecBuilder {
     ) -> Self {
         let profile = profile.into();
         let name = name.into();
-        let Some(declarations) = self.config.profiles.get_mut(&profile) else {
+        if self.try_edit_source(|source| {
+            crate::spec_edit::replace_secret(source, &profile, &name, &secret.config)
+        }) {
+            return self;
+        }
+
+        let Some(declarations) = self.declarations_mut().profiles.get_mut(&profile) else {
             self.errors.push(format!(
                 "cannot replace secret '{name}': profile '{profile}' does not exist"
             ));
@@ -386,6 +357,7 @@ impl SpecBuilder {
             return self;
         };
         *existing = secret.config;
+        self.refresh_effective_config();
         self
     }
 
@@ -396,10 +368,25 @@ impl SpecBuilder {
     /// declaration inherited from `default`; removing a `default` declaration
     /// also removes it from profiles that only inherited it. References from
     /// scopes, compositions, or constraints are checked again by [`Self::build`].
+    /// In parsed TOML, unrelated comments and formatting are preserved.
     pub fn remove_secret(mut self, profile: impl Into<String>, name: impl Into<String>) -> Self {
         let profile = profile.into();
         let name = name.into();
-        let Some(declarations) = self.config.profiles.get_mut(&profile) else {
+        let remove_empty_profile = self.synthesized_profiles.contains(&profile);
+        let error_count = self.errors.len();
+        if self.try_edit_source(|source| {
+            crate::spec_edit::remove_secret(source, &profile, &name, remove_empty_profile)
+        }) {
+            if remove_empty_profile
+                && self.errors.len() == error_count
+                && !self.declarations().profiles.contains_key(&profile)
+            {
+                self.synthesized_profiles.remove(&profile);
+            }
+            return self;
+        }
+
+        let Some(declarations) = self.declarations_mut().profiles.get_mut(&profile) else {
             self.errors.push(format!(
                 "cannot remove secret '{name}': profile '{profile}' does not exist"
             ));
@@ -409,12 +396,19 @@ impl SpecBuilder {
             self.errors.push(format!(
                 "cannot remove secret '{name}': profile '{profile}' does not contain that declaration"
             ));
+        } else if remove_empty_profile && declarations.secrets.is_empty() {
+            self.declarations_mut().profiles.remove(&profile);
+            self.synthesized_profiles.remove(&profile);
         }
+        self.refresh_effective_config();
         self
     }
 
     /// Add a named profile.
+    ///
+    /// This semantic edit clears any retained source document.
     pub fn profile(mut self, name: impl Into<String>, profile: Profile) -> Self {
+        self.source = None;
         let name = name.into();
         self.errors.extend(
             profile
@@ -423,41 +417,73 @@ impl SpecBuilder {
                 .map(|error| format!("profile '{name}': {error}")),
         );
         if self
-            .config
+            .declarations_mut()
             .profiles
             .insert(name.clone(), profile.config)
             .is_some()
         {
             self.errors.push(format!("duplicate profile '{name}'"));
         }
+        self.refresh_effective_config();
         self
     }
 
     /// Define a project-local provider alias.
+    ///
+    /// This semantic edit clears any retained source document.
     pub fn provider(mut self, name: impl Into<String>, provider: impl Into<ProviderAlias>) -> Self {
+        self.source = None;
         let name = name.into();
-        let providers = self.config.providers.get_or_insert_with(HashMap::new);
+        let providers = self
+            .declarations_mut()
+            .providers
+            .get_or_insert_with(HashMap::new);
         if providers.insert(name.clone(), provider.into()).is_some() {
             self.errors
                 .push(format!("duplicate provider alias '{name}'"));
         }
+        self.refresh_effective_config();
+        self
+    }
+
+    /// Set the provider chain used across profiles when neither a profile nor
+    /// a secret selects one. Available starting with SecretSpec 0.21.
+    ///
+    /// This semantic edit clears any retained source document.
+    pub fn default_providers<I, S>(mut self, providers: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.source = None;
+        self.declarations_mut().defaults = Some(ProjectDefaults {
+            providers: providers.into_iter().map(Into::into).collect(),
+        });
+        self.refresh_effective_config();
         self
     }
 
     /// Define a named, membership-only subset of secrets.
+    ///
+    /// This semantic edit clears any retained source document.
     pub fn scope<I, S>(mut self, name: impl Into<String>, secrets: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
+        self.source = None;
         let name = name.into();
-        let scopes = self.config.scopes.get_or_insert_with(HashMap::new);
+        let scopes = self
+            .declarations_mut()
+            .scopes
+            .get_or_insert_with(HashMap::new);
         let scope = Scope {
             secrets: secrets.into_iter().map(Into::into).collect(),
         };
         if scopes.insert(name.clone(), scope).is_some() {
             self.errors.push(format!("duplicate scope '{name}'"));
         }
+        self.refresh_effective_config();
         self
     }
 
@@ -468,7 +494,71 @@ impl SpecBuilder {
         }
         let mut spec = Spec::from_config_document(self.config)?;
         spec.base_dir = self.base_dir;
+        spec.root_config = self.root_config;
+        spec.source = self.source;
+        spec.synthesized_profiles = self.synthesized_profiles;
         Ok(spec)
+    }
+
+    /// Apply an edit to retained TOML and refresh the merged semantic model.
+    /// `true` means a source-backed edit was attempted, including an error
+    /// deferred to [`Self::build`].
+    fn try_edit_source<F>(&mut self, edit: F) -> bool
+    where
+        F: FnOnce(&str) -> miette::Result<String>,
+    {
+        let Some(source) = self.source.as_deref() else {
+            return false;
+        };
+        let edited = match edit(source) {
+            Ok(edited) => edited,
+            Err(error) => {
+                self.errors.push(error.to_string());
+                return true;
+            }
+        };
+        let root_config = match Config::from_str(&edited) {
+            Ok(config) => config,
+            Err(error) => {
+                self.errors.push(error.to_string());
+                return true;
+            }
+        };
+        let config = match self.base_dir.as_deref() {
+            Some(base_dir) => Config::from_root_in(root_config.clone(), base_dir),
+            None => Ok(root_config.clone()),
+        };
+        match config {
+            Ok(config) => {
+                self.config = config;
+                self.root_config = Some(root_config);
+                self.source = Some(edited);
+            }
+            Err(error) => self.errors.push(error.to_string()),
+        }
+        true
+    }
+
+    fn declarations(&self) -> &Config {
+        self.root_config.as_ref().unwrap_or(&self.config)
+    }
+
+    fn declarations_mut(&mut self) -> &mut Config {
+        self.root_config.as_mut().unwrap_or(&mut self.config)
+    }
+
+    fn refresh_effective_config(&mut self) {
+        let Some(root_config) = self.root_config.clone() else {
+            return;
+        };
+        let config = match self.base_dir.as_deref() {
+            Some(base_dir) => Config::from_root_in(root_config, base_dir),
+            None => Ok(root_config),
+        };
+        match config {
+            Ok(config) => self.config = config,
+            Err(error) => self.errors.push(error.to_string()),
+        }
     }
 }
 
@@ -477,6 +567,9 @@ impl From<Spec> for SpecBuilder {
         Self {
             config: spec.config,
             base_dir: spec.base_dir,
+            root_config: spec.root_config,
+            source: spec.source,
+            synthesized_profiles: spec.synthesized_profiles,
             errors: Vec::new(),
         }
     }
@@ -487,6 +580,9 @@ impl From<&Spec> for SpecBuilder {
         Self {
             config: spec.config.clone(),
             base_dir: spec.base_dir.clone(),
+            root_config: spec.root_config.clone(),
+            source: spec.source.clone(),
+            synthesized_profiles: spec.synthesized_profiles.clone(),
             errors: Vec::new(),
         }
     }
@@ -698,9 +794,43 @@ impl Secret {
         self
     }
 
-    /// Extract a value from a structured provider result.
+    /// Extract a value from a structured provider result, or from the text of
+    /// the secret named by [`from`](Self::from).
     pub fn extract(mut self, extract: SecretExtract) -> Self {
         self.config.extract = Some(extract);
+        self
+    }
+
+    /// Set the semantic type. For the typed contracts (`x509_identity` and the
+    /// `pkcs12`, `pkcs8_private_key`, `x509_certificate`,
+    /// `x509_certificate_chain`, and `x509_issuer_chain` targets, 0.22+) the
+    /// type governs decoding, conversion, credentials, and delivery.
+    pub fn secret_type(mut self, secret_type: impl Into<String>) -> Self {
+        self.config.secret_type = Some(secret_type.into());
+        self
+    }
+
+    /// Choose the serialization of a typed value that offers more than one,
+    /// such as DER instead of the default PEM (0.22+).
+    pub fn format(mut self, format: crate::typed::Format) -> Self {
+        self.config.format = Some(format.as_str().to_string());
+        self
+    }
+
+    /// Derive this value from another declared secret: convert it with a
+    /// derivable type or select from it with `extract` (0.22+).
+    pub fn from(mut self, source: impl Into<String>) -> Self {
+        self.config.from = Some(source.into());
+        self
+    }
+
+    /// Bind a credential role of this typed value, such as the `password`
+    /// that opens or protects a PKCS#12 archive, to a declared secret (0.22+).
+    pub fn credential(mut self, role: impl Into<String>, secret: impl Into<String>) -> Self {
+        self.config
+            .credentials
+            .get_or_insert_with(BTreeMap::new)
+            .insert(role.into(), CredentialBinding::Secret(secret.into()));
         self
     }
 
@@ -744,6 +874,22 @@ pub enum Generation {
         /// Characters from which the password is drawn.
         charset: PasswordCharset,
     },
+    /// A human-readable passphrase composed from independently selected words (0.22+).
+    Passphrase {
+        /// Word count; `None` uses SecretSpec's seven-word default.
+        words: Option<usize>,
+        /// Text placed between words.
+        separator: String,
+    },
+    /// A checksum-protected recovery mnemonic (0.22+).
+    Mnemonic {
+        /// Mnemonic encoding algorithm.
+        algorithm: MnemonicAlgorithm,
+        /// Word count; `None` uses SecretSpec's 24-word default.
+        words: Option<usize>,
+        /// Word-list language.
+        language: MnemonicLanguage,
+    },
     /// Random bytes rendered as hexadecimal.
     Hex {
         /// Byte count; `None` uses SecretSpec's default.
@@ -756,12 +902,48 @@ pub enum Generation {
     },
     /// A random version-4 UUID.
     Uuid,
-    /// The trimmed stdout of a shell command.
+    /// The exact stdout bytes of a shell command (0.21+).
     Command(String),
     /// A PEM-encoded RSA private key.
     RsaPrivateKey {
         /// Key size in bits; `None` uses SecretSpec's default.
         bits: Option<usize>,
+    },
+    /// An ASCII-armored OpenPGP transferable secret key (0.21+).
+    OpenPgpPrivateKey {
+        /// User ID certified by the generated key.
+        user_id: String,
+        /// Cryptographic profile used for the primary key and subkeys.
+        algorithm: OpenPgpAlgorithm,
+        /// Capabilities placed on separate subkeys.
+        capabilities: Vec<OpenPgpCapability>,
+    },
+    /// An unencrypted OpenSSH private key (0.21+).
+    SshPrivateKey {
+        /// Cryptographic algorithm and optional RSA key size.
+        algorithm: SshKeyAlgorithm,
+        /// Optional comment embedded in the OpenSSH key.
+        comment: Option<String>,
+    },
+    /// A Base64-encoded WireGuard private key (0.22+).
+    WireguardPrivateKey,
+    /// A private signing key serialized as a JSON Web Key (0.22+).
+    JwkPrivateKey {
+        /// JOSE signing algorithm and optional RSA key size.
+        algorithm: JwkKeyAlgorithm,
+        /// Optional JWK `kid` metadata.
+        kid: Option<String>,
+    },
+    /// A native X25519 age identity (0.22+).
+    AgeIdentity,
+    /// A self-signed P-256 X.509 identity stored as PKCS#12 (0.22+).
+    X509Identity {
+        /// DNS and IP subject alternative names (`dns:name` or `ip:address`).
+        subject_alt_names: Vec<String>,
+        /// Extended key usages placed on the certificate.
+        usages: Vec<X509Usage>,
+        /// Validity in days; `None` uses SecretSpec's 30-day default.
+        valid_for_days: Option<u32>,
     },
 }
 
@@ -771,6 +953,23 @@ impl Generation {
         Self::Password {
             length: None,
             charset: PasswordCharset::Alphanumeric,
+        }
+    }
+
+    /// A seven-word passphrase separated with hyphens (0.22+).
+    pub fn passphrase() -> Self {
+        Self::Passphrase {
+            words: None,
+            separator: "-".to_string(),
+        }
+    }
+
+    /// A 24-word English BIP-39 mnemonic (0.22+).
+    pub fn mnemonic() -> Self {
+        Self::Mnemonic {
+            algorithm: MnemonicAlgorithm::Bip39,
+            words: None,
+            language: MnemonicLanguage::English,
         }
     }
 
@@ -789,7 +988,7 @@ impl Generation {
         Self::Uuid
     }
 
-    /// Generate from the trimmed stdout of `command`.
+    /// Generate from the exact stdout bytes of `command` (0.21+).
     pub fn command(command: impl Into<String>) -> Self {
         Self::Command(command.into())
     }
@@ -799,6 +998,50 @@ impl Generation {
         Self::RsaPrivateKey { bits: None }
     }
 
+    /// An OpenPGP private key with signing and encryption subkeys (0.21+).
+    pub fn openpgp_private_key(user_id: impl Into<String>) -> Self {
+        Self::OpenPgpPrivateKey {
+            user_id: user_id.into(),
+            algorithm: OpenPgpAlgorithm::Ed25519,
+            capabilities: vec![OpenPgpCapability::Sign, OpenPgpCapability::Encrypt],
+        }
+    }
+
+    /// An Ed25519 OpenSSH private key without an embedded comment (0.21+).
+    pub fn ssh_private_key() -> Self {
+        Self::SshPrivateKey {
+            algorithm: SshKeyAlgorithm::Ed25519,
+            comment: None,
+        }
+    }
+
+    /// A Base64-encoded WireGuard private key (0.22+).
+    pub fn wireguard_private_key() -> Self {
+        Self::WireguardPrivateKey
+    }
+
+    /// An Ed25519 private signing JWK (0.22+).
+    pub fn jwk_private_key() -> Self {
+        Self::JwkPrivateKey {
+            algorithm: JwkKeyAlgorithm::Ed25519,
+            kid: None,
+        }
+    }
+
+    /// A native X25519 age identity (0.22+).
+    pub fn age_identity() -> Self {
+        Self::AgeIdentity
+    }
+
+    /// A self-signed P-256 X.509 server identity with a 30-day validity (0.22+).
+    pub fn x509_identity(subject_alt_names: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self::X509Identity {
+            subject_alt_names: subject_alt_names.into_iter().map(Into::into).collect(),
+            usages: vec![X509Usage::ServerAuth],
+            valid_for_days: None,
+        }
+    }
+
     fn into_config(self) -> (&'static str, GenerateConfig) {
         match self {
             Self::Password { length, charset } => (
@@ -806,6 +1049,27 @@ impl Generation {
                 GenerateConfig::Options(GenerateOptions {
                     length,
                     charset: Some(charset.as_str().to_string()),
+                    ..GenerateOptions::default()
+                }),
+            ),
+            Self::Passphrase { words, separator } => (
+                "passphrase",
+                GenerateConfig::Options(GenerateOptions {
+                    words,
+                    separator: Some(separator),
+                    ..GenerateOptions::default()
+                }),
+            ),
+            Self::Mnemonic {
+                algorithm,
+                words,
+                language,
+            } => (
+                "mnemonic",
+                GenerateConfig::Options(GenerateOptions {
+                    algorithm: Some(algorithm.as_str().to_string()),
+                    words,
+                    language: Some(language.as_str().to_string()),
                     ..GenerateOptions::default()
                 }),
             ),
@@ -838,6 +1102,230 @@ impl Generation {
                     ..GenerateOptions::default()
                 }),
             ),
+            Self::OpenPgpPrivateKey {
+                user_id,
+                algorithm,
+                capabilities,
+            } => (
+                "openpgp_private_key",
+                GenerateConfig::Options(GenerateOptions {
+                    user_id: Some(user_id),
+                    algorithm: Some(algorithm.as_str().to_string()),
+                    bits: algorithm.bits(),
+                    capabilities: Some(
+                        capabilities
+                            .into_iter()
+                            .map(|capability| capability.as_str().to_string())
+                            .collect(),
+                    ),
+                    ..GenerateOptions::default()
+                }),
+            ),
+            Self::SshPrivateKey { algorithm, comment } => (
+                "ssh_private_key",
+                GenerateConfig::Options(GenerateOptions {
+                    algorithm: Some(algorithm.as_str().to_string()),
+                    bits: algorithm.bits(),
+                    comment,
+                    ..GenerateOptions::default()
+                }),
+            ),
+            Self::WireguardPrivateKey => ("wireguard_private_key", GenerateConfig::Bool(true)),
+            Self::JwkPrivateKey { algorithm, kid } => (
+                "jwk_private_key",
+                GenerateConfig::Options(GenerateOptions {
+                    algorithm: Some(algorithm.as_str().to_string()),
+                    bits: algorithm.bits(),
+                    kid,
+                    ..GenerateOptions::default()
+                }),
+            ),
+            Self::AgeIdentity => ("age_identity", GenerateConfig::Bool(true)),
+            Self::X509Identity {
+                subject_alt_names,
+                usages,
+                valid_for_days,
+            } => (
+                "x509_identity",
+                GenerateConfig::Options(GenerateOptions {
+                    issuer: Some("self_signed".to_string()),
+                    algorithm: Some("p256".to_string()),
+                    san: Some(subject_alt_names),
+                    usages: Some(
+                        usages
+                            .into_iter()
+                            .map(|usage| usage.as_str().to_string())
+                            .collect(),
+                    ),
+                    valid_for: valid_for_days.map(|days| format!("{days}d")),
+                    ..GenerateOptions::default()
+                }),
+            ),
+        }
+    }
+}
+
+/// Extended key usage for a generated X.509 identity.
+///
+/// Available starting with SecretSpec 0.22.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum X509Usage {
+    /// TLS server authentication.
+    ServerAuth,
+    /// TLS client authentication.
+    ClientAuth,
+}
+
+impl X509Usage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ServerAuth => "server_auth",
+            Self::ClientAuth => "client_auth",
+        }
+    }
+}
+
+/// The encoding algorithm for a generated recovery mnemonic.
+///
+/// Available starting with SecretSpec 0.22.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MnemonicAlgorithm {
+    /// BIP-39 entropy and checksum encoding.
+    Bip39,
+}
+
+impl MnemonicAlgorithm {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Bip39 => "bip39",
+        }
+    }
+}
+
+/// The word-list language for a generated recovery mnemonic.
+///
+/// Available starting with SecretSpec 0.22.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MnemonicLanguage {
+    /// The BIP-39 English word list.
+    English,
+}
+
+impl MnemonicLanguage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::English => "english",
+        }
+    }
+}
+
+/// The algorithm for a generated private JSON Web Key.
+///
+/// Available starting with SecretSpec 0.22.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum JwkKeyAlgorithm {
+    /// Ed25519 with the fully specified JOSE algorithm `Ed25519` (RFC 9864).
+    Ed25519,
+    /// NIST P-256 with JOSE algorithm `ES256`.
+    P256,
+    /// RSA with JOSE algorithm `RS256`. `None` uses the 3072-bit default.
+    Rsa { bits: Option<usize> },
+}
+
+impl JwkKeyAlgorithm {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ed25519 => "ed25519",
+            Self::P256 => "p256",
+            Self::Rsa { .. } => "rsa",
+        }
+    }
+
+    fn bits(self) -> Option<usize> {
+        match self {
+            Self::Rsa { bits } => bits,
+            Self::Ed25519 | Self::P256 => None,
+        }
+    }
+}
+
+/// The algorithm for a generated OpenSSH private key.
+///
+/// Available starting with SecretSpec 0.21.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SshKeyAlgorithm {
+    /// Ed25519, the default for new SSH keys.
+    Ed25519,
+    /// RSA for compatibility. `None` uses the 3072-bit default.
+    Rsa { bits: Option<usize> },
+}
+
+impl SshKeyAlgorithm {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ed25519 => "ed25519",
+            Self::Rsa { .. } => "rsa",
+        }
+    }
+
+    fn bits(self) -> Option<usize> {
+        match self {
+            Self::Ed25519 => None,
+            Self::Rsa { bits } => bits,
+        }
+    }
+}
+
+/// The cryptographic profile for a generated OpenPGP key.
+///
+/// Available starting with SecretSpec 0.21.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OpenPgpAlgorithm {
+    /// Ed25519 certification/signing keys and Curve25519 encryption subkeys.
+    Ed25519,
+    /// RSA primary key and subkeys. `None` uses the 3072-bit default.
+    Rsa { bits: Option<usize> },
+}
+
+impl OpenPgpAlgorithm {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ed25519 => "ed25519",
+            Self::Rsa { .. } => "rsa",
+        }
+    }
+
+    fn bits(self) -> Option<usize> {
+        match self {
+            Self::Ed25519 => None,
+            Self::Rsa { bits } => bits,
+        }
+    }
+}
+
+/// A capability assigned to a generated OpenPGP subkey.
+///
+/// Available starting with SecretSpec 0.21.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OpenPgpCapability {
+    /// Generate a signing subkey using the selected algorithm.
+    Sign,
+    /// Generate an encryption subkey using the selected algorithm.
+    Encrypt,
+}
+
+impl OpenPgpCapability {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Sign => "sign",
+            Self::Encrypt => "encrypt",
         }
     }
 }
@@ -870,6 +1358,7 @@ mod tests {
     #[test]
     fn rust_builder_and_toml_compile_to_the_same_shape() {
         let rust = Spec::builder("embedded")
+            .default_providers(["keyring"])
             .secret("TOKEN", Secret::required("API token").providers(["env"]))
             .secret("OPTIONAL", Secret::optional("Optional value"))
             .profile(
@@ -885,6 +1374,9 @@ mod tests {
                 [project]
                 name = "embedded"
                 revision = "1.0"
+
+                [defaults]
+                providers = ["keyring"]
 
                 [profiles.default]
                 TOKEN = { description = "API token", required = true, providers = ["env"] }
@@ -910,6 +1402,16 @@ mod tests {
                 toml.secrets(profile).unwrap().collect::<Vec<_>>()
             );
         }
+        assert_eq!(
+            rust.config
+                .defaults
+                .as_ref()
+                .map(|defaults| &defaults.providers),
+            toml.config
+                .defaults
+                .as_ref()
+                .map(|defaults| &defaults.providers)
+        );
     }
 
     #[test]
@@ -921,6 +1423,137 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("duplicate secret 'TOKEN'"));
+    }
+
+    #[test]
+    fn openpgp_generation_builder_uses_the_interoperable_default_profile() {
+        let (secret_type, config) =
+            Generation::openpgp_private_key("Release Bot <releases@example.com>").into_config();
+        assert_eq!(secret_type, "openpgp_private_key");
+        let GenerateConfig::Options(options) = config else {
+            panic!("OpenPGP generation must use options");
+        };
+        assert_eq!(
+            options.user_id.as_deref(),
+            Some("Release Bot <releases@example.com>")
+        );
+        assert_eq!(options.algorithm.as_deref(), Some("ed25519"));
+        assert_eq!(options.bits, None);
+        assert_eq!(
+            options.capabilities,
+            Some(vec!["sign".to_string(), "encrypt".to_string()])
+        );
+    }
+
+    #[test]
+    fn openpgp_generation_builder_maps_an_explicit_rsa_profile() {
+        let generation = Generation::OpenPgpPrivateKey {
+            user_id: "Legacy Bot <legacy@example.com>".to_string(),
+            algorithm: OpenPgpAlgorithm::Rsa { bits: Some(4096) },
+            capabilities: vec![OpenPgpCapability::Encrypt],
+        };
+        let (_, GenerateConfig::Options(options)) = generation.into_config() else {
+            panic!("OpenPGP generation must use options");
+        };
+        assert_eq!(options.algorithm.as_deref(), Some("rsa"));
+        assert_eq!(options.bits, Some(4096));
+        assert_eq!(options.capabilities, Some(vec!["encrypt".to_string()]));
+    }
+
+    #[test]
+    fn ssh_generation_builder_maps_default_and_rsa_profiles() {
+        let (secret_type, GenerateConfig::Options(default)) =
+            Generation::ssh_private_key().into_config()
+        else {
+            panic!("SSH generation must use options");
+        };
+        assert_eq!(secret_type, "ssh_private_key");
+        assert_eq!(default.algorithm.as_deref(), Some("ed25519"));
+        assert_eq!(default.bits, None);
+        assert_eq!(default.comment, None);
+
+        let generation = Generation::SshPrivateKey {
+            algorithm: SshKeyAlgorithm::Rsa { bits: Some(4096) },
+            comment: Some("deploy@example.com".to_string()),
+        };
+        let (_, GenerateConfig::Options(rsa)) = generation.into_config() else {
+            panic!("SSH generation must use options");
+        };
+        assert_eq!(rsa.algorithm.as_deref(), Some("rsa"));
+        assert_eq!(rsa.bits, Some(4096));
+        assert_eq!(rsa.comment.as_deref(), Some("deploy@example.com"));
+    }
+
+    #[test]
+    fn additional_credential_generation_builders_map_to_document_options() {
+        let (secret_type, GenerateConfig::Options(passphrase)) = Generation::Passphrase {
+            words: Some(8),
+            separator: " ".to_string(),
+        }
+        .into_config() else {
+            panic!("passphrase generation must use options");
+        };
+        assert_eq!(secret_type, "passphrase");
+        assert_eq!(passphrase.words, Some(8));
+        assert_eq!(passphrase.separator.as_deref(), Some(" "));
+
+        let (secret_type, GenerateConfig::Options(mnemonic)) = Generation::Mnemonic {
+            algorithm: MnemonicAlgorithm::Bip39,
+            words: Some(12),
+            language: MnemonicLanguage::English,
+        }
+        .into_config() else {
+            panic!("mnemonic generation must use options");
+        };
+        assert_eq!(secret_type, "mnemonic");
+        assert_eq!(mnemonic.algorithm.as_deref(), Some("bip39"));
+        assert_eq!(mnemonic.words, Some(12));
+        assert_eq!(mnemonic.language.as_deref(), Some("english"));
+
+        let (secret_type, GenerateConfig::Options(default_mnemonic)) =
+            Generation::mnemonic().into_config()
+        else {
+            panic!("mnemonic generation must use options");
+        };
+        assert_eq!(secret_type, "mnemonic");
+        assert_eq!(default_mnemonic.words, None);
+
+        let (secret_type, GenerateConfig::Options(jwk)) = Generation::JwkPrivateKey {
+            algorithm: JwkKeyAlgorithm::Rsa { bits: Some(4096) },
+            kid: Some("release-2026".to_string()),
+        }
+        .into_config() else {
+            panic!("JWK generation must use options");
+        };
+        assert_eq!(secret_type, "jwk_private_key");
+        assert_eq!(jwk.algorithm.as_deref(), Some("rsa"));
+        assert_eq!(jwk.bits, Some(4096));
+        assert_eq!(jwk.kid.as_deref(), Some("release-2026"));
+
+        assert!(matches!(
+            Generation::wireguard_private_key().into_config(),
+            ("wireguard_private_key", GenerateConfig::Bool(true))
+        ));
+        assert!(matches!(
+            Generation::age_identity().into_config(),
+            ("age_identity", GenerateConfig::Bool(true))
+        ));
+
+        let (secret_type, GenerateConfig::Options(x509)) =
+            Generation::x509_identity(["dns:localhost", "ip:127.0.0.1"]).into_config()
+        else {
+            panic!("X.509 generation must use options");
+        };
+        assert_eq!(secret_type, "x509_identity");
+        assert_eq!(x509.algorithm.as_deref(), Some("p256"));
+        assert_eq!(
+            x509.san,
+            Some(vec![
+                "dns:localhost".to_string(),
+                "ip:127.0.0.1".to_string()
+            ])
+        );
+        assert_eq!(x509.usages, Some(vec!["server_auth".to_string()]));
     }
 
     #[test]
@@ -1104,6 +1737,30 @@ mod tests {
     }
 
     #[test]
+    fn whitespace_descriptions_have_the_same_semantics_for_every_builder_origin() {
+        let parsed = Spec::from_toml(
+            r#"
+                [project]
+                name = "parsed"
+                revision = "1.0"
+
+                [profiles.default]
+                TOKEN = { description = "token" }
+            "#,
+        )
+        .unwrap()
+        .into_builder()
+        .add_secret("default", "SPACE", Secret::required(" "))
+        .build();
+        let rust_built = Spec::builder("rust")
+            .secret("SPACE", Secret::required(" "))
+            .build();
+
+        assert!(parsed.is_ok());
+        assert!(rust_built.is_ok());
+    }
+
+    #[test]
     fn profile_required_default_applies_to_secrets_that_inherit_it() {
         let declaration = Secret::new("Deployment token");
         assert_eq!(declaration.required_setting(), None);
@@ -1170,22 +1827,17 @@ mod tests {
         assert_eq!(options.charset.as_deref(), Some("ascii"));
     }
 
-    #[cfg(feature = "manifest-edit")]
-    mod text_edits {
+    mod format_preserving_edits {
         use super::*;
 
-        /// Deliberately awkward: a comment, non-alphabetical key order, a
-        /// blank line, and a full `[profiles.x.NAME]` table beside inline
-        /// ones. Every one of these is something a regenerating writer would
-        /// silently normalize away.
-        const MANIFEST: &str = r#"[project]
+        const SPEC_TEXT: &str = r#"[project]
 name = "demo"
 revision = "1.0"
 
-# Team convention: transport secrets first, then credentials.
+# Team convention: transport secrets first.
 [profiles.default]
 ZULU = { description = "sorts last on purpose" }
-ALPHA = { description = "sorts first on purpose" }
+ALPHA = { description = "sorts first on purpose" } # Keep this explanation.
 
 [profiles.default.NESTED]
 description = "declared as a full table"
@@ -1193,103 +1845,65 @@ required = false
 "#;
 
         #[test]
-        fn a_parsed_spec_preserves_the_exact_text_it_came_from() {
-            // The guarantee the whole surface rests on, stated as the issue
-            // states it: from_toml(s).preserved_text() == Some(s).
-            let spec = Spec::from_toml(MANIFEST).unwrap();
+        fn parsed_specs_retain_their_exact_root_text() {
+            let spec = Spec::from_toml(SPEC_TEXT).unwrap();
 
-            assert_eq!(spec.preserved_text(), Some(MANIFEST));
+            assert_eq!(spec.preserved_text(), Some(SPEC_TEXT));
         }
 
         #[test]
-        fn adding_then_removing_a_declaration_restores_the_original_bytes() {
-            // Byte-exact, not merely semantically equivalent. Callers that
-            // compare manifests as raw bytes -- a drift checker diffing a
-            // runtime manifest against a tracked template -- get a permanent
-            // false positive from anything weaker.
-            let spec = Spec::from_toml(MANIFEST).unwrap();
-
-            let added = spec
-                .add_secret_to_text("default", "SCRATCH", Secret::required("temporary"))
+        fn chained_add_and_remove_restore_the_original_bytes() {
+            let restored = Spec::from_toml(SPEC_TEXT)
+                .unwrap()
+                .to_builder()
+                .add_secret("default", "SCRATCH", Secret::required("temporary"))
+                .replace_secret("default", "SCRATCH", Secret::optional("replacement"))
+                .remove_secret("default", "SCRATCH")
+                .build()
                 .unwrap();
-            assert_ne!(added.preserved_text(), Some(MANIFEST));
 
-            let removed = added.remove_secret_from_text("default", "SCRATCH").unwrap();
-
-            assert_eq!(removed.preserved_text(), Some(MANIFEST));
+            assert_eq!(restored.preserved_text(), Some(SPEC_TEXT));
         }
 
         #[test]
-        fn an_edit_leaves_comments_ordering_and_table_shapes_alone() {
-            // The point of doing this with toml_edit rather than a round-trip
-            // through the semantic model, asserted directly rather than only
-            // via the round-trip: a regenerated document would lose the
-            // comment, sort ZULU after ALPHA, and inline the NESTED table.
-            let spec = Spec::from_toml(MANIFEST).unwrap();
-
-            let text = spec
-                .add_secret_to_text("default", "SCRATCH", Secret::required("temporary"))
+        fn edits_preserve_comments_ordering_and_unrelated_table_shapes() {
+            let original = Spec::from_toml(SPEC_TEXT).unwrap();
+            let edited = original
+                .to_builder()
+                .add_secret("default", "SCRATCH", Secret::required("temporary"))
+                .replace_secret("default", "ALPHA", Secret::optional("replacement"))
+                .build()
                 .unwrap();
-            let text = text.preserved_text().unwrap().to_string();
+            let text = edited.preserved_text().unwrap();
 
             assert!(text.contains("# Team convention:"), "{text}");
+            assert!(text.contains("# Keep this explanation."), "{text}");
             assert!(
                 text.find("ZULU").unwrap() < text.find("ALPHA").unwrap(),
-                "declaration order was not preserved: {text}"
+                "replacement moved the declaration: {text}"
             );
             assert!(text.contains("[profiles.default.NESTED]"), "{text}");
-        }
-
-        #[test]
-        fn an_edited_spec_is_revalidated_not_just_rewritten() {
-            // The synchronization point. The returned Spec's semantic view is
-            // re-derived from the edited text, so it must already see the new
-            // declaration -- a version that edited text and left `compiled`
-            // stale would pass a bytes-only assertion and fail this.
-            let spec = Spec::from_toml(MANIFEST).unwrap();
-
-            let added = spec
-                .add_secret_to_text("default", "SCRATCH", Secret::required("temporary"))
-                .unwrap();
-
-            let secrets: Vec<&str> = added.secrets("default").unwrap().collect();
-            assert!(secrets.contains(&"SCRATCH"), "{secrets:?}");
-            // ...and the spec it was derived from is untouched.
-            let original: Vec<&str> = spec.secrets("default").unwrap().collect();
-            assert!(!original.contains(&"SCRATCH"), "{original:?}");
-        }
-
-        #[test]
-        fn an_edit_that_would_not_validate_fails_at_the_edit() {
-            // Reparsing through the validated path is what makes this a
-            // failure here rather than a surprise at some later load.
-            let spec = Spec::from_toml(MANIFEST).unwrap();
-
-            let err = spec
-                .add_secret_to_text(
-                    "default",
-                    "COMPOSED",
-                    Secret::required("bad template").composed("${NO_SUCH_SECRET}"),
-                )
-                .unwrap_err();
-
+            assert!(text.contains("replacement"), "{text}");
             assert!(
-                err.to_string().contains("NO_SUCH_SECRET"),
-                "unexpected error: {err}"
+                edited
+                    .secrets("default")
+                    .unwrap()
+                    .any(|name| name == "SCRATCH")
+            );
+            assert!(
+                !original
+                    .secrets("default")
+                    .unwrap()
+                    .any(|name| name == "SCRATCH")
             );
         }
 
         #[test]
-        fn a_declaration_survives_every_field_it_was_given() {
-            // add_secret_to_text takes a whole `Secret`, not a description and
-            // a bool, so the richer fields have to reach the document -- and
-            // `ref`, which serializes as a nested table rather than a scalar,
-            // is exactly where a writer that only knows how to emit scalars
-            // into an inline table breaks.
-            let spec = Spec::from_toml(MANIFEST).unwrap();
-
-            let added = spec
-                .add_secret_to_text(
+        fn complete_secret_declarations_round_trip_through_the_editor() {
+            let added = Spec::from_toml(SPEC_TEXT)
+                .unwrap()
+                .to_builder()
+                .add_secret(
                     "default",
                     "RICH",
                     Secret::required("fully specified")
@@ -1301,107 +1915,72 @@ required = false
                             ..NativeAddress::default()
                         }),
                 )
+                .build()
                 .unwrap();
-
             let text = added.preserved_text().unwrap();
-            assert!(text.contains("RICH = {"), "{text}");
+
             assert!(text.contains(r#"providers = ["env", "keyring"]"#), "{text}");
             assert!(text.contains("as_path = true"), "{text}");
             assert!(text.contains(r#"item = "db""#), "{text}");
             assert!(text.contains(r#"field = "password""#), "{text}");
-
-            // And it round-trips: the parser accepts every key the writer
-            // emitted, which is the property that keeps them from drifting.
-            let removed = added.remove_secret_from_text("default", "RICH").unwrap();
-            assert_eq!(removed.preserved_text(), Some(MANIFEST));
         }
 
         #[test]
-        fn declaring_a_name_twice_is_an_error() {
-            let spec = Spec::from_toml(MANIFEST).unwrap();
+        fn invalid_source_edits_are_reported_by_build() {
+            let spec = Spec::from_toml(SPEC_TEXT).unwrap();
 
-            let err = spec
-                .add_secret_to_text("default", "ALPHA", Secret::required("duplicate"))
+            let duplicate = spec
+                .to_builder()
+                .add_secret("default", "ALPHA", Secret::required("duplicate"))
+                .build()
                 .unwrap_err();
+            assert!(duplicate.to_string().contains("already declared"));
 
-            assert!(err.to_string().contains("already declared"), "{err}");
-        }
-
-        #[test]
-        fn removing_a_name_that_is_not_declared_is_an_error() {
-            // Not a silent no-op: a caller undeclaring something already
-            // absent has a wrong model of the manifest.
-            let spec = Spec::from_toml(MANIFEST).unwrap();
-
-            let err = spec
-                .remove_secret_from_text("default", "ABSENT")
+            let absent = spec
+                .to_builder()
+                .remove_secret("default", "ABSENT")
+                .build()
                 .unwrap_err();
+            assert!(absent.to_string().contains("not declared"));
 
-            assert!(err.to_string().contains("not declared"), "{err}");
+            let invalid = spec
+                .to_builder()
+                .add_secret(
+                    "default",
+                    "COMPOSED",
+                    Secret::required("bad template").composed("${NO_SUCH_SECRET}"),
+                )
+                .build()
+                .unwrap_err();
+            assert!(invalid.to_string().contains("NO_SUCH_SECRET"));
         }
 
         #[test]
-        fn declares_secret_in_text_is_parsed_rather_than_searched() {
-            // Why this is not a substring test. Both of these carry the name
-            // as text while declaring nothing of the sort, and the inverse
-            // mistake would be silent.
-            let manifest = r#"[project]
-name = "demo"
-revision = "1.0"
+        fn semantic_only_builder_operations_clear_preserved_text() {
+            let edited = Spec::from_toml(SPEC_TEXT)
+                .unwrap()
+                .to_builder()
+                .require_reason(RequireReason::Always)
+                .build()
+                .unwrap();
 
-[profiles.default]
-# TODO: declare LOOKALIKE next release
-OTHER = { description = "unrelated, mentions LOOKALIKE in prose" }
-"#;
-            let spec = Spec::from_toml(manifest).unwrap();
-
-            assert!(spec.declares_secret_in_text("default", "OTHER"));
-            assert!(!spec.declares_secret_in_text("default", "LOOKALIKE"));
+            assert_eq!(edited.preserved_text(), None);
+            assert!(edited.to_toml().unwrap().contains("require_reason = true"));
         }
 
         #[test]
-        fn a_builder_built_spec_has_no_text_and_says_so_rather_than_inventing_one() {
-            // The reason preserved_text() returns Option and to_toml() does
-            // not: a single renderer whose exactness depended on hidden state
-            // would hand this caller a regenerated document and call it the
-            // original.
+        fn rust_built_specs_render_without_claiming_to_preserve_text() {
             let spec = Spec::builder("embedded")
                 .secret("TOKEN", Secret::required("API token"))
                 .build()
                 .unwrap();
 
             assert_eq!(spec.preserved_text(), None);
-
-            let err = spec
-                .add_secret_to_text("default", "SCRATCH", Secret::required("temporary"))
-                .unwrap_err();
-            assert!(err.to_string().contains("Spec::builder"), "{err}");
-
-            // to_toml still works -- it never promised exactness.
-            let rendered = spec.to_toml().unwrap();
-            assert!(rendered.contains("TOKEN"), "{rendered}");
-        }
-
-        #[test]
-        fn to_toml_renders_a_spec_that_never_had_a_document() {
-            // Round-trips through the parser, so "freshly formatted" still
-            // means "valid", not merely "printable".
-            let spec = Spec::builder("embedded")
-                .secret("TOKEN", Secret::required("API token"))
-                .build()
-                .unwrap();
-
-            let reparsed = Spec::from_toml(&spec.to_toml().unwrap()).unwrap();
-
-            assert_eq!(reparsed.project(), "embedded");
-            let secrets: Vec<&str> = reparsed.secrets("default").unwrap().collect();
-            assert_eq!(secrets, vec!["TOKEN"]);
+            assert!(spec.to_toml().unwrap().contains("TOKEN"));
         }
     }
 
-    /// The `extends` wrinkle, which needs real files on disk.
-    #[cfg(feature = "manifest-edit")]
-    mod text_edits_with_inheritance {
+    mod format_preserving_edits_with_inheritance {
         use super::*;
         use std::fs;
 
@@ -1434,80 +2013,228 @@ OWN = { description = "declared by the child" }
         }
 
         #[test]
-        fn the_retained_text_is_the_root_file_not_the_merged_result() {
-            // Config::try_from folds every parent into the child. Retaining
-            // that merged document as the child's text and writing it back
-            // would silently inline the parent's declarations into a file that
-            // had only referenced them -- turning inheritance into a copy.
-            let dir = project_with_parent();
-
-            let spec = Spec::try_from(dir.path().join("secretspec.toml").as_path()).unwrap();
-
-            let text = spec.preserved_text().unwrap();
-            assert!(text.contains("OWN"), "{text}");
-            assert!(
-                !text.contains("INHERITED"),
-                "the parent's declaration leaked into the child's text: {text}"
-            );
-            // ...while the semantic view still sees both.
-            let secrets: Vec<&str> = spec.secrets("default").unwrap().collect();
-            assert!(secrets.contains(&"INHERITED"), "{secrets:?}");
-        }
-
-        #[test]
-        fn editing_a_spec_that_extends_another_revalidates_against_the_parent() {
-            // The wrinkle. Spec::from_toml rejects a non-empty project.extends
-            // outright -- a string has nowhere to resolve the paths from -- so
-            // reparsing the edited text through it would fail on every
-            // inheriting project. The reparse is seeded with base_dir instead.
-            let dir = project_with_parent();
-            let spec = Spec::try_from(dir.path().join("secretspec.toml").as_path()).unwrap();
-
-            let added = spec
-                .add_secret_to_text("default", "SCRATCH", Secret::required("temporary"))
-                .unwrap();
-
-            // Inheritance survived the edit rather than being dropped...
-            let secrets: Vec<&str> = added.secrets("default").unwrap().collect();
-            assert!(secrets.contains(&"INHERITED"), "{secrets:?}");
-            assert!(secrets.contains(&"SCRATCH"), "{secrets:?}");
-            // ...and the edited text is still root-only.
-            assert!(!added.preserved_text().unwrap().contains("INHERITED"));
-
-            // Control: the same text has no chance through from_toml.
-            assert!(Spec::from_toml(added.preserved_text().unwrap()).is_err());
-        }
-
-        #[test]
-        fn an_inherited_declaration_is_not_editable_here() {
-            // declares_secret_in_text answers "can this be edited in this
-            // document", which is what remove_secret_from_text can act on --
-            // deliberately a different question from `secrets()`.
-            let dir = project_with_parent();
-            let spec = Spec::try_from(dir.path().join("secretspec.toml").as_path()).unwrap();
-
-            assert!(spec.declares_secret_in_text("default", "OWN"));
-            assert!(!spec.declares_secret_in_text("default", "INHERITED"));
-
-            let err = spec
-                .remove_secret_from_text("default", "INHERITED")
-                .unwrap_err();
-            assert!(err.to_string().contains("not declared"), "{err}");
-        }
-
-        #[test]
-        fn the_round_trip_still_holds_through_inheritance() {
+        fn edits_keep_the_root_document_separate_from_its_parents() {
             let dir = project_with_parent();
             let spec = Spec::try_from(dir.path().join("secretspec.toml").as_path()).unwrap();
             let original = spec.preserved_text().unwrap().to_string();
 
-            let restored = spec
-                .add_secret_to_text("default", "SCRATCH", Secret::required("temporary"))
-                .unwrap()
-                .remove_secret_from_text("default", "SCRATCH")
-                .unwrap();
+            assert!(!original.contains("INHERITED"));
+            assert!(
+                spec.secrets("default")
+                    .unwrap()
+                    .any(|name| name == "INHERITED")
+            );
 
+            let added = spec
+                .to_builder()
+                .add_secret("default", "SCRATCH", Secret::required("temporary"))
+                .build()
+                .unwrap();
+            assert!(!added.preserved_text().unwrap().contains("INHERITED"));
+            assert!(
+                added
+                    .secrets("default")
+                    .unwrap()
+                    .any(|name| name == "INHERITED")
+            );
+            assert!(
+                added
+                    .secrets("default")
+                    .unwrap()
+                    .any(|name| name == "SCRATCH")
+            );
+        }
+
+        #[test]
+        fn inherited_declarations_can_be_overridden_then_revealed_again() {
+            let dir = project_with_parent();
+            let spec = Spec::try_from(dir.path().join("secretspec.toml").as_path()).unwrap();
+            let original = spec.preserved_text().unwrap().to_string();
+
+            let overridden = spec
+                .to_builder()
+                .add_secret(
+                    "default",
+                    "INHERITED",
+                    Secret::required("declared by the child"),
+                )
+                .build()
+                .unwrap();
+            assert_eq!(
+                overridden.compiled.profiles["default"].secrets["INHERITED"]
+                    .config
+                    .description
+                    .as_deref(),
+                Some("declared by the child")
+            );
+
+            let restored = overridden
+                .into_builder()
+                .remove_secret("default", "INHERITED")
+                .build()
+                .unwrap();
             assert_eq!(restored.preserved_text(), Some(original.as_str()));
+            assert_eq!(
+                restored.compiled.profiles["default"].secrets["INHERITED"]
+                    .config
+                    .description
+                    .as_deref(),
+                Some("declared by the parent")
+            );
+        }
+
+        #[test]
+        fn inherited_declarations_cannot_be_removed_from_the_child() {
+            let dir = project_with_parent();
+            let spec = Spec::try_from(dir.path().join("secretspec.toml").as_path()).unwrap();
+
+            let error = spec
+                .to_builder()
+                .remove_secret("default", "INHERITED")
+                .build()
+                .unwrap_err();
+
+            assert!(error.to_string().contains("not declared"));
+        }
+
+        #[test]
+        fn semantic_edits_keep_root_declaration_provenance() {
+            let dir = project_with_parent();
+            let spec = Spec::try_from(dir.path().join("secretspec.toml").as_path()).unwrap();
+
+            let overridden = spec
+                .to_builder()
+                .require_reason(RequireReason::Always)
+                .add_secret(
+                    "default",
+                    "INHERITED",
+                    Secret::required("declared by the child"),
+                )
+                .build()
+                .unwrap();
+            let rendered = overridden.to_toml().unwrap();
+            assert!(rendered.contains("extends = [\"base.toml\"]"), "{rendered}");
+            assert_eq!(rendered.matches("INHERITED").count(), 1, "{rendered}");
+
+            let revealed = overridden
+                .into_builder()
+                .remove_secret("default", "INHERITED")
+                .build()
+                .unwrap();
+            assert_eq!(
+                revealed.compiled.profiles["default"].secrets["INHERITED"]
+                    .config
+                    .description
+                    .as_deref(),
+                Some("declared by the parent")
+            );
+
+            let error = spec
+                .into_builder()
+                .require_reason(RequireReason::Always)
+                .remove_secret("default", "INHERITED")
+                .build()
+                .unwrap_err();
+            assert!(error.to_string().contains("not contain that declaration"));
+        }
+
+        #[test]
+        fn relative_loads_keep_resolving_extends_after_cwd_changes() {
+            let _cwd = crate::secrets::lock_cwd();
+            let workspace = tempfile::tempdir().unwrap();
+            let project = workspace.path().join("project");
+            let elsewhere = workspace.path().join("elsewhere");
+            fs::create_dir_all(&project).unwrap();
+            fs::create_dir_all(&elsewhere).unwrap();
+            fs::write(
+                project.join("base.toml"),
+                r#"[project]
+name = "demo"
+revision = "1.0"
+
+[profiles.default]
+INHERITED = { description = "parent" }
+"#,
+            )
+            .unwrap();
+            fs::write(
+                project.join("secretspec.toml"),
+                r#"[project]
+name = "demo"
+revision = "1.0"
+extends = ["base.toml"]
+
+[profiles.default]
+OWN = { description = "child" }
+"#,
+            )
+            .unwrap();
+
+            let original_cwd = std::env::current_dir().unwrap();
+            std::env::set_current_dir(workspace.path()).unwrap();
+            let spec = Spec::try_from(Path::new("project/secretspec.toml")).unwrap();
+            std::env::set_current_dir(&elsewhere).unwrap();
+            let edited = spec
+                .into_builder()
+                .add_secret("default", "ADDED", Secret::required("added"))
+                .build();
+            std::env::set_current_dir(original_cwd).unwrap();
+
+            let edited = edited.unwrap();
+            assert!(
+                edited
+                    .secrets("default")
+                    .unwrap()
+                    .any(|name| name == "INHERITED")
+            );
+        }
+
+        #[test]
+        fn undoing_an_add_removes_only_synthesized_profile_tables() {
+            let dir = project_with_parent();
+            fs::write(
+                dir.path().join("base.toml"),
+                r#"[project]
+name = "demo"
+revision = "1.0"
+
+[profiles.default]
+INHERITED = { description = "declared by the parent" }
+
+[profiles.production]
+PRODUCTION = { description = "parent-only profile" }
+"#,
+            )
+            .unwrap();
+            let spec = Spec::try_from(dir.path().join("secretspec.toml").as_path()).unwrap();
+            let original = spec.preserved_text().unwrap().to_string();
+
+            let restored = spec
+                .into_builder()
+                .add_secret("production", "SCRATCH", Secret::required("temporary"))
+                .add_secret("production", "SECOND", Secret::required("temporary"))
+                .build()
+                .unwrap()
+                .into_builder()
+                .remove_secret("production", "SCRATCH")
+                .remove_secret("production", "SECOND")
+                .build()
+                .unwrap();
+            assert_eq!(restored.preserved_text(), Some(original.as_str()));
+
+            let spec_with_empty_profile = original + "\n[profiles.production]\n";
+            fs::write(dir.path().join("secretspec.toml"), &spec_with_empty_profile).unwrap();
+            let restored = Spec::try_from(dir.path().join("secretspec.toml").as_path())
+                .unwrap()
+                .into_builder()
+                .add_secret("production", "SCRATCH", Secret::required("temporary"))
+                .remove_secret("production", "SCRATCH")
+                .build()
+                .unwrap();
+            assert_eq!(
+                restored.preserved_text(),
+                Some(spec_with_empty_profile.as_str())
+            );
         }
     }
 }

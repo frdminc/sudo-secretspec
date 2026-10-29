@@ -33,8 +33,9 @@
 //! DATABASE_URL = { description = "Production database", required = true }
 //! ```
 
+use crate::compiled_spec::CompiledSpec;
 use crate::composition::Template;
-use crate::manifest::CompiledSpec;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, hash_map};
 use std::fs;
@@ -43,6 +44,9 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use tempfile::NamedTempFile;
+
+#[path = "config_schema.rs"]
+pub(crate) mod schema;
 
 /// Where one credential required by a provider comes from.
 ///
@@ -112,6 +116,16 @@ impl Serialize for CredentialSource {
     }
 }
 
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct CredentialSourceTable {
+    /// Provider alias, name, or URI supplying the credential.
+    provider: String,
+    /// Native coordinates of the credential; otherwise uses convention naming.
+    #[serde(default, rename = "ref")]
+    reference: Option<NativeAddress>,
+}
+
 impl<'de> Deserialize<'de> for CredentialSource {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct SourceVisitor;
@@ -131,14 +145,9 @@ impl<'de> Deserialize<'de> for CredentialSource {
                 self,
                 map: M,
             ) -> Result<CredentialSource, M::Error> {
-                #[derive(Deserialize)]
-                #[serde(deny_unknown_fields)]
-                struct Table {
-                    provider: String,
-                    #[serde(default, rename = "ref")]
-                    reference: Option<NativeAddress>,
-                }
-                let table = Table::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                let table = CredentialSourceTable::deserialize(
+                    serde::de::value::MapAccessDeserializer::new(map),
+                )?;
                 Ok(CredentialSource {
                     provider: table.provider,
                     reference: table.reference,
@@ -158,11 +167,14 @@ impl<'de> Deserialize<'de> for CredentialSource {
 /// [`ProviderCache::new`] is the only constructor, and the fields carrying the
 /// validated values are private, so a policy that exists always has a
 /// non-empty provider spec and a `max_age` that parsed.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[schemars(description = "Cache storage and freshness policy (0.17+).")]
 pub struct ProviderCache {
     /// Leaf provider spec used to persist the cache envelope.
+    #[schemars(regex(pattern = r"\S"))]
     provider: String,
     /// Human-readable freshness duration (`30m`, `8h`, `1d`, or combinations).
+    #[schemars(length(min = 1))]
     max_age: String,
     /// [`Self::max_age`] in seconds, parsed once at construction. Derived, so
     /// it is not part of the serialized form.
@@ -551,6 +563,27 @@ impl Serialize for ProviderAlias {
     }
 }
 
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ProviderAliasTable {
+    /// Provider URI, for example dotenv://.env.
+    #[serde(default)]
+    uri: Option<String>,
+    /// Provider credentials mapped to their secret sources.
+    #[serde(default)]
+    credentials: Option<HashMap<String, CredentialSource>>,
+    /// Native address template (0.19+); accepts {project}, {profile}, and {key}.
+    #[serde(default, rename = "ref")]
+    reference_template: Option<NativeAddressTemplate>,
+    /// Ordered leaf provider aliases for a cached fallback chain (0.17+).
+    #[serde(default)]
+    #[schemars(length(min = 1))]
+    fallback: Option<Vec<String>>,
+    /// Cache storage and freshness policy (0.17+).
+    #[serde(default)]
+    cache: Option<ProviderCache>,
+}
+
 impl<'de> Deserialize<'de> for ProviderAlias {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct AliasVisitor;
@@ -576,21 +609,9 @@ impl<'de> Deserialize<'de> for ProviderAlias {
                 // A dedicated struct gives precise field-level errors (unknown
                 // key, missing `uri`) rather than the opaque message an
                 // `#[serde(untagged)]` enum would produce on any typo.
-                #[derive(Deserialize)]
-                #[serde(deny_unknown_fields)]
-                struct Table {
-                    #[serde(default)]
-                    uri: Option<String>,
-                    #[serde(default)]
-                    credentials: Option<HashMap<String, CredentialSource>>,
-                    #[serde(default, rename = "ref")]
-                    reference_template: Option<NativeAddressTemplate>,
-                    #[serde(default)]
-                    fallback: Option<Vec<String>>,
-                    #[serde(default)]
-                    cache: Option<ProviderCache>,
-                }
-                let table = Table::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                let table = ProviderAliasTable::deserialize(
+                    serde::de::value::MapAccessDeserializer::new(map),
+                )?;
                 match (table.uri, table.fallback, table.cache) {
                     (Some(uri), None, cache) => {
                         if let Some(template) = &table.reference_template {
@@ -651,12 +672,16 @@ impl<'de> Deserialize<'de> for ProviderAlias {
 ///
 /// This is the top-level type that represents the entire `secretspec.toml` file.
 /// It contains project metadata and profile-specific secret definitions.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Config {
     /// Project metadata including name, revision, and optional inheritance
     pub project: Project,
     /// Map of profile names to their configurations (e.g., "default", "production", "staging")
+    #[schemars(extend("minProperties" = 1))]
     pub profiles: HashMap<String, Profile>,
+    /// Project-wide defaults applied to every provider-backed secret (0.21+).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub defaults: Option<ProjectDefaults>,
     /// Project-level provider aliases that map alias names to provider URIs.
     ///
     /// Take precedence over aliases in the user-global config
@@ -704,6 +729,10 @@ impl Config {
             return Err(ParseError::Validation(
                 "At least one profile must be defined".into(),
             ));
+        }
+
+        if let Some(defaults) = &self.defaults {
+            defaults.validate().map_err(ParseError::Validation)?;
         }
 
         // Raw syntax checks stay on the document model; effective semantic
@@ -842,6 +871,10 @@ impl Config {
             }
         }
 
+        if later.defaults.is_some() {
+            self.defaults = later.defaults;
+        }
+
         if let Some(later_providers) = later.providers {
             self.providers
                 .get_or_insert_with(HashMap::new)
@@ -888,12 +921,12 @@ fn validate_compiled_profile(
 
 fn validate_profile_constraints(
     profile_name: &str,
-    profile: &crate::manifest::CompiledProfile,
+    profile: &crate::compiled_spec::CompiledProfile,
 ) -> Result<(), ParseError> {
     fn validate_groups(
         profile_name: &str,
         kind: &str,
-        groups: &[crate::manifest::CompiledConstraintGroup],
+        groups: &[crate::compiled_spec::CompiledConstraintGroup],
     ) -> Result<(), ParseError> {
         for group in groups {
             if group.members.len() < 2 {
@@ -940,29 +973,81 @@ fn validate_profile_constraints(
 
 fn validate_composition_graph(
     profile_name: &str,
-    profile: &crate::manifest::CompiledProfile,
+    profile: &crate::compiled_spec::CompiledProfile,
 ) -> Result<(), ParseError> {
-    // Templates were parsed during manifest compilation; a malformed one was
-    // already rejected by `validate_semantics` before this runs.
-    let mut graph: BTreeMap<&str, &[String]> = BTreeMap::new();
+    // Templates, `from`, and credential shapes were validated per secret
+    // before this runs. They share one dependency graph so a cycle mixing
+    // composed, converted, and credential edges cannot evade any resolver pass.
+    let mut graph: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for (name, secret) in &profile.secrets {
-        let Some(template) = &secret.composition else {
-            continue;
+        let fail = |message: String| {
+            ParseError::Validation(format!(
+                "Profile '{profile_name}': Secret '{name}': {message}"
+            ))
         };
-        for dependency in template.dependencies() {
-            if !profile.secrets.contains_key(dependency) {
-                return Err(ParseError::Validation(format!(
-                    "Profile '{}': Secret '{}': composed reference `${{{}}}` does not name a declared secret",
-                    profile_name, name, dependency
+        let dependencies = secret.dependencies();
+        for dependency in &dependencies {
+            if *dependency == name.as_str() {
+                return Err(fail("cannot depend on itself".to_string()));
+            }
+            if !profile.secrets.contains_key(*dependency) {
+                return Err(fail(format!(
+                    "dependency '{dependency}' does not name a declared secret"
                 )));
             }
         }
-        graph.insert(name.as_str(), template.dependencies());
+
+        let config = &secret.config;
+        if let Some(source) = config.from.as_deref() {
+            let source_config = &profile.secrets[source].config;
+            if let Some(contract) = config.typed_contract() {
+                if !contract.accepts_source(source_config.secret_type.as_deref()) {
+                    let declared = source_config.secret_type.as_deref().map_or_else(
+                        || "no `type`".to_string(),
+                        |source_type| format!("type = \"{source_type}\""),
+                    );
+                    return Err(fail(format!(
+                        "`from` source '{source}' has {declared}, but type = \"{}\" derives from {}",
+                        contract.name,
+                        contract
+                            .sources
+                            .iter()
+                            .map(|source| format!("type = \"{source}\""))
+                            .collect::<Vec<_>>()
+                            .join(" or ")
+                    )));
+                }
+            } else if source_config.is_binary_value() {
+                return Err(fail(format!(
+                    "`extract` cannot select from '{source}' because its type = \"{}\" is binary",
+                    source_config.secret_type.as_deref().unwrap_or_default()
+                )));
+            }
+        }
+
+        for (role, credential) in config.credential_secrets() {
+            let credential_config = &profile.secrets[credential].config;
+            if credential_config.as_path == Some(true) {
+                return Err(fail(format!(
+                    "credential `{role}` names '{credential}', which is delivered as a path; credentials must be text values"
+                )));
+            }
+            if credential_config.is_binary_value() {
+                return Err(fail(format!(
+                    "credential `{role}` names '{credential}', whose type = \"{}\" is binary; credentials must be text values",
+                    credential_config.secret_type.as_deref().unwrap_or_default()
+                )));
+            }
+        }
+
+        if !dependencies.is_empty() {
+            graph.insert(name.as_str(), dependencies);
+        }
     }
 
     fn visit<'a>(
         name: &'a str,
-        graph: &BTreeMap<&'a str, &'a [String]>,
+        graph: &BTreeMap<&'a str, Vec<&'a str>>,
         state: &mut HashMap<&'a str, u8>,
         stack: &mut Vec<&'a str>,
     ) -> Result<(), Vec<String>> {
@@ -979,8 +1064,8 @@ fn validate_composition_graph(
         state.insert(name, 1);
         stack.push(name);
         if let Some(dependencies) = graph.get(name) {
-            for dependency in *dependencies {
-                if graph.contains_key(dependency.as_str()) {
+            for dependency in dependencies {
+                if graph.contains_key(dependency) {
                     visit(dependency, graph, state, stack)?;
                 }
             }
@@ -994,7 +1079,7 @@ fn validate_composition_graph(
     for name in graph.keys() {
         if let Err(cycle) = visit(name, &graph, &mut state, &mut Vec::new()) {
             return Err(ParseError::Validation(format!(
-                "Profile '{}': composed secret cycle: {}",
+                "Profile '{}': derived secret cycle: {}",
                 profile_name,
                 cycle.join(" -> ")
             )));
@@ -1031,39 +1116,13 @@ impl ConfigGraphLoader {
         Ok(merged)
     }
 
-    /// Load a root document supplied as *text*, resolving its `extends` against
-    /// `base_dir`.
-    ///
-    /// [`Self::load`] cannot serve this: it reads the root from disk, and the
-    /// caller here holds a document that exists only in memory — an edited
-    /// manifest being revalidated before anyone commits to writing it.
-    /// Ancestors are still read from disk, and are still deduplicated and
-    /// cycle-checked by canonical path exactly as they would be under `load`.
-    ///
-    /// The root is overlaid last, so it stays the most specific document, which
-    /// is the same precedence `load` produces by emitting it last in post-order.
-    fn load_text(source: &str, base_dir: &Path) -> Result<Config, ParseError> {
-        let root = Config::parse_document(source)?;
-        let mut loader = Self {
-            active: HashSet::new(),
-            emitted: HashSet::new(),
-            documents: Vec::new(),
-        };
-        loader.visit_extends_of(&root, base_dir)?;
-
-        let mut documents = loader.documents.into_iter();
-        let Some(mut merged) = documents.next() else {
-            return Ok(root);
-        };
-        for document in documents {
-            merged.overlay_with(document);
-        }
-        merged.overlay_with(root);
-        Ok(merged)
+    #[cfg(feature = "cli")]
+    fn load_inline(content: &str, base_dir: &Path) -> Result<Config, ParseError> {
+        let root = Config::parse_document(content)?;
+        Config::from_root_in(root, base_dir)
     }
 
-    /// Visit every document `config` extends, resolving each against `base_dir`.
-    fn visit_extends_of(&mut self, config: &Config, base_dir: &Path) -> Result<(), ParseError> {
+    fn visit_extends(&mut self, config: &Config, base_dir: &Path) -> Result<(), ParseError> {
         for extend_path in config.project.extends.iter().flatten() {
             let joined_path = base_dir.join(extend_path);
             let full_path = if extend_path.ends_with(".toml") {
@@ -1106,7 +1165,7 @@ impl ConfigGraphLoader {
         // relative to the symlink, not to the file it points at. Cycle detection
         // and dedup still key on `canonical_path`.
         let base_dir = path.parent().unwrap_or(Path::new("."));
-        self.visit_extends_of(&config, base_dir)?;
+        self.visit_extends(&config, base_dir)?;
 
         self.active.remove(&canonical_path);
         self.emitted.insert(canonical_path);
@@ -1127,6 +1186,13 @@ impl FromStr for Config {
     }
 }
 
+impl Config {
+    #[cfg(feature = "cli")]
+    pub(crate) fn from_inline(content: &str, base_dir: &Path) -> Result<Self, ParseError> {
+        ConfigGraphLoader::load_inline(content, base_dir)
+    }
+}
+
 impl TryFrom<&Path> for Config {
     type Error = ParseError;
 
@@ -1139,14 +1205,24 @@ impl TryFrom<&Path> for Config {
 }
 
 impl Config {
-    /// Parse and merge a root document held as text, resolving `extends`
-    /// against `base_dir`.
-    ///
-    /// The `extends`-aware counterpart to [`Config::from_str`], which has no
-    /// location to resolve inheritance against and so rejects it. Used to
-    /// revalidate an edited manifest that has not been written anywhere yet.
-    pub(crate) fn from_text_in(source: &str, base_dir: &Path) -> Result<Self, ParseError> {
-        ConfigGraphLoader::load_text(source, base_dir)
+    /// Merge an already parsed root document with its `extends` from `base_dir`.
+    pub(crate) fn from_root_in(root: Self, base_dir: &Path) -> Result<Self, ParseError> {
+        let mut loader = ConfigGraphLoader {
+            active: HashSet::new(),
+            emitted: HashSet::new(),
+            documents: Vec::new(),
+        };
+        loader.visit_extends(&root, base_dir)?;
+
+        let mut documents = loader.documents.into_iter();
+        let Some(mut merged) = documents.next() else {
+            return Ok(root);
+        };
+        for document in documents {
+            merged.overlay_with(document);
+        }
+        merged.overlay_with(root);
+        Ok(merged)
     }
 }
 
@@ -1218,11 +1294,13 @@ impl<'de> Deserialize<'de> for RequireReason {
 /// Contains essential project information and optional configuration inheritance.
 /// The `extends` field allows projects to inherit secrets from other configurations,
 /// enabling shared configuration patterns across multiple projects.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Project {
     /// The name of the project, used for identification and namespacing
+    #[schemars(length(min = 1))]
     pub name: String,
     /// Configuration format revision (currently must be "1.0")
+    #[schemars(extend("enum" = ["1.0"]))]
     pub revision: String,
     /// Optional list of relative paths to other SecretSpec projects to inherit from
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1263,7 +1341,7 @@ impl Default for Project {
 /// [audit]
 /// enabled = false
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct AuditConfig {
     /// Whether to record secret access. Defaults to `true`.
@@ -1374,7 +1452,7 @@ fn home_dir() -> Option<PathBuf> {
 ///
 /// A profile represents a specific environment or context (e.g., "default", "production", "staging").
 /// Each profile contains its own set of secret definitions with their requirements.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Profile {
     /// Default configuration for secrets in this profile
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1382,6 +1460,36 @@ pub struct Profile {
     /// Map of secret names to their configurations, flattened in TOML for cleaner syntax
     #[serde(flatten)]
     pub secrets: HashMap<String, Secret>,
+}
+
+/// Project-wide defaults for provider-backed secrets (0.21+).
+///
+/// This is deliberately narrower than [`ProfileDefaults`]: a project can
+/// select one provider chain without assigning the same fallback value or
+/// requiredness policy to every secret in every profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectDefaults {
+    /// Provider aliases, names, or URIs used when neither a secret nor its
+    /// profile declares a provider chain.
+    #[schemars(length(min = 1))]
+    pub providers: Vec<String>,
+}
+
+impl ProjectDefaults {
+    fn validate(&self) -> Result<(), String> {
+        if self.providers.is_empty() {
+            return Err("project defaults must name at least one provider".to_string());
+        }
+        if self
+            .providers
+            .iter()
+            .any(|provider| provider.trim().is_empty())
+        {
+            return Err("project default providers cannot be empty or whitespace".to_string());
+        }
+        Ok(())
+    }
 }
 
 /// A named, membership-only subset of a profile's secrets.
@@ -1392,7 +1500,7 @@ pub struct Profile {
 /// resolution. Selecting `--scope api` resolves exactly the intersection of the
 /// merged profile and this scope's `secrets` list, so a single service loads only
 /// what it declares instead of the entire profile.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Scope {
     /// The secret names that belong to this scope. Every name must be declared by
     /// at least one profile; an unknown name is a configuration error.
@@ -1403,7 +1511,7 @@ pub struct Scope {
 ///
 /// Provides defaults that apply to all secrets within the profile.
 /// Individual secrets can override any of these defaults.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ProfileDefaults {
     /// Whether this non-default profile inherits declarations and omitted
     /// fields from `[profiles.default]`. Omitted means `true`. Available since
@@ -1546,8 +1654,10 @@ impl IntoIterator for Profile {
 ///
 /// Can be either a simple boolean (`generate = true`) or a table with
 /// type-specific options (`generate = { length = 64 }`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
+// Keep the options variant unboxed to preserve the public Rust API.
+#[allow(clippy::large_enum_variant)]
 pub enum GenerateConfig {
     /// Simple boolean flag to enable/disable generation with defaults
     Bool(bool),
@@ -1566,7 +1676,7 @@ impl GenerateConfig {
 }
 
 /// Type-specific options for secret generation.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
 pub struct GenerateOptions {
     /// Length of generated password (for `password` type)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1576,14 +1686,68 @@ pub struct GenerateOptions {
     pub bytes: Option<usize>,
     /// Character set for password generation ("alphanumeric" or "ascii")
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("enum" = ["alphanumeric", "ascii"]))]
     pub charset: Option<String>,
     /// Shell command to run (for `command` type)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
-    /// Key size in bits (for `rsa` type, default 2048)
+    /// RSA key size in bits (`rsa_private_key` defaults to 2048; OpenPGP, SSH, and JWK RSA default to 3072).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bits: Option<usize>,
+    /// OpenPGP or SSH algorithm (0.21+), or JWK or mnemonic algorithm (0.22+).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("enum" = ["ed25519", "rsa", "p256", "bip39"]))]
+    pub algorithm: Option<String>,
+    /// OpenPGP User ID bound to a generated certificate (0.21+).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    /// OpenPGP subkey capabilities (`sign` and/or `encrypt`, 0.21+).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1), extend("items" = {"type": "string", "enum": ["sign", "encrypt"]}))]
+    pub capabilities: Option<Vec<String>>,
+    /// Comment embedded in a generated OpenSSH private key (0.21+).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    /// Number of words in a generated passphrase or mnemonic (defaults 7 or 24; 0.22+).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub words: Option<usize>,
+    /// Separator placed between generated passphrase words (default `-`; 0.22+).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub separator: Option<String>,
+    /// Word-list language for a generated mnemonic (currently `english`; 0.22+).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// Optional JSON Web Key identifier (`kid`; 0.22+).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kid: Option<String>,
+    /// X.509 issuer mode (currently `self_signed`; 0.22+).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+    /// X.509 subject alternative names, written as `dns:name` or `ip:address` (0.22+).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub san: Option<Vec<String>>,
+    /// X.509 extended key usages (`server_auth` and/or `client_auth`; 0.22+).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usages: Option<Vec<String>>,
+    /// X.509 certificate lifetime as whole days, for example `30d` (0.22+).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub valid_for: Option<String>,
 }
+
+pub(crate) const OPENPGP_RSA_DEFAULT_BITS: usize = 3072;
+pub(crate) const OPENPGP_RSA_MIN_BITS: usize = 2048;
+pub(crate) const OPENPGP_RSA_MAX_BITS: usize = 8192;
+pub(crate) const SSH_RSA_DEFAULT_BITS: usize = 3072;
+pub(crate) const SSH_RSA_MIN_BITS: usize = 2048;
+pub(crate) const SSH_RSA_MAX_BITS: usize = 8192;
+pub(crate) const JWK_RSA_DEFAULT_BITS: usize = 3072;
+pub(crate) const JWK_RSA_MIN_BITS: usize = 2048;
+pub(crate) const JWK_RSA_MAX_BITS: usize = 8192;
+pub(crate) const PASSPHRASE_DEFAULT_WORDS: usize = 7;
+pub(crate) const PASSPHRASE_MIN_WORDS: usize = 6;
+pub(crate) const PASSPHRASE_MAX_WORDS: usize = 32;
+pub(crate) const MNEMONIC_DEFAULT_WORDS: usize = 24;
+pub(crate) const MNEMONIC_WORD_COUNTS: &[usize] = &[12, 15, 18, 21, 24];
 
 /// Native coordinates of one externally managed secret: the value of a
 /// secret's `ref` field.
@@ -1614,16 +1778,20 @@ pub struct GenerateOptions {
 ///   from the provider URI instead.
 ///
 /// Unknown TOML keys are rejected at parse time.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, JsonSchema)]
+#[schemars(
+    description = "Provider-native coordinates for one secret. Routing follows the selected provider chain; supported coordinates depend on the provider."
+)]
 pub struct NativeAddress {
     /// The store's own name for the secret: item title (1Password, Proton
     /// Pass, LastPass), entry path (pass), KV path (Vault), secret name/ARN
     /// (AWS), secret id (GCSM), key name (BWS, dotenv), variable name (env),
     /// service (keyring).
+    #[schemars(length(min = 1))]
     pub item: String,
-    /// A component within the item: field label (1Password), KV field
-    /// (Vault), JSON key (AWS), account (keyring). Providers whose secrets
-    /// have no sub-components reject it.
+    /// A component within the item: field label (1Password), field name
+    /// (Proton Pass), KV field (Vault), JSON key (AWS), account (keyring).
+    /// Providers whose secrets have no sub-components reject it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub field: Option<String>,
     /// 1Password only: the vault holding the item, overriding the store's
@@ -1679,7 +1847,7 @@ impl NativeAddress {
 /// and `{key}`. The template belongs to one provider alias, so fallback links
 /// and import endpoints can map the same logical secret into different native
 /// address shapes without sharing provider-specific coordinates.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NativeAddressTemplate {
     /// Template for the provider's required `item` coordinate.
@@ -1894,6 +2062,13 @@ fn ref_string_hint(s: &str) -> String {
     )
 }
 
+#[derive(Deserialize, JsonSchema)]
+#[serde(untagged)]
+enum GroupNames {
+    One(String),
+    Many(Vec<String>),
+}
+
 /// Deserialize a group membership as either `"name"` or `["name", ...]`.
 fn deserialize_group_names<'de, D>(
     deserializer: D,
@@ -1901,16 +2076,9 @@ fn deserialize_group_names<'de, D>(
 where
     D: serde::Deserializer<'de>,
 {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum OneOrMany {
-        One(String),
-        Many(Vec<String>),
-    }
-
-    Ok(Some(match OneOrMany::deserialize(deserializer)? {
-        OneOrMany::One(name) => vec![name],
-        OneOrMany::Many(names) => names,
+    Ok(Some(match GroupNames::deserialize(deserializer)? {
+        GroupNames::One(name) => vec![name],
+        GroupNames::Many(names) => names,
     }))
 }
 
@@ -1968,67 +2136,102 @@ impl<'de> Deserialize<'de> for NativeAddress {
 
 /// The serialized form of `required`: either the existing boolean or a table
 /// of cross-secret presence groups.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
 enum RequiredSetting {
     Bool(bool),
     Groups(RequiredGroups),
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(extend("minProperties" = 1))]
 struct RequiredGroups {
+    /// At least one member of each named group must resolve (0.17+).
     #[serde(
         default,
         deserialize_with = "deserialize_group_names",
         serialize_with = "serialize_group_names",
         skip_serializing_if = "Option::is_none"
     )]
+    #[schemars(with = "Option<GroupNames>")]
     at_least_one: Option<Vec<String>>,
+    /// Exactly one member of each named group must resolve (0.17+).
     #[serde(
         default,
         deserialize_with = "deserialize_group_names",
         serialize_with = "serialize_group_names",
         skip_serializing_if = "Option::is_none"
     )]
+    #[schemars(with = "Option<GroupNames>")]
     exactly_one: Option<Vec<String>>,
 }
 
 /// Serde proxy that keeps the established Rust `Secret` API while presenting
 /// requiredness as one boolean-or-table field in TOML.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, JsonSchema)]
+#[schemars(extend("not" = {"required": ["ref", "refs"]}))]
 struct SecretSerde {
+    /// Human-readable explanation of this secret.
     description: Option<String>,
+    /// Whether this secret is required, or named presence groups (0.17+).
     #[serde(skip_serializing_if = "Option::is_none")]
     required: Option<RequiredSetting>,
+    /// Fallback value when no provider supplies the secret.
     #[serde(skip_serializing_if = "Option::is_none")]
     default: Option<String>,
+    /// Template using ${SECRET_NAME} references; $$ escapes a dollar sign (0.16+).
     #[serde(skip_serializing_if = "Option::is_none")]
     composed: Option<String>,
+    /// Provider aliases, names, or URIs to try in order.
     #[serde(skip_serializing_if = "Option::is_none")]
     providers: Option<Vec<String>>,
+    /// Native coordinates for the secret, replacing convention naming.
     #[serde(rename = "ref", skip_serializing_if = "Option::is_none")]
     reference: Option<NativeAddress>,
+    /// Native coordinates per provider alias (0.19+); mutually exclusive with ref.
     #[serde(skip_serializing_if = "Option::is_none")]
     refs: Option<HashMap<String, NativeAddress>>,
+    /// Write the resolved value to a temporary file and expose its path.
     #[serde(skip_serializing_if = "Option::is_none")]
     as_path: Option<bool>,
+    /// Encoding of the stored value (0.19+).
     #[serde(skip_serializing_if = "Option::is_none")]
     encoding: Option<SecretEncoding>,
+    /// Select a logical value from structured provider data (0.19+).
     #[serde(skip_serializing_if = "Option::is_none")]
     extract: Option<SecretExtract>,
+    /// Secret type for validation and generation. OpenPGP and SSH private keys require 0.21+.
+    /// Passphrases, mnemonics, WireGuard, JWK, age, and X.509 types require 0.22+.
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("enum" = ["password", "passphrase", "mnemonic", "hex", "base64", "uuid", "command", "rsa_private_key", "openpgp_private_key", "ssh_private_key", "wireguard_private_key", "jwk_private_key", "age_identity", "x509_identity", "pkcs12", "pkcs8_private_key", "x509_certificate", "x509_certificate_chain", "x509_issuer_chain"]))]
     secret_type: Option<String>,
+    /// Typed output serialization, such as pem or der (0.22+).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    format: Option<String>,
+    /// Declared source secret for a conversion or extraction (0.22+).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    from: Option<String>,
+    /// Declared secrets bound to typed credential roles (0.22+).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    credentials: Option<BTreeMap<String, CredentialBinding>>,
+    /// Generate a missing secret with defaults or type-specific options.
     #[serde(skip_serializing_if = "Option::is_none")]
     generate: Option<GenerateConfig>,
+    /// Whether an interactive caller may prompt for a missing secret.
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt: Option<bool>,
+    // Keep permissive parsing for manifests from newer versions, but make
+    // ignored fields visible without retaining or printing their values.
+    #[serde(flatten, skip_serializing)]
+    #[schemars(skip)]
+    unknown_fields: BTreeMap<String, serde::de::IgnoredAny>,
 }
 
 /// Text encoding used for a secret's stored representation.
 ///
 /// Available since SecretSpec 0.19.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum SecretEncoding {
     /// RFC 4648 Base64. Writes use padding; reads accept padded or unpadded input.
@@ -2054,11 +2257,16 @@ impl SecretEncoding {
 /// A structured-data format from which one logical secret can be extracted.
 ///
 /// Available since SecretSpec 0.19.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ExtractFormat {
     /// A JSON document selected with an RFC 6901 JSON Pointer.
     Json,
+    /// An INI document selected with an RFC 6901-escaped `/key` or
+    /// `/section/key` pointer.
+    ///
+    /// Available since SecretSpec 0.20.
+    Ini,
 }
 
 impl ExtractFormat {
@@ -2066,23 +2274,28 @@ impl ExtractFormat {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Json => "json",
+            Self::Ini => "ini",
         }
     }
 }
 
-/// Selects one logical secret from a structured stored value.
+/// Selects one logical secret from a structured text document.
 ///
-/// Extraction is applied after [`SecretEncoding`] is decoded and only to
-/// values read from providers or caches. Defaults and composed values are
-/// already logical and are not extracted.
+/// On a provider-backed secret, extraction is applied after [`SecretEncoding`]
+/// is decoded and only to values read from providers or caches. On a secret
+/// with [`from`](Secret::from) (0.22+), the named declared secret is resolved
+/// first and its logical text becomes the extraction input.
 ///
 /// Available since SecretSpec 0.19.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SecretExtract {
-    /// The structured-data format of the stored value.
+    /// The structured-data format of the document.
     pub format: ExtractFormat,
-    /// RFC 6901 JSON Pointer selecting the logical value.
+    /// Slash-delimited pointer selecting the logical value. JSON accepts a
+    /// complete RFC 6901 JSON Pointer; INI accepts `/key` or `/section/key`
+    /// with RFC 6901 escaping for each segment.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub pointer: String,
 }
 
@@ -2090,14 +2303,83 @@ impl SecretExtract {
     fn validate(&self) -> Result<(), String> {
         match self.format {
             ExtractFormat::Json => validate_json_pointer(&self.pointer),
+            ExtractFormat::Ini => crate::ini_field::validate_pointer(&self.pointer),
         }
+    }
+}
+
+/// How a typed secret obtains one credential it needs (SecretSpec 0.22+).
+///
+/// Written in a secret's `credentials` table keyed by the role its type
+/// defines, with the bare name of another declared secret as the value:
+///
+/// ```toml
+/// TLS_PFX = { type = "pkcs12", from = "TLS_IDENTITY", credentials = { password = "TLS_PFX_PASSWORD" } }
+/// ```
+///
+/// The named secret is an ordinary declaration: it resolves through its own
+/// providers, default, prompt, or generator, joins the dependency graph, and is
+/// stored with `secretspec set` like any other value. Table values are rejected
+/// and reserved for a future provider-pinned source, so adding one later is
+/// additive.
+#[derive(Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[schemars(with = "String")]
+#[non_exhaustive]
+pub enum CredentialBinding {
+    /// A declared secret in the same profile.
+    Secret(String),
+}
+
+impl CredentialBinding {
+    /// The declared secret this binding resolves through.
+    pub fn secret_name(&self) -> &str {
+        match self {
+            Self::Secret(name) => name,
+        }
+    }
+}
+
+impl Serialize for CredentialBinding {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Secret(name) => serializer.serialize_str(name),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for CredentialBinding {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = CredentialBinding;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("the name of a declared secret")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, name: &str) -> Result<CredentialBinding, E> {
+                Ok(CredentialBinding::Secret(name.to_string()))
+            }
+
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                _map: M,
+            ) -> Result<CredentialBinding, M::Error> {
+                Err(serde::de::Error::custom(
+                    "credential bindings name a declared secret, for example `password = \"PFX_PASSWORD\"`; the `{ provider, ref }` table form is reserved",
+                ))
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
     }
 }
 
 /// Validate the JSON Pointer grammar independently of any particular document.
 /// An empty pointer selects the whole document; every non-empty pointer starts
 /// with `/`, and `~` escapes only `~0` and `~1`.
-fn validate_json_pointer(pointer: &str) -> Result<(), String> {
+pub(crate) fn validate_json_pointer(pointer: &str) -> Result<(), String> {
     if pointer.is_empty() {
         return Ok(());
     }
@@ -2126,7 +2408,7 @@ fn validate_json_pointer(pointer: &str) -> Result<(), String> {
 /// Defines the properties of a secret including its documentation,
 /// whether it's required, an optional default value, and optionally
 /// which providers to use for retrieving this secret (in fallback order).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(try_from = "SecretSerde", into = "SecretSerde")]
 pub struct Secret {
     /// Human-readable description of what this secret is used for
@@ -2153,8 +2435,10 @@ pub struct Secret {
     pub composed: Option<String>,
     /// Optional list of provider aliases for retrieving this secret.
     /// Providers are tried in order until one has the secret.
-    /// If not specified, uses the profile defaults.providers or global provider.
-    /// Each alias is resolved against the providers map in GlobalConfig.
+    /// If not specified, uses the profile defaults, project defaults in 0.21+,
+    /// or the user-global provider.
+    /// Aliases resolve against the project's provider map first, then the
+    /// user-global provider map.
     /// Example: providers = ["keyring", "env"] will try keyring first, then env.
     pub providers: Option<Vec<String>>,
     /// Native coordinates naming one externally managed secret (see
@@ -2186,15 +2470,47 @@ pub struct Secret {
     ///
     /// Available since SecretSpec 0.19.
     pub encoding: Option<SecretEncoding>,
-    /// Structured stored-value extraction applied after optional decoding.
-    /// JSON extraction uses an RFC 6901 pointer. Extracted secrets are
-    /// read-only because a selected value cannot reconstruct its containing
-    /// document for a storage write.
+    /// Structured extraction applied after optional decoding, or to the
+    /// logical text of the declared secret named by [`from`](Self::from)
+    /// (0.22+). JSON extraction uses an RFC 6901 pointer. INI extraction
+    /// (0.20+) uses `/key` for an unsectioned key or `/section/key` for a named
+    /// section, with RFC 6901 segment escaping. Extracted secrets are read-only
+    /// because a selected value cannot reconstruct its containing document for
+    /// a storage write.
     ///
     /// Available since SecretSpec 0.19.
     pub extract: Option<SecretExtract>,
-    /// The type of secret, used for generation (e.g., "password", "hex", "base64", "uuid", "command", "rsa_private_key")
+    /// The semantic secret type. OpenPGP and SSH private keys require 0.21+;
+    /// `passphrase`, `mnemonic`, `wireguard_private_key`, `jwk_private_key`,
+    /// `age_identity`, and `x509_identity` require SecretSpec 0.22+.
+    /// For the typed contracts in [`crate::typed`] (`x509_identity` and the
+    /// `pkcs12`, `pkcs8_private_key`, `x509_certificate`,
+    /// `x509_certificate_chain`, and `x509_issuer_chain` targets, 0.22+) the
+    /// type is authoritative: it decides decoding, validation, conversion,
+    /// accepted `credentials` roles, accepted `format` values, and the default
+    /// `encoding` of a binary value.
     pub secret_type: Option<String>,
+    /// Serialization of a typed value whose type offers more than one, for
+    /// example `pem` or `der` for a `pkcs8_private_key`. Every such type has a
+    /// default, so this is normally written only to select DER.
+    ///
+    /// Available since SecretSpec 0.22.
+    pub format: Option<String>,
+    /// Another declared secret whose logical value this secret derives from.
+    /// Combined with a derivable `type` it converts the source (an
+    /// `x509_identity` to a `pkcs12`, key, or certificate); combined with
+    /// `extract` it selects one field from the source's text. Derived secrets
+    /// are read-only and route to no provider.
+    ///
+    /// Available since SecretSpec 0.22.
+    pub from: Option<String>,
+    /// Declared secrets that unlock or protect this typed value, keyed by the
+    /// role the type defines: the `password` that opens a stored
+    /// `x509_identity` archive, or the `password` that protects a derived
+    /// `pkcs12`.
+    ///
+    /// Available since SecretSpec 0.22.
+    pub credentials: Option<BTreeMap<String, CredentialBinding>>,
     /// Auto-generation configuration. Either `true` for defaults or a table with options.
     pub generate: Option<GenerateConfig>,
     /// Prompt securely when the value is missing during `secretspec run`.
@@ -2207,6 +2523,16 @@ impl TryFrom<SecretSerde> for Secret {
     type Error = String;
 
     fn try_from(value: SecretSerde) -> Result<Self, Self::Error> {
+        for field in value.unknown_fields.keys() {
+            let hint = if field == "compose" {
+                " Did you mean `composed`?"
+            } else {
+                " Check the spelling."
+            };
+            eprintln!(
+                "warning: ignoring unknown secret field `{field}`.{hint} This field may be supported in a newer version of SecretSpec."
+            );
+        }
         if value.reference.is_some() && value.refs.is_some() {
             return Err("`ref` and `refs` cannot both be set; use `refs` for provider-scoped addresses or keep the legacy route-wide `ref`".into());
         }
@@ -2235,6 +2561,9 @@ impl TryFrom<SecretSerde> for Secret {
             encoding: value.encoding,
             extract: value.extract,
             secret_type: value.secret_type,
+            format: value.format,
+            from: value.from,
+            credentials: value.credentials,
             generate: value.generate,
             prompt: value.prompt,
         })
@@ -2264,8 +2593,12 @@ impl From<Secret> for SecretSerde {
             encoding: value.encoding,
             extract: value.extract,
             secret_type: value.secret_type,
+            format: value.format,
+            from: value.from,
+            credentials: value.credentials,
             generate: value.generate,
             prompt: value.prompt,
+            unknown_fields: BTreeMap::new(),
         }
     }
 }
@@ -2290,7 +2623,7 @@ impl Secret {
         self.validate_semantics()
     }
 
-    fn validate_description(&self) -> Result<(), String> {
+    pub(crate) fn validate_description(&self) -> Result<(), String> {
         match self.description.as_deref() {
             Some("") => Err("description cannot be empty".into()),
             None => Err("missing description".into()),
@@ -2314,6 +2647,211 @@ impl Secret {
     /// validation.
     pub(crate) fn would_generate(&self) -> bool {
         self.generate.as_ref().is_some_and(|g| g.is_enabled())
+    }
+
+    /// The registry contract behind `type`, when the type is one the registry
+    /// governs. `None` for informational types and untyped secrets.
+    pub(crate) fn typed_contract(&self) -> Option<&'static crate::typed::TypeContract> {
+        self.secret_type.as_deref().and_then(crate::typed::contract)
+    }
+
+    /// The effective serialization of a registry-typed value: the declared
+    /// `format` or the type's default. `None` when the type is not a registry
+    /// type, has a fixed representation, or the declared format is invalid
+    /// (which [`Self::validate`] rejects separately).
+    pub(crate) fn typed_format(&self) -> Option<crate::typed::Format> {
+        self.typed_contract()
+            .and_then(|contract| contract.format(self.format.as_deref()).ok())
+            .flatten()
+    }
+
+    /// Whether the logical value is bytes rather than text. Only registry
+    /// types are binary; an informational type with `encoding` still stores
+    /// text that happens to be encoded at rest.
+    pub(crate) fn is_binary_value(&self) -> bool {
+        self.typed_contract()
+            .is_some_and(|contract| contract.is_binary(self.typed_format()))
+    }
+
+    /// The codec used wherever this value must be text: the declared
+    /// `encoding`, or Base64 for a binary registry type that declares none.
+    pub(crate) fn effective_encoding(&self) -> Option<SecretEncoding> {
+        self.encoding.or_else(|| {
+            self.typed_contract()
+                .and_then(|contract| contract.default_encoding(self.typed_format()))
+        })
+    }
+
+    /// Preferred file suffix for `as_path` delivery, from the type registry.
+    pub(crate) fn file_suffix(&self) -> Option<&'static str> {
+        self.typed_contract()
+            .map(|contract| contract.suffix(self.typed_format()))
+    }
+
+    /// The `(role, declared secret)` pairs bound through `credentials`.
+    pub(crate) fn credential_secrets(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.credentials
+            .iter()
+            .flat_map(|bindings| bindings.iter())
+            .map(|(role, binding)| (role.as_str(), binding.secret_name()))
+    }
+
+    /// Whether the value is derived from other declared secrets rather than
+    /// stored: a `composed` template or a `from` source.
+    pub(crate) fn is_derived(&self) -> bool {
+        self.composed.is_some() || self.from.is_some()
+    }
+
+    /// Rules for `from`, `format`, `credentials`, and the registry types
+    /// (0.22+). Every rule reads the type registry rather than matching type
+    /// names, so adding a contract cannot leave a rule behind.
+    fn validate_typed(&self) -> Result<(), String> {
+        let contract = self.typed_contract();
+
+        let format = match contract {
+            Some(contract) => contract.format(self.format.as_deref())?,
+            None => {
+                if self.format.is_some() {
+                    return Err(match self.secret_type.as_deref() {
+                        Some(name) => format!(
+                            "`format` is not valid for type = \"{name}\"; only `pkcs8_private_key` and `x509_certificate` accept `pem` or `der`"
+                        ),
+                        None => "`format` requires a `type` that accepts formats: `pkcs8_private_key` or `x509_certificate`".into(),
+                    });
+                }
+                None
+            }
+        };
+
+        if let Some(bindings) = &self.credentials
+            && !bindings.is_empty()
+        {
+            let Some(contract) = contract else {
+                return Err(match self.secret_type.as_deref() {
+                    Some(name) => format!(
+                        "`credentials` is not valid for type = \"{name}\"; only `x509_identity` and `pkcs12` accept a `password` credential"
+                    ),
+                    None => "`credentials` requires a `type` that accepts credentials: `x509_identity` or `pkcs12`".into(),
+                });
+            };
+            for (role, binding) in bindings {
+                if !contract.accepts_role(role) {
+                    return Err(if contract.roles.is_empty() {
+                        format!(
+                            "type = \"{}\" accepts no credentials; unknown role `{role}`",
+                            contract.name
+                        )
+                    } else {
+                        format!(
+                            "unknown credential role `{role}` for type = \"{}\"; expected {}",
+                            contract.name,
+                            contract
+                                .roles
+                                .iter()
+                                .map(|role| format!("`{role}`"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    });
+                }
+                if !is_valid_identifier(binding.secret_name()) {
+                    return Err(format!(
+                        "credential `{role}` must name a declared secret using a valid identifier"
+                    ));
+                }
+            }
+            if contract.is_stored() && self.would_generate() {
+                return Err(format!(
+                    "`credentials` cannot be combined with enabled `generate` for type = \"{}\"; a generated identity is stored with an empty password and the provider is its boundary",
+                    contract.name
+                ));
+            }
+        }
+
+        match (&self.from, contract) {
+            (Some(source), _) => {
+                if !is_valid_identifier(source) {
+                    return Err(
+                        "`from` must name a declared secret using a valid identifier".into(),
+                    );
+                }
+                match (contract, &self.extract) {
+                    (Some(contract), None) if !contract.is_stored() => {}
+                    (Some(contract), None) => {
+                        return Err(format!(
+                            "type = \"{}\" is stored by a provider and cannot be derived with `from`",
+                            contract.name
+                        ));
+                    }
+                    (Some(_), Some(_)) => {
+                        return Err(
+                            "`from` either selects with `extract` or converts with a derivable `type`, not both"
+                                .into(),
+                        );
+                    }
+                    (None, Some(_)) => {
+                        if self.secret_type.is_some() {
+                            return Err("`from` with `extract` cannot also set `type`".into());
+                        }
+                    }
+                    (None, None) => {
+                        return Err(match self.secret_type.as_deref() {
+                            Some(name) => format!(
+                                "type = \"{name}\" cannot be derived with `from`; derivable types are {}",
+                                crate::typed::derivable_type_names()
+                                    .map(|name| format!("`{name}`"))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ),
+                            None => "`from` requires `extract` to select from the source or a derivable `type` to convert it".into(),
+                        });
+                    }
+                }
+                if self.default.is_some()
+                    || self.providers.is_some()
+                    || self.reference.is_some()
+                    || self.refs.is_some()
+                    || self.would_generate()
+                    || self.prompt == Some(true)
+                {
+                    return Err(
+                        "`from` secrets cannot also set `default`, `providers`, `ref`, `refs`, enabled `generate`, or `prompt = true`; the source declaration owns storage"
+                            .into(),
+                    );
+                }
+                if self.encoding.is_some()
+                    && !contract.is_some_and(|contract| contract.is_binary(format))
+                {
+                    return Err(
+                        "`encoding` on a `from` secret is valid only when the result is binary: a `pkcs12` or a `der` format"
+                            .into(),
+                    );
+                }
+            }
+            (None, Some(contract)) => {
+                if !contract.is_stored() {
+                    return Err(format!(
+                        "type = \"{}\" requires `from`; it is derived from a declared `x509_identity`",
+                        contract.name
+                    ));
+                }
+                if self.extract.is_some() {
+                    return Err(format!(
+                        "`extract` is not valid for stored type = \"{}\"; its value is a binary archive",
+                        contract.name
+                    ));
+                }
+                if self.default.is_some() || self.prompt == Some(true) {
+                    return Err(format!(
+                        "`type = \"{}\"` cannot be combined with `default` or `prompt = true`; its value is a binary archive",
+                        contract.name
+                    ));
+                }
+            }
+            (None, None) => {}
+        }
+
+        Ok(())
     }
 
     /// Whether this declaration supplies an individual or grouped requiredness
@@ -2370,16 +2908,20 @@ impl Secret {
                 || self.encoding.is_some()
                 || self.extract.is_some()
                 || self.secret_type.is_some()
+                || self.format.is_some()
+                || self.from.is_some()
+                || self.credentials.is_some()
                 || self.would_generate()
                 || self.prompt == Some(true)
             {
                 return Err(
-                    "`composed` secrets cannot also set `default`, `providers`, `ref`, `refs`, `encoding`, `extract`, `type`, enabled `generate`, or `prompt = true`"
+                    "`composed` secrets cannot also set `default`, `providers`, `ref`, `refs`, `encoding`, `extract`, `type`, `format`, `from`, `credentials`, enabled `generate`, or `prompt = true`"
                         .into(),
                 );
             }
         }
 
+        self.validate_typed()?;
         if self.prompt == Some(true) {
             if self.required == Some(false)
                 || self.at_least_one.is_some()
@@ -2462,6 +3004,19 @@ impl Secret {
                 return Err("'generate' and 'default' cannot both be set".into());
             }
 
+            if let GenerateConfig::Options(opts) = gen_config
+                && self.secret_type.as_deref() != Some("x509_identity")
+                && (opts.issuer.is_some()
+                    || opts.san.is_some()
+                    || opts.usages.is_some()
+                    || opts.valid_for.is_some())
+            {
+                return Err(
+                    "generate.issuer, generate.san, generate.usages, and generate.valid_for are only valid for type = \"x509_identity\""
+                        .into(),
+                );
+            }
+
             // type = "command" requires generate = { command = "..." }
             if self.secret_type.as_deref() == Some("command") {
                 match gen_config {
@@ -2479,10 +3034,407 @@ impl Secret {
                 }
             }
 
+            if self.secret_type.as_deref() == Some("openpgp_private_key") {
+                let opts = match gen_config {
+                    GenerateConfig::Options(opts) => opts,
+                    GenerateConfig::Bool(true) => {
+                        return Err(
+                            "type = \"openpgp_private_key\" requires generate = { user_id = \"Name <email>\" }"
+                                .into(),
+                        );
+                    }
+                    GenerateConfig::Bool(false) => {
+                        unreachable!("disabled generation handled above")
+                    }
+                };
+                let user_id = opts.user_id.as_deref().ok_or_else(|| {
+                    "type = \"openpgp_private_key\" requires generate.user_id".to_string()
+                })?;
+                if user_id.trim().is_empty() {
+                    return Err("generate.user_id cannot be empty or whitespace".into());
+                }
+                if user_id.chars().any(char::is_control) {
+                    return Err("generate.user_id cannot contain control characters".into());
+                }
+                if opts.length.is_some()
+                    || opts.bytes.is_some()
+                    || opts.charset.is_some()
+                    || opts.command.is_some()
+                    || opts.comment.is_some()
+                    || opts.words.is_some()
+                    || opts.separator.is_some()
+                    || opts.language.is_some()
+                    || opts.kid.is_some()
+                {
+                    return Err(
+                        "openpgp_private_key generation accepts only `algorithm`, `bits`, `user_id`, and `capabilities` options"
+                            .into(),
+                    );
+                }
+
+                match opts.algorithm.as_deref().unwrap_or("ed25519") {
+                    "ed25519" => {
+                        if opts.bits.is_some() {
+                            return Err(
+                                "generate.bits is only valid when generate.algorithm = \"rsa\""
+                                    .into(),
+                            );
+                        }
+                    }
+                    "rsa" => {
+                        let bits = opts.bits.unwrap_or(OPENPGP_RSA_DEFAULT_BITS);
+                        if !(OPENPGP_RSA_MIN_BITS..=OPENPGP_RSA_MAX_BITS).contains(&bits) {
+                            return Err(
+                                "OpenPGP RSA generate.bits must be between 2048 and 8192".into()
+                            );
+                        }
+                    }
+                    algorithm => {
+                        return Err(format!(
+                            "unknown OpenPGP algorithm '{algorithm}'; expected `ed25519` or `rsa`"
+                        ));
+                    }
+                }
+
+                if let Some(capabilities) = &opts.capabilities {
+                    if capabilities.is_empty() {
+                        return Err(
+                            "generate.capabilities must contain `sign`, `encrypt`, or both".into(),
+                        );
+                    }
+                    let mut seen = HashSet::new();
+                    for capability in capabilities {
+                        if !matches!(capability.as_str(), "sign" | "encrypt") {
+                            return Err(format!(
+                                "unknown OpenPGP capability '{capability}'; expected `sign` or `encrypt`"
+                            ));
+                        }
+                        if !seen.insert(capability) {
+                            return Err(format!(
+                                "generate.capabilities contains duplicate capability '{capability}'"
+                            ));
+                        }
+                    }
+                }
+            }
+
+            if self.secret_type.as_deref() == Some("ssh_private_key") {
+                let opts = match gen_config {
+                    GenerateConfig::Bool(true) => None,
+                    GenerateConfig::Options(opts) => Some(opts),
+                    GenerateConfig::Bool(false) => {
+                        unreachable!("disabled generation handled above")
+                    }
+                };
+                if let Some(opts) = opts {
+                    if opts.length.is_some()
+                        || opts.bytes.is_some()
+                        || opts.charset.is_some()
+                        || opts.command.is_some()
+                        || opts.user_id.is_some()
+                        || opts.capabilities.is_some()
+                        || opts.words.is_some()
+                        || opts.separator.is_some()
+                        || opts.language.is_some()
+                        || opts.kid.is_some()
+                    {
+                        return Err(
+                            "ssh_private_key generation accepts only `algorithm`, `bits`, and `comment` options"
+                                .into(),
+                        );
+                    }
+                    if opts
+                        .comment
+                        .as_deref()
+                        .is_some_and(|comment| comment.chars().any(char::is_control))
+                    {
+                        return Err("generate.comment cannot contain control characters".into());
+                    }
+                    match opts.algorithm.as_deref().unwrap_or("ed25519") {
+                        "ed25519" => {
+                            if opts.bits.is_some() {
+                                return Err(
+                                    "generate.bits is only valid when generate.algorithm = \"rsa\""
+                                        .into(),
+                                );
+                            }
+                        }
+                        "rsa" => {
+                            let bits = opts.bits.unwrap_or(SSH_RSA_DEFAULT_BITS);
+                            if !(SSH_RSA_MIN_BITS..=SSH_RSA_MAX_BITS).contains(&bits) {
+                                return Err(
+                                    "SSH RSA generate.bits must be between 2048 and 8192".into()
+                                );
+                            }
+                        }
+                        algorithm => {
+                            return Err(format!(
+                                "unknown SSH algorithm '{algorithm}'; expected `ed25519` or `rsa`"
+                            ));
+                        }
+                    }
+                }
+            }
+
+            if self.secret_type.as_deref() == Some("passphrase") {
+                let opts = match gen_config {
+                    GenerateConfig::Bool(true) => None,
+                    GenerateConfig::Options(opts) => Some(opts),
+                    GenerateConfig::Bool(false) => {
+                        unreachable!("disabled generation handled above")
+                    }
+                };
+                if let Some(opts) = opts {
+                    let words = opts.words.unwrap_or(PASSPHRASE_DEFAULT_WORDS);
+                    if !(PASSPHRASE_MIN_WORDS..=PASSPHRASE_MAX_WORDS).contains(&words) {
+                        return Err(format!(
+                            "passphrase generate.words must be between {PASSPHRASE_MIN_WORDS} and {PASSPHRASE_MAX_WORDS}"
+                        ));
+                    }
+                    if opts.separator.as_deref().is_some_and(|separator| {
+                        separator.is_empty() || separator.chars().any(char::is_control)
+                    }) {
+                        return Err(
+                            "passphrase generate.separator must be non-empty and contain no control characters"
+                                .into(),
+                        );
+                    }
+                    if opts.length.is_some()
+                        || opts.bytes.is_some()
+                        || opts.charset.is_some()
+                        || opts.command.is_some()
+                        || opts.algorithm.is_some()
+                        || opts.bits.is_some()
+                        || opts.user_id.is_some()
+                        || opts.capabilities.is_some()
+                        || opts.comment.is_some()
+                        || opts.kid.is_some()
+                        || opts.language.is_some()
+                    {
+                        return Err(
+                            "passphrase generation accepts only `words` and `separator` options"
+                                .into(),
+                        );
+                    }
+                }
+            }
+
+            if self.secret_type.as_deref() == Some("mnemonic") {
+                let opts = match gen_config {
+                    GenerateConfig::Bool(true) => None,
+                    GenerateConfig::Options(opts) => Some(opts),
+                    GenerateConfig::Bool(false) => {
+                        unreachable!("disabled generation handled above")
+                    }
+                };
+                if let Some(opts) = opts {
+                    let words = opts.words.unwrap_or(MNEMONIC_DEFAULT_WORDS);
+                    if !MNEMONIC_WORD_COUNTS.contains(&words) {
+                        return Err(
+                            "mnemonic generate.words must be one of 12, 15, 18, 21, or 24".into(),
+                        );
+                    }
+                    if opts.algorithm.as_deref().unwrap_or("bip39") != "bip39" {
+                        return Err("unknown mnemonic algorithm; expected `bip39`".into());
+                    }
+                    if opts.language.as_deref().unwrap_or("english") != "english" {
+                        return Err("unknown mnemonic language; expected `english`".into());
+                    }
+                    if opts.length.is_some()
+                        || opts.bytes.is_some()
+                        || opts.charset.is_some()
+                        || opts.command.is_some()
+                        || opts.bits.is_some()
+                        || opts.user_id.is_some()
+                        || opts.capabilities.is_some()
+                        || opts.comment.is_some()
+                        || opts.separator.is_some()
+                        || opts.kid.is_some()
+                    {
+                        return Err(
+                            "mnemonic generation accepts only `algorithm`, `words`, and `language` options"
+                                .into(),
+                        );
+                    }
+                }
+            }
+
+            if self.secret_type.as_deref() == Some("jwk_private_key") {
+                let opts = match gen_config {
+                    GenerateConfig::Bool(true) => None,
+                    GenerateConfig::Options(opts) => Some(opts),
+                    GenerateConfig::Bool(false) => {
+                        unreachable!("disabled generation handled above")
+                    }
+                };
+                if let Some(opts) = opts {
+                    if opts.kid.as_deref().is_some_and(|kid| {
+                        kid.trim().is_empty() || kid.chars().any(char::is_control)
+                    }) {
+                        return Err(
+                            "JWK generate.kid must be non-empty and contain no control characters"
+                                .into(),
+                        );
+                    }
+                    match opts.algorithm.as_deref().unwrap_or("ed25519") {
+                        "ed25519" | "p256" => {
+                            if opts.bits.is_some() {
+                                return Err(
+                                    "generate.bits is only valid when generate.algorithm = \"rsa\""
+                                        .into(),
+                                );
+                            }
+                        }
+                        "rsa" => {
+                            let bits = opts.bits.unwrap_or(JWK_RSA_DEFAULT_BITS);
+                            if !(JWK_RSA_MIN_BITS..=JWK_RSA_MAX_BITS).contains(&bits) {
+                                return Err(
+                                    "JWK RSA generate.bits must be between 2048 and 8192".into()
+                                );
+                            }
+                        }
+                        algorithm => {
+                            return Err(format!(
+                                "unknown JWK algorithm '{algorithm}'; expected `ed25519`, `p256`, or `rsa`"
+                            ));
+                        }
+                    }
+                    if opts.length.is_some()
+                        || opts.bytes.is_some()
+                        || opts.charset.is_some()
+                        || opts.command.is_some()
+                        || opts.user_id.is_some()
+                        || opts.capabilities.is_some()
+                        || opts.comment.is_some()
+                        || opts.words.is_some()
+                        || opts.separator.is_some()
+                        || opts.language.is_some()
+                    {
+                        return Err(
+                            "JWK generation accepts only `algorithm`, `bits`, and `kid` options"
+                                .into(),
+                        );
+                    }
+                }
+            }
+
+            if self.secret_type.as_deref() == Some("x509_identity") {
+                let opts = match gen_config {
+                    GenerateConfig::Options(opts) => opts,
+                    GenerateConfig::Bool(true) => {
+                        return Err(
+                            "type = \"x509_identity\" requires generate = { san = [\"dns:localhost\"] }"
+                                .into(),
+                        );
+                    }
+                    GenerateConfig::Bool(false) => {
+                        unreachable!("disabled generation handled above")
+                    }
+                };
+                if opts.issuer.as_deref().unwrap_or("self_signed") != "self_signed" {
+                    return Err("unknown X.509 issuer; expected `self_signed`".into());
+                }
+                if opts.algorithm.as_deref().unwrap_or("p256") != "p256" {
+                    return Err("unknown X.509 algorithm; expected `p256`".into());
+                }
+                let sans = opts
+                    .san
+                    .as_deref()
+                    .ok_or_else(|| "type = \"x509_identity\" requires generate.san".to_string())?;
+                if sans.is_empty() || sans.len() > 100 {
+                    return Err("X.509 generate.san must contain between 1 and 100 names".into());
+                }
+                let mut seen = HashSet::new();
+                for san in sans {
+                    crate::x509_identity::validate_san(san)?;
+                    if !seen.insert(san) {
+                        return Err(format!("generate.san contains duplicate name '{san}'"));
+                    }
+                }
+                if let Some(usages) = &opts.usages {
+                    if usages.is_empty() {
+                        return Err(
+                            "X.509 generate.usages must contain `server_auth`, `client_auth`, or both"
+                                .into(),
+                        );
+                    }
+                    let mut seen = HashSet::new();
+                    for usage in usages {
+                        if !matches!(usage.as_str(), "server_auth" | "client_auth") {
+                            return Err(format!(
+                                "unknown X.509 usage '{usage}'; expected `server_auth` or `client_auth`"
+                            ));
+                        }
+                        if !seen.insert(usage) {
+                            return Err(format!(
+                                "generate.usages contains duplicate usage '{usage}'"
+                            ));
+                        }
+                    }
+                }
+                crate::x509_identity::parse_valid_days(opts.valid_for.as_deref())?;
+                if opts.length.is_some()
+                    || opts.bytes.is_some()
+                    || opts.charset.is_some()
+                    || opts.command.is_some()
+                    || opts.bits.is_some()
+                    || opts.user_id.is_some()
+                    || opts.capabilities.is_some()
+                    || opts.comment.is_some()
+                    || opts.words.is_some()
+                    || opts.separator.is_some()
+                    || opts.language.is_some()
+                    || opts.kid.is_some()
+                {
+                    return Err(
+                        "X.509 generation accepts only `issuer`, `algorithm`, `san`, `usages`, and `valid_for` options"
+                            .into(),
+                    );
+                }
+            }
+
+            if matches!(
+                self.secret_type.as_deref(),
+                Some("wireguard_private_key" | "age_identity")
+            ) && let GenerateConfig::Options(opts) = gen_config
+                && (opts.length.is_some()
+                    || opts.bytes.is_some()
+                    || opts.charset.is_some()
+                    || opts.command.is_some()
+                    || opts.bits.is_some()
+                    || opts.algorithm.is_some()
+                    || opts.user_id.is_some()
+                    || opts.capabilities.is_some()
+                    || opts.comment.is_some()
+                    || opts.words.is_some()
+                    || opts.separator.is_some()
+                    || opts.language.is_some()
+                    || opts.kid.is_some())
+            {
+                return Err(format!(
+                    "{} generation does not accept options",
+                    self.secret_type.as_deref().expect("matched type")
+                ));
+            }
+
             // Validate known types
             if let Some(ref t) = self.secret_type {
                 match t.as_str() {
-                    "password" | "hex" | "base64" | "uuid" | "command" | "rsa_private_key" => {}
+                    "password"
+                    | "hex"
+                    | "base64"
+                    | "uuid"
+                    | "command"
+                    | "rsa_private_key"
+                    | "openpgp_private_key"
+                    | "ssh_private_key"
+                    | "passphrase"
+                    | "mnemonic"
+                    | "wireguard_private_key"
+                    | "jwk_private_key"
+                    | "age_identity"
+                    | "x509_identity" => {}
+                    typed if crate::typed::contract(typed).is_some() => {}
                     unknown => {
                         return Err(format!("unknown secret type '{}'", unknown));
                     }
@@ -2496,7 +3448,21 @@ impl Secret {
         {
             // Type is informational when not generating, but still validate known values
             match t.as_str() {
-                "password" | "hex" | "base64" | "uuid" | "command" | "rsa_private_key" => {}
+                "password"
+                | "hex"
+                | "base64"
+                | "uuid"
+                | "command"
+                | "rsa_private_key"
+                | "openpgp_private_key"
+                | "ssh_private_key"
+                | "passphrase"
+                | "mnemonic"
+                | "wireguard_private_key"
+                | "jwk_private_key"
+                | "age_identity"
+                | "x509_identity" => {}
+                typed if crate::typed::contract(typed).is_some() => {}
                 unknown => {
                     return Err(format!("unknown secret type '{}'", unknown));
                 }
@@ -2510,14 +3476,16 @@ impl Secret {
     /// acts on.
     ///
     /// Precedence (highest to lowest): the current profile's entry, the
-    /// default profile's entry, then the current profile's `[defaults]` table
-    /// (for the fields it can supply). Shared by secret resolution
+    /// default profile's entry, the current profile's `[defaults]` table, then
+    /// project `[defaults].providers` in 0.21+ (for the fields each can supply).
+    /// Shared by secret resolution
     /// (`Secrets::resolve_secret_config`) and `Config::validate` so the two
     /// can never disagree about what a merged secret looks like.
     pub(crate) fn resolved(
         current: Option<&Secret>,
         default: Option<&Secret>,
         defaults: Option<&ProfileDefaults>,
+        project_defaults: Option<&ProjectDefaults>,
     ) -> Option<Secret> {
         if current.is_none() && default.is_none() {
             return None;
@@ -2550,9 +3518,16 @@ impl Secret {
         } else {
             (defaults.and_then(|d| d.required), None, None)
         };
-        // A composed secret's source is its dependency graph, so the
-        // `[defaults]` storage fields (`default`, `providers`) do not apply.
-        let storage_defaults = if composed.is_some() { None } else { defaults };
+        let extract = inherit(current, default, |s| s.extract.clone());
+        let from = inherit(current, default, |s| s.from.clone());
+        // Derived values do not inherit storage routes or defaults.
+        let derived = composed.is_some() || from.is_some();
+        let storage_defaults = if derived { None } else { defaults };
+        let project_providers = if derived {
+            None
+        } else {
+            project_defaults.map(|defaults| defaults.providers.clone())
+        };
         // `ref` and `refs` are two serialized forms of one address-model
         // setting. Select the pair from one profile entry so an explicit switch
         // in either direction replaces, rather than combines with, the inherited
@@ -2565,6 +3540,14 @@ impl Secret {
         let (reference, refs) = reference_source.map_or((None, None), |secret| {
             (secret.reference.clone(), secret.refs.clone())
         });
+        // An explicitly empty table clears a binding inherited from the
+        // default profile. Keep this selection separate from `inherit`: using
+        // `or_else` would mistake the empty table for an absent override.
+        let credentials = match current.and_then(|secret| secret.credentials.as_ref()) {
+            Some(bindings) if bindings.is_empty() => None,
+            Some(bindings) => Some(bindings.clone()),
+            None => default.and_then(|secret| secret.credentials.clone()),
+        };
         Some(Secret {
             description: inherit(current, default, |s| s.description.clone()),
             required,
@@ -2574,13 +3557,17 @@ impl Secret {
                 .or_else(|| storage_defaults.and_then(|d| d.default.clone())),
             composed,
             providers: inherit(current, default, |s| s.providers.clone())
-                .or_else(|| storage_defaults.and_then(|d| d.providers.clone())),
+                .or_else(|| storage_defaults.and_then(|d| d.providers.clone()))
+                .or(project_providers),
             reference,
             refs,
             as_path: inherit(current, default, |s| s.as_path),
             encoding: inherit(current, default, |s| s.encoding),
-            extract: inherit(current, default, |s| s.extract.clone()),
+            extract,
             secret_type: inherit(current, default, |s| s.secret_type.clone()),
+            format: inherit(current, default, |s| s.format.clone()),
+            from,
+            credentials,
             generate: inherit(current, default, |s| s.generate.clone()),
             prompt: inherit(current, default, |s| s.prompt),
         })
@@ -2608,7 +3595,7 @@ pub(crate) fn is_valid_identifier(s: &str) -> bool {
 ///
 /// This configuration is stored in the user's config directory and provides
 /// defaults that apply across all projects.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
 #[doc(hidden)]
 pub struct GlobalConfig {
     /// Default settings
@@ -2623,9 +3610,13 @@ pub struct GlobalConfig {
 }
 
 /// Default settings in the global configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
 #[doc(hidden)]
 pub struct GlobalDefaults {
+    /// Retry policy for provider operations (0.22+). One attempt disables retries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<crate::provider::RetryPolicy>,
+
     /// Default provider to use when not specified
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
@@ -2975,6 +3966,7 @@ mod require_reason_tests {
     fn extends_inherits_parent_require_reason_when_unspecified() {
         use std::collections::HashMap;
         let cfg = |rr: Option<RequireReason>| Config {
+            defaults: None,
             project: Project {
                 name: "t".to_string(),
                 require_reason: rr,
@@ -3179,6 +4171,7 @@ mod validation_tests {
             })
             .collect();
         Config {
+            defaults: None,
             project: Project {
                 name: name.to_string(),
                 ..Default::default()
@@ -3477,6 +4470,39 @@ ACCESS_TOKEN = { required = { at_least_one = "auth" } }
     }
 
     #[test]
+    fn secret_declarations_ignore_unknown_fields() {
+        for field in ["compose", "requred", "providerss", "metadata"] {
+            let declaration = format!(
+                r#"description = "Temporary home"
+{field} = "${{REPO_PATH}}/.tmp""#
+            );
+            let secret = toml::from_str::<Secret>(&declaration).unwrap();
+            assert_eq!(secret.description.as_deref(), Some("Temporary home"));
+            assert!(secret.composed.is_none());
+            assert!(!toml::to_string(&secret).unwrap().contains(field));
+
+            let manifest = format!(
+                r#"
+[project]
+name = "unknown-fields"
+revision = "1.0"
+
+[profiles.development]
+REPO_PATH = {{ description = "Repository path", default = "c:/ws/my-repo", providers = ["dotenv"] }}
+TEMP_HOME = {{ description = "Temporary home", {field} = "${{REPO_PATH}}/.tmp", providers = ["null"] }}
+"#
+            );
+            let config = Config::parse_document(&manifest).unwrap();
+            config.validate().unwrap();
+            assert!(
+                config.profiles["development"].secrets["TEMP_HOME"]
+                    .composed
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
     fn composed_references_are_validated_as_a_static_graph() {
         let parse = |body: &str| {
             toml::from_str::<Config>(&format!(
@@ -3526,6 +4552,107 @@ C = { description = "c", composed = "${A}" }
         .unwrap_err()
         .to_string();
         assert!(cycle.contains("A -> B -> C -> A"), "{cycle}");
+    }
+
+    #[test]
+    fn from_sources_share_the_derived_dependency_graph() {
+        let parse = |body: &str| {
+            toml::from_str::<Config>(&format!(
+                r#"
+[project]
+name = "derived"
+revision = "1.0"
+
+[profiles.default]
+{body}
+"#
+            ))
+            .unwrap()
+        };
+
+        parse(
+            r#"
+TLS_IDENTITY = { description = "identity", type = "x509_identity" }
+TLS_KEY = { description = "key", type = "pkcs8_private_key", from = "TLS_IDENTITY" }
+TLS_CERTIFICATE = { description = "certificate", type = "x509_certificate", format = "der", from = "TLS_IDENTITY", as_path = true }
+DOCUMENT = { description = "document" }
+FIELD = { description = "field", from = "DOCUMENT", extract = { format = "json", pointer = "/a" } }
+"#,
+        )
+        .validate()
+        .unwrap();
+
+        let wrong_type = parse(
+            r#"
+DOCUMENT = { description = "document" }
+TLS_KEY = { description = "key", type = "pkcs8_private_key", from = "DOCUMENT" }
+"#,
+        )
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(
+            wrong_type.contains("has no `type`, but type = \"pkcs8_private_key\" derives from type = \"x509_identity\""),
+            "{wrong_type}"
+        );
+
+        let cycle = parse(
+            r#"
+A = { description = "a", from = "B", extract = { format = "json", pointer = "" } }
+B = { description = "b", from = "A", extract = { format = "json", pointer = "" } }
+"#,
+        )
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(cycle.contains("A -> B -> A"), "{cycle}");
+
+        let credential_cycle = parse(
+            r#"
+TLS_IDENTITY = { description = "identity", type = "x509_identity" }
+TLS_PFX = { description = "pfx", type = "pkcs12", from = "TLS_IDENTITY", credentials = { password = "PFX_PASSWORD" } }
+PFX_PASSWORD = { description = "password", composed = "${TLS_PFX}" }
+"#,
+        )
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(
+            credential_cycle.contains("derived secret cycle"),
+            "{credential_cycle}"
+        );
+        assert!(
+            credential_cycle.contains("TLS_PFX -> PFX_PASSWORD")
+                || credential_cycle.contains("PFX_PASSWORD -> TLS_PFX"),
+            "{credential_cycle}"
+        );
+
+        let self_reference = parse(
+            r#"
+A = { description = "a", from = "A", extract = { format = "json", pointer = "" } }
+"#,
+        )
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(
+            self_reference.contains("cannot depend on itself"),
+            "{self_reference}"
+        );
+
+        let unknown = parse(
+            r#"
+TLS_IDENTITY = { description = "identity", type = "x509_identity" }
+TLS_PFX = { description = "pfx", type = "pkcs12", from = "TLS_IDENTITY", credentials = { password = "MISSING" } }
+"#,
+        )
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(
+            unknown.contains("dependency 'MISSING' does not name a declared secret"),
+            "{unknown}"
+        );
     }
 
     #[test]
@@ -3631,6 +4758,122 @@ providers = ["keyring"]
     }
 
     #[test]
+    fn project_default_providers_apply_with_narrow_precedence() {
+        let config: Config = toml::from_str(
+            r#"
+[project]
+name = "payments"
+revision = "1.0"
+
+[defaults]
+providers = ["project"]
+
+[profiles.default]
+SHARED = { description = "Shared secret" }
+
+[profiles.production.defaults]
+providers = ["profile"]
+
+[profiles.production]
+DIRECT = { description = "Direct secret", providers = ["secret"] }
+"#,
+        )
+        .unwrap();
+
+        let compiled = config.validate_and_compile().unwrap();
+        let default = compiled.profile("default").unwrap();
+        assert_eq!(
+            default.secrets["SHARED"].config.providers.as_deref(),
+            Some(["project".to_string()].as_slice())
+        );
+
+        let production = compiled.profile("production").unwrap();
+        assert_eq!(
+            production.secrets["SHARED"].config.providers.as_deref(),
+            Some(["profile".to_string()].as_slice())
+        );
+        assert_eq!(
+            production.secrets["DIRECT"].config.providers.as_deref(),
+            Some(["secret".to_string()].as_slice())
+        );
+    }
+
+    #[test]
+    fn project_defaults_accept_only_a_nonempty_provider_chain() {
+        for body in [
+            "[defaults]\nproviders = []",
+            "[defaults]\nproviders = [\"  \"]",
+        ] {
+            let source = format!(
+                r#"
+[project]
+name = "payments"
+revision = "1.0"
+
+{body}
+
+[profiles.default]
+TOKEN = {{ description = "Token" }}
+"#
+            );
+            let config: Config = toml::from_str(&source).unwrap();
+            assert!(config.validate().is_err(), "{source}");
+        }
+
+        let error = toml::from_str::<Config>(
+            r#"
+[project]
+name = "payments"
+revision = "1.0"
+
+[defaults]
+default = "same value for every secret"
+
+[profiles.default]
+TOKEN = { description = "Token" }
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("unknown field `default`"), "{error}");
+    }
+
+    #[test]
+    fn later_documents_override_project_defaults_only_when_present() {
+        let parse = |providers: Option<&str>| {
+            let defaults = providers
+                .map(|provider| format!("[defaults]\nproviders = [\"{provider}\"]\n"))
+                .unwrap_or_default();
+            toml::from_str::<Config>(&format!(
+                r#"
+[project]
+name = "payments"
+revision = "1.0"
+
+{defaults}
+[profiles.default]
+TOKEN = {{ description = "Token" }}
+"#
+            ))
+            .unwrap()
+        };
+
+        let mut inherited = parse(Some("parent"));
+        inherited.overlay_with(parse(None));
+        assert_eq!(
+            inherited.defaults.unwrap().providers,
+            vec!["parent".to_string()]
+        );
+
+        let mut overridden = parse(Some("parent"));
+        overridden.overlay_with(parse(Some("child")));
+        assert_eq!(
+            overridden.defaults.unwrap().providers,
+            vec!["child".to_string()]
+        );
+    }
+
+    #[test]
     fn config_validate_allows_profile_override_to_inherit_description() {
         // required = true in the default profile plus a default value from
         // the override is also fine: only that combination within a single
@@ -3725,6 +4968,30 @@ TOKEN = { generate = true }
         .unwrap();
 
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn empty_credentials_override_clears_inherited_binding() {
+        let config: Config = toml::from_str(
+            r#"
+[project]
+name = "tmp"
+revision = "1.0"
+
+[profiles.default]
+PFX_PASSWORD = { description = "password" }
+TLS_IDENTITY = { description = "identity", type = "x509_identity", credentials = { password = "PFX_PASSWORD" } }
+
+[profiles.production]
+TLS_IDENTITY = { credentials = {}, generate = { san = ["dns:localhost"] } }
+"#,
+        )
+        .unwrap();
+
+        let compiled = config.validate_and_compile().unwrap();
+        let identity = &compiled.profile("production").unwrap().secrets["TLS_IDENTITY"].config;
+        assert!(identity.credentials.is_none());
+        assert!(identity.would_generate());
     }
 
     #[test]
@@ -3824,7 +5091,7 @@ default = "placeholder"
         let rendered = toml::to_string(&parsed).unwrap();
         assert!(rendered.contains("prompt = true"), "{rendered}");
 
-        let inherited = Secret::resolved(None, Some(&parsed), None).unwrap();
+        let inherited = Secret::resolved(None, Some(&parsed), None, None).unwrap();
         assert_eq!(inherited.prompt, Some(true));
         let disabled = Secret::resolved(
             Some(&Secret {
@@ -3832,6 +5099,7 @@ default = "placeholder"
                 ..Default::default()
             }),
             Some(&parsed),
+            None,
             None,
         )
         .unwrap();
@@ -3955,7 +5223,7 @@ refs = { remote = { item = "scoped" } }"#,
             ..Default::default()
         };
 
-        let resolved = Secret::resolved(Some(&scoped), Some(&legacy), None).unwrap();
+        let resolved = Secret::resolved(Some(&scoped), Some(&legacy), None, None).unwrap();
         assert!(
             resolved.reference.is_none(),
             "an explicit `refs` override must replace an inherited legacy `ref`"
@@ -3963,7 +5231,7 @@ refs = { remote = { item = "scoped" } }"#,
         assert_eq!(resolved.refs, scoped.refs);
         resolved.validate().unwrap();
 
-        let resolved = Secret::resolved(Some(&legacy), Some(&scoped), None).unwrap();
+        let resolved = Secret::resolved(Some(&legacy), Some(&scoped), None, None).unwrap();
         assert_eq!(resolved.reference, legacy.reference);
         assert!(
             resolved.refs.is_none(),
@@ -4102,6 +5370,7 @@ refs = { remote = { item = "scoped" } }"#,
                 ..Default::default()
             }),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(inherited.encoding, Some(SecretEncoding::Base64));
@@ -4120,11 +5389,7 @@ encoding = "rot13""#,
 
     #[test]
     fn secret_extract_parses_round_trips_and_inherits() {
-        let secret: Secret = toml::from_str(
-            r#"description = "selected"
-extract = { format = "json", pointer = "/database/password" }"#,
-        )
-        .unwrap();
+        let secret = extract_secret("json", "/database/password");
         assert_eq!(
             secret.extract,
             Some(SecretExtract {
@@ -4150,19 +5415,34 @@ extract = { format = "json", pointer = "/database/password" }"#,
                 ..Default::default()
             }),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(inherited.extract, secret.extract);
+
+        let ini = extract_secret("ini", "/database/password");
+        assert_eq!(
+            ini.extract,
+            Some(SecretExtract {
+                format: ExtractFormat::Ini,
+                pointer: "/database/password".to_string(),
+            })
+        );
+        assert!(toml::to_string(&ini).unwrap().contains("format = \"ini\""));
+    }
+
+    /// A secret declaring nothing but the extract table under test.
+    fn extract_secret(format: &str, pointer: &str) -> Secret {
+        toml::from_str(&format!(
+            "description = \"selected\"\nextract = {{ format = \"{format}\", pointer = \"{pointer}\" }}"
+        ))
+        .unwrap()
     }
 
     #[test]
     fn secret_extract_validates_json_pointer_and_table_shape() {
         for pointer in ["database/password", "/bad~", "/bad~2escape"] {
-            let secret: Secret = toml::from_str(&format!(
-                "description = \"selected\"\nextract = {{ format = \"json\", pointer = \"{pointer}\" }}"
-            ))
-            .unwrap();
-            let error = secret.validate().unwrap_err();
+            let error = extract_secret("json", pointer).validate().unwrap_err();
             assert!(error.contains("`extract.pointer`"), "{error}");
         }
 
@@ -4186,11 +5466,27 @@ extract = { format = "yaml", pointer = "/x" }"#,
     #[test]
     fn secret_extract_accepts_root_and_escaped_json_pointers() {
         for pointer in ["", "/a~1b/~0key", "/items/0"] {
-            let secret: Secret = toml::from_str(&format!(
-                "description = \"selected\"\nextract = {{ format = \"json\", pointer = \"{pointer}\" }}"
-            ))
-            .unwrap();
-            secret.validate().unwrap();
+            extract_secret("json", pointer).validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn secret_extract_validates_ini_pointer_shape() {
+        for pointer in ["/token", "/database/password", "/a~1b/~0key"] {
+            extract_secret("ini", pointer).validate().unwrap();
+        }
+
+        for pointer in [
+            "",
+            "token",
+            "/",
+            "//password",
+            "/database/",
+            "/database/password/extra",
+            "/bad~2escape",
+        ] {
+            let error = extract_secret("ini", pointer).validate().unwrap_err();
+            assert!(error.contains("`extract.pointer`"), "{pointer}: {error}");
         }
     }
 

@@ -62,7 +62,11 @@
 //! secretspec check --provider akv://myvault?auth=managed_identity
 //! ```
 
-use super::{Address, Provider, ProviderCredentials, ProviderUrl, credential_or_env};
+use super::ProviderBase as _;
+use super::{Address, ProviderCredentials, ProviderUrl, credential_or_env};
+#[cfg(test)]
+use super::{Provider, SyncProviderAdapter};
+use crate::SecretBytes;
 use crate::{Result, SecretSpecError};
 use azure_core::credentials::{Secret, TokenCredential};
 use azure_core::http::StatusCode;
@@ -75,10 +79,9 @@ use azure_security_keyvault_secrets::{
     models::{SecretClientGetSecretOptions, SetSecretParameters},
 };
 use data_encoding::BASE32_NOPAD;
-use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use std::sync::{
-    Arc, Mutex, OnceLock,
+    Arc, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
 
@@ -94,25 +97,35 @@ use std::sync::{
 #[derive(Default)]
 pub(crate) struct InitialRequestGate {
     ready: AtomicBool,
-    lock: Mutex<()>,
+    lock: tokio::sync::Mutex<()>,
 }
 
 impl InitialRequestGate {
+    #[cfg(test)]
     pub(crate) fn run<T, F>(&self, request: F) -> Result<T>
     where
-        F: FnOnce() -> Result<T>,
+        F: FnOnce() -> Result<T> + Send,
+        T: Send,
+    {
+        super::block_on(self.run_async(|| async { request() }))
+    }
+
+    pub(crate) async fn run_async<T, F, Fut>(&self, request: F) -> Result<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
     {
         if self.ready.load(Ordering::Acquire) {
-            return request();
+            return request().await;
         }
 
-        let guard = self.lock.lock().unwrap();
+        let guard = self.lock.lock().await;
         if self.ready.load(Ordering::Acquire) {
             drop(guard);
-            return request();
+            return request().await;
         }
 
-        let result = request();
+        let result = request().await;
         if result.is_ok() {
             self.ready.store(true, Ordering::Release);
         }
@@ -191,6 +204,7 @@ const DEFAULT_SUFFIX: &str = "vault.azure.net";
 impl AkvConfig {
     /// Builds Key Vault configuration from a full vault DNS host that the
     /// caller has already validated.
+    #[cfg(any(feature = "aac", test))]
     pub(crate) fn from_validated_vault_host(vault_host: String, auth: AuthMethod) -> Self {
         Self {
             vault_url: format!("https://{vault_host}/"),
@@ -260,6 +274,7 @@ impl TryFrom<&ProviderUrl> for AkvConfig {
 ///
 /// Stores and retrieves secrets from an Azure Key Vault instance.
 pub struct AkvProvider {
+    retry_policy: super::RetryPolicy,
     config: AkvConfig,
     /// Service-principal credentials supplied by the provider alias.
     credentials: ProviderCredentials,
@@ -310,7 +325,7 @@ pub(crate) fn resolve_azure_credential(
             ))
         })? as Arc<dyn TokenCredential>),
         AuthMethod::Env => {
-            let (tenant_id, client_id, client_secret) = service_principal_inputs(credentials);
+            let (tenant_id, client_id, client_secret) = service_principal_inputs(credentials)?;
 
             match classify_env_credentials(tenant_id, client_id, client_secret)? {
                 Some((tenant_id, client_id, client_secret)) => Ok(ClientSecretCredential::new(
@@ -342,12 +357,17 @@ pub(crate) fn resolve_azure_credential(
 
 fn service_principal_inputs(
     credentials: &ProviderCredentials,
-) -> (Option<String>, Option<String>, Option<String>) {
-    (
-        credential_or_env(credentials, TENANT_ID, AZURE_TENANT_ID_ENV),
-        credential_or_env(credentials, CLIENT_ID, AZURE_CLIENT_ID_ENV),
-        credential_or_env(credentials, CLIENT_SECRET, AZURE_CLIENT_SECRET_ENV),
-    )
+) -> Result<(Option<String>, Option<String>, Option<String>)> {
+    let text = |name, env| {
+        credential_or_env(credentials, name, env)
+            .map(|value| value.try_as_utf8().map(str::to_owned))
+            .transpose()
+    };
+    Ok((
+        text(TENANT_ID, AZURE_TENANT_ID_ENV)?,
+        text(CLIENT_ID, AZURE_CLIENT_ID_ENV)?,
+        text(CLIENT_SECRET, AZURE_CLIENT_SECRET_ENV)?,
+    ))
 }
 
 fn classify_env_credentials(
@@ -386,11 +406,8 @@ fn classify_env_credentials(
 crate::register_provider! {
     struct: AkvProvider,
     config: AkvConfig,
-    name: "akv",
-    description: "Azure Key Vault",
-    schemes: ["akv"],
-    examples: ["akv://myvault", "akv://myvault?auth=managed_identity", "akv://myvault?suffix=vault.azure.cn"],
-    credential_names: [TENANT_ID, CLIENT_ID, CLIENT_SECRET],
+    metadata: &super::catalog::AKV,
+    native_async: true,
 }
 
 impl AkvProvider {
@@ -400,6 +417,7 @@ impl AkvProvider {
             config,
             credentials: ProviderCredentials::new(),
             credential: None,
+            retry_policy: super::RetryPolicy::default(),
             client: OnceLock::new(),
             initial_request: InitialRequestGate::default(),
         }
@@ -407,6 +425,7 @@ impl AkvProvider {
 
     /// Creates a provider that reuses a credential resolved by another Azure
     /// provider.
+    #[cfg(any(feature = "aac", test))]
     pub(crate) fn with_token_credential(
         config: AkvConfig,
         credential: Arc<dyn TokenCredential>,
@@ -415,6 +434,7 @@ impl AkvProvider {
             config,
             credentials: ProviderCredentials::new(),
             credential: Some(credential),
+            retry_policy: super::RetryPolicy::default(),
             client: OnceLock::new(),
             initial_request: InitialRequestGate::default(),
         }
@@ -426,6 +446,7 @@ impl AkvProvider {
             config,
             credentials: ProviderCredentials::new(),
             credential: None,
+            retry_policy: super::RetryPolicy::default(),
             client: OnceLock::from(client),
             initial_request: InitialRequestGate::default(),
         }
@@ -538,7 +559,25 @@ impl AkvProvider {
     /// Creates a SecretClient for the configured vault.
     fn create_client(&self) -> Result<SecretClient> {
         let credential = self.resolve_credential()?;
-        SecretClient::new(&self.config.vault_url, credential, None).map_err(|e| {
+        SecretClient::new(
+            &self.config.vault_url,
+            credential,
+            Some(azure_security_keyvault_secrets::SecretClientOptions {
+                client_options: azure_core::http::ClientOptions {
+                    retry: azure_core::http::RetryOptions::exponential(
+                        azure_core::http::ExponentialRetryOptions {
+                            max_retries: self.retry_policy.max_attempts() - 1,
+                            initial_delay: azure_core::time::Duration::milliseconds(250),
+                            max_delay: azure_core::time::Duration::seconds(10),
+                            ..Default::default()
+                        },
+                    ),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        )
+        .map_err(|e| {
             SecretSpecError::ProviderOperationFailed(format!(
                 "Failed to create Azure Key Vault client for {}: {}",
                 self.config.vault_url,
@@ -575,7 +614,7 @@ impl AkvProvider {
         &self,
         name: &str,
         version: Option<&str>,
-    ) -> Result<Option<SecretString>> {
+    ) -> Result<Option<SecretBytes>> {
         let client = self.client()?;
         let options = version.map(|version| SecretClientGetSecretOptions {
             secret_version: Some(version.to_string()),
@@ -590,7 +629,7 @@ impl AkvProvider {
                         crate::error::display_error_chain(&e)
                     ))
                 })?;
-                Ok(secret.value.map(|v| SecretString::new(v.into())))
+                Ok(secret.value.map(SecretBytes::from_utf8))
             }
             Err(e) => {
                 if Self::is_not_found_error(&e) {
@@ -609,10 +648,11 @@ impl AkvProvider {
     /// Sets a secret's value by name. Azure Key Vault's SET operation always
     /// creates a new version if the secret already exists, so create and
     /// update share this one call.
-    async fn set_secret_async(&self, name: &str, value: &SecretString) -> Result<()> {
+    async fn set_secret_async(&self, name: &str, value: &SecretBytes) -> Result<()> {
+        let value = super::require_utf8("akv", value)?;
         let client = self.client()?;
         let params = SetSecretParameters {
-            value: Some(value.expose_secret().to_string()),
+            value: Some(value.to_string()),
             ..Default::default()
         };
         client
@@ -639,9 +679,15 @@ impl AkvProvider {
     }
 }
 
-impl Provider for AkvProvider {
-    /// Convention names use lowercase Base32 components so they remain
-    /// injective despite Azure Key Vault's restricted, case-insensitive names.
+impl super::ProviderBase for AkvProvider {
+    fn set_retry_policy(&mut self, policy: super::RetryPolicy) {
+        self.retry_policy = policy;
+    }
+
+    fn retry_ownership(&self) -> super::RetryOwnership {
+        super::RetryOwnership::Managed
+    }
+
     fn convention_address(
         &self,
         project: &str,
@@ -658,7 +704,7 @@ impl Provider for AkvProvider {
         self.credentials = credentials;
     }
 
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         Self::PROVIDER_NAME
     }
 
@@ -682,27 +728,32 @@ impl Provider for AkvProvider {
         self.config.vault_url.clone()
     }
 
-    /// An optional `version` pins the secret version to read.
     fn supported_coords(&self) -> &'static [&'static str] {
         &["version"]
     }
+}
 
-    fn get(&self, addr: Address<'_>) -> Result<Option<SecretString>> {
+#[async_trait::async_trait]
+impl super::AsyncProvider for AkvProvider {
+    async fn get(&self, addr: Address<'_>) -> Result<Option<SecretBytes>> {
         let coords = self.resolve_address(addr)?;
         self.initial_request
-            .run(|| super::block_on(self.get_secret_async(&coords.item, coords.version.as_deref())))
+            .run_async(|| async {
+                self.get_secret_async(&coords.item, coords.version.as_deref())
+                    .await
+            })
+            .await
     }
 
-    fn set(&self, addr: Address<'_>, value: &SecretString) -> Result<()> {
-        self.check_writable(addr)?;
+    async fn set(&self, addr: Address<'_>, value: &SecretBytes) -> Result<()> {
+        super::AsyncProvider::check_writable(self, addr).await?;
         let coords = self.resolve_address(addr)?;
         self.initial_request
-            .run(|| super::block_on(self.set_secret_async(&coords.item, value)))
+            .run_async(|| async { self.set_secret_async(&coords.item, value).await })
+            .await
     }
 
-    /// Native addresses are read-only: they name a secret managed outside
-    /// SecretSpec, and writing would mint a new version of it.
-    fn check_writable(&self, addr: Address<'_>) -> Result<()> {
+    async fn check_writable(&self, addr: Address<'_>) -> Result<()> {
         match addr {
             Address::Convention { .. } => Ok(()),
             Address::Native(_) => Err(SecretSpecError::ProviderOperationFailed(
@@ -741,7 +792,7 @@ mod tests {
             .map(|(name, value)| {
                 (
                     (*name).to_string(),
-                    SecretString::new((*value).to_string().into()),
+                    SecretBytes::from_utf8((*value).to_string()),
                 )
             })
             .collect()
@@ -834,6 +885,31 @@ mod tests {
         assert!(gate.ready.load(Ordering::Acquire));
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_async_gate_releases_a_cancelled_cold_request() {
+        let gate = Arc::new(InitialRequestGate::default());
+        let started = Arc::new(tokio::sync::Notify::new());
+        let worker_gate = Arc::clone(&gate);
+        let worker_started = Arc::clone(&started);
+        let first = tokio::spawn(async move {
+            worker_gate
+                .run_async(|| async {
+                    worker_started.notify_one();
+                    std::future::pending::<Result<()>>().await
+                })
+                .await
+        });
+        started.notified().await;
+        assert!(!gate.ready.load(Ordering::Acquire));
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(2), gate.run_async(|| async { Ok(()) }))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(gate.ready.load(Ordering::Acquire));
+    }
+
     #[test]
     fn test_format_secret_name() {
         let name = AkvProvider::format_secret_name("myapp", "prod", "DB_URL").unwrap();
@@ -913,14 +989,15 @@ mod tests {
         let _tenant = EnvVarGuard::set(AZURE_TENANT_ID_ENV, "tenant-from-env");
         let _client = EnvVarGuard::set(AZURE_CLIENT_ID_ENV, "client-from-env");
         let _secret = EnvVarGuard::set(AZURE_CLIENT_SECRET_ENV, "secret-from-env");
-        let mut provider = AkvProvider::new(config("akv://myvault"));
+        let mut provider =
+            SyncProviderAdapter::from_async(AkvProvider::new(config("akv://myvault")));
         provider.with_credentials(credentials(&[
             (TENANT_ID, "tenant-from-provider"),
             (CLIENT_SECRET, "secret-from-provider"),
         ]));
 
         assert_eq!(
-            service_principal_inputs(&provider.credentials),
+            service_principal_inputs(&provider.credentials).unwrap(),
             (
                 Some("tenant-from-provider".to_string()),
                 Some("client-from-env".to_string()),
@@ -930,9 +1007,26 @@ mod tests {
     }
 
     #[test]
+    fn non_utf8_service_principal_credential_fails_without_environment_fallback() {
+        let _lock = crate::tests::scrub_resolution_env();
+        let _tenant = EnvVarGuard::set(AZURE_TENANT_ID_ENV, "tenant-from-env");
+        let _client = EnvVarGuard::set(AZURE_CLIENT_ID_ENV, "client-from-env");
+        let _secret = EnvVarGuard::set(AZURE_CLIENT_SECRET_ENV, "secret-from-env");
+        for name in [TENANT_ID, CLIENT_ID, CLIENT_SECRET] {
+            let credentials = ProviderCredentials::from([(
+                name.into(),
+                SecretBytes::from_slice(b"private-credential\xff"),
+            )]);
+            let error = service_principal_inputs(&credentials).unwrap_err();
+            assert!(error.to_string().contains("UTF-8"));
+            assert!(!format!("{error:?}: {error}").contains("private-credential"));
+        }
+    }
+
+    #[test]
     fn registration_advertises_service_principal_credentials() {
         assert_eq!(
-            crate::provider::credential_names_for_spec("akv://myvault"),
+            crate::provider::credential_names_for_spec("akv://myvault").unwrap(),
             &[TENANT_ID, CLIENT_ID, CLIENT_SECRET]
         );
     }
@@ -993,15 +1087,17 @@ mod tests {
 
     #[test]
     fn test_uri_roundtrips_suffix() {
-        let p = AkvProvider::new(config("akv://myvault?suffix=vault.azure.cn"));
+        let p = SyncProviderAdapter::from_async(AkvProvider::new(config(
+            "akv://myvault?suffix=vault.azure.cn",
+        )));
         assert_eq!(p.uri(), "akv://myvault?suffix=vault.azure.cn");
     }
 
     #[test]
     fn test_uri_roundtrips_auth_and_suffix() {
-        let p = AkvProvider::new(config(
+        let p = SyncProviderAdapter::from_async(AkvProvider::new(config(
             "akv://myvault?auth=managed_identity&suffix=vault.azure.cn",
-        ));
+        )));
         assert_eq!(
             p.uri(),
             "akv://myvault?auth=managed_identity&suffix=vault.azure.cn"
@@ -1010,10 +1106,15 @@ mod tests {
 
     #[test]
     fn storage_identity_uses_effective_vault_url_without_auth() {
-        let public = AkvProvider::new(config("akv://myvault"));
-        let cli = AkvProvider::new(config("akv://myvault?auth=cli"));
-        let sovereign = AkvProvider::new(config("akv://myvault?suffix=vault.azure.cn"));
-        let sovereign_fqdn = AkvProvider::new(config("akv://myvault.vault.azure.cn"));
+        let public = SyncProviderAdapter::from_async(AkvProvider::new(config("akv://myvault")));
+        let cli =
+            SyncProviderAdapter::from_async(AkvProvider::new(config("akv://myvault?auth=cli")));
+        let sovereign = SyncProviderAdapter::from_async(AkvProvider::new(config(
+            "akv://myvault?suffix=vault.azure.cn",
+        )));
+        let sovereign_fqdn = SyncProviderAdapter::from_async(AkvProvider::new(config(
+            "akv://myvault.vault.azure.cn",
+        )));
 
         assert_eq!(public.storage_identity(), cli.storage_identity());
         assert_eq!(
@@ -1033,7 +1134,10 @@ mod tests {
         assert_eq!(config.vault_host, "shared.vault.azure.net");
 
         let credential: Arc<dyn TokenCredential> = DeveloperToolsCredential::new(None).unwrap();
-        let provider = AkvProvider::with_token_credential(config, Arc::clone(&credential));
+        let provider = SyncProviderAdapter::from_async(AkvProvider::with_token_credential(
+            config,
+            Arc::clone(&credential),
+        ));
         assert!(Arc::ptr_eq(
             &credential,
             &provider.resolve_credential().unwrap()
@@ -1064,7 +1168,7 @@ mod tests {
 
     #[test]
     fn test_convention_address() {
-        let p = AkvProvider::new(config("akv://myvault"));
+        let p = SyncProviderAdapter::from_async(AkvProvider::new(config("akv://myvault")));
         let coords = p.convention_address("proj", "default", "A").unwrap();
         assert_eq!(coords.item, "secretspec--obzg62q--mrswmylvnr2a--ie");
         assert_eq!(coords.field, None);
@@ -1072,7 +1176,7 @@ mod tests {
 
     #[test]
     fn version_coordinate_is_supported_and_distinguishes_entries() {
-        let p = AkvProvider::new(config("akv://myvault"));
+        let p = SyncProviderAdapter::from_async(AkvProvider::new(config("akv://myvault")));
         assert_eq!(p.supported_coords(), &["version"]);
 
         let first = crate::config::NativeAddress {
@@ -1101,8 +1205,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn native_reads_request_pinned_or_latest_version() {
+    #[tokio::test]
+    async fn native_async_reads_request_pinned_or_latest_version() {
         let transport = Arc::new(RecordingHttpClient::default());
         let credential = DeveloperToolsCredential::new(None).unwrap();
         let client = SecretClient::new(
@@ -1117,7 +1221,10 @@ mod tests {
             }),
         )
         .unwrap();
-        let provider = AkvProvider::with_client(config("akv://myvault"), client);
+        let provider = SyncProviderAdapter::from_async(AkvProvider::with_client(
+            config("akv://myvault"),
+            client,
+        ));
         let pinned_version = "0123456789abcdef0123456789abcdef";
 
         let pinned = crate::config::NativeAddress {
@@ -1125,15 +1232,21 @@ mod tests {
             version: Some(pinned_version.into()),
             ..Default::default()
         };
-        let value = provider.get(Address::Native(&pinned)).unwrap().unwrap();
-        assert_eq!(value.expose_secret(), "secret-value");
+        let value = super::super::AsyncProvider::get(provider.as_async(), Address::Native(&pinned))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(value.expose_secret(), b"secret-value");
 
         let latest = crate::config::NativeAddress {
             version: None,
             ..pinned
         };
-        let value = provider.get(Address::Native(&latest)).unwrap().unwrap();
-        assert_eq!(value.expose_secret(), "secret-value");
+        let value = super::super::AsyncProvider::get(provider.as_async(), Address::Native(&latest))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(value.expose_secret(), b"secret-value");
 
         assert_eq!(
             *transport.paths.lock().unwrap(),
@@ -1146,7 +1259,7 @@ mod tests {
 
     #[test]
     fn native_address_rejects_invalid_version_before_client_creation() {
-        let p = AkvProvider::new(config("akv://myvault"));
+        let p = SyncProviderAdapter::from_async(AkvProvider::new(config("akv://myvault")));
         for version in [
             "",
             "3",
@@ -1173,7 +1286,7 @@ mod tests {
     /// SecretSpec.
     #[test]
     fn native_address_is_read_only() {
-        let p = AkvProvider::new(config("akv://myvault"));
+        let p = SyncProviderAdapter::from_async(AkvProvider::new(config("akv://myvault")));
         let addr = crate::config::NativeAddress {
             item: "existing-secret".into(),
             version: Some("0123456789abcdef0123456789abcdef".into()),
@@ -1182,10 +1295,7 @@ mod tests {
         let refusal = p.check_writable(Address::Native(&addr)).unwrap_err();
         assert!(refusal.to_string().contains("read-only"), "{refusal}");
         let err = p
-            .set(
-                Address::Native(&addr),
-                &secrecy::SecretString::new("v".into()),
-            )
+            .set(Address::Native(&addr), &crate::SecretBytes::from_utf8("v"))
             .unwrap_err();
         assert_eq!(err.to_string(), refusal.to_string());
     }
@@ -1194,7 +1304,7 @@ mod tests {
     /// before any network I/O.
     #[test]
     fn native_address_rejects_field() {
-        let p = AkvProvider::new(config("akv://myvault"));
+        let p = SyncProviderAdapter::from_async(AkvProvider::new(config("akv://myvault")));
         let addr = crate::config::NativeAddress {
             item: "existing-secret".into(),
             field: Some("x".into()),
@@ -1209,7 +1319,7 @@ mod tests {
     /// I/O.
     #[test]
     fn native_address_rejects_invalid_azure_chars() {
-        let p = AkvProvider::new(config("akv://myvault"));
+        let p = SyncProviderAdapter::from_async(AkvProvider::new(config("akv://myvault")));
         let addr = crate::config::NativeAddress {
             item: "existing_secret".into(),
             ..Default::default()

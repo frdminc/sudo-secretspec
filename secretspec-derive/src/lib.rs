@@ -525,21 +525,24 @@ fn ir_field_type(field: &IrField) -> proc_macro2::TokenStream {
 /// ```ignore
 /// field_name: source.get("SECRET_NAME")
 ///     .ok_or_else(|| SecretSpecError::RequiredSecretMissing("SECRET_NAME".to_string()))?
-///     .expose_secret().to_string()
+///     .try_as_utf8_for("SECRET_NAME")?.to_string()
 /// ```
 ///
 /// For required PathBuf fields:
 /// ```ignore
 /// field_name: std::path::PathBuf::from(source.get("SECRET_NAME")
 ///     .ok_or_else(|| SecretSpecError::RequiredSecretMissing("SECRET_NAME".to_string()))?
-///     .expose_secret())
+///     .try_as_utf8_for("SECRET_NAME")?)
 /// ```
 ///
 /// For optional fields:
 /// ```ignore
-/// field_name: source.get("SECRET_NAME").map(|s| s.expose_secret().to_string())
-/// field_name: source.get("SECRET_NAME").map(|s| std::path::PathBuf::from(s.expose_secret()))
+/// field_name: source.get("SECRET_NAME").map(|s| s.try_as_utf8_for("SECRET_NAME").map(str::to_owned)).transpose()?
+/// field_name: source.get("SECRET_NAME").map(|s| s.try_as_utf8_for("SECRET_NAME").map(std::path::PathBuf::from)).transpose()?
 /// ```
+///
+/// A value that is not valid UTF-8 fails with `SecretSpecError::SecretNotText`
+/// naming the secret.
 fn generate_secret_assignment(
     field_name: &proc_macro2::Ident,
     secret_name: &str,
@@ -551,13 +554,17 @@ fn generate_secret_assignment(
         (true, true) => {
             // Optional PathBuf
             quote! {
-                #field_name: #source.get(#secret_name).map(|s| std::path::PathBuf::from(s.expose_secret()))
+                #field_name: #source.get(#secret_name)
+                    .map(|s| s.try_as_utf8_for(#secret_name).map(std::path::PathBuf::from))
+                    .transpose()?
             }
         }
         (true, false) => {
             // Optional String
             quote! {
-                #field_name: #source.get(#secret_name).map(|s| s.expose_secret().to_string())
+                #field_name: #source.get(#secret_name)
+                    .map(|s| s.try_as_utf8_for(#secret_name).map(str::to_owned))
+                    .transpose()?
             }
         }
         (false, true) => {
@@ -566,7 +573,7 @@ fn generate_secret_assignment(
                 #field_name: std::path::PathBuf::from(
                     #source.get(#secret_name)
                         .ok_or_else(|| secretspec::SecretSpecError::RequiredSecretMissing(#secret_name.to_string()))?
-                        .expose_secret()
+                        .try_as_utf8_for(#secret_name)?
                 )
             }
         }
@@ -575,7 +582,7 @@ fn generate_secret_assignment(
             quote! {
                 #field_name: #source.get(#secret_name)
                     .ok_or_else(|| secretspec::SecretSpecError::RequiredSecretMissing(#secret_name.to_string()))?
-                    .expose_secret()
+                    .try_as_utf8_for(#secret_name)?
                     .to_string()
             }
         }
@@ -780,7 +787,8 @@ mod secret_spec_generation {
     /// # Generated Code Example
     ///
     /// ```ignore
-    /// #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    /// #[derive(Debug, ::secretspec::__private::serde::Serialize, ::secretspec::__private::serde::Deserialize)]
+    /// #[serde(crate = "::secretspec::__private::serde")]
     /// pub struct SecretSpec {
     ///     pub database_url: String,
     ///     pub api_key: Option<String>,
@@ -791,7 +799,8 @@ mod secret_spec_generation {
         let fields = field_info.values().map(|info| info.generate_struct_field());
 
         quote! {
-            #[derive(Debug, serde::Serialize, serde::Deserialize)]
+            #[derive(Debug, ::secretspec::__private::serde::Serialize, ::secretspec::__private::serde::Deserialize)]
+            #[serde(crate = "::secretspec::__private::serde")]
             pub struct SecretSpec {
                 #(#fields,)*
             }
@@ -811,7 +820,8 @@ mod secret_spec_generation {
     /// # Generated Code Example
     ///
     /// ```ignore
-    /// #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    /// #[derive(Debug, ::secretspec::__private::serde::Serialize, ::secretspec::__private::serde::Deserialize)]
+    /// #[serde(crate = "::secretspec::__private::serde")]
     /// pub enum SecretSpecProfile {
     ///     Development {
     ///         database_url: String,
@@ -828,7 +838,8 @@ mod secret_spec_generation {
         profile_variants: &[proc_macro2::TokenStream],
     ) -> proc_macro2::TokenStream {
         quote! {
-            #[derive(Debug, serde::Serialize, serde::Deserialize)]
+            #[derive(Debug, ::secretspec::__private::serde::Serialize, ::secretspec::__private::serde::Deserialize)]
+            #[serde(crate = "::secretspec::__private::serde")]
             pub enum SecretSpecProfile {
                 #(#profile_variants,)*
             }
@@ -937,15 +948,17 @@ mod secret_spec_generation {
     /// The function:
     /// 1. Loads the SecretSpec configuration
     /// 2. Validates it with the given provider and profile
-    /// 3. Returns the validation result containing loaded secrets
+    /// 3. Converts the values and returns them with their temporary-file owners
     pub fn generate_load_internal() -> proc_macro2::TokenStream {
         quote! {
-            fn load_internal(
+            fn load_internal<T>(
                 provider_str: Option<String>,
                 profile_str: Option<String>,
                 reason: Option<String>,
                 caller: Option<secretspec::CallerContext>,
-            ) -> Result<secretspec::ValidatedSecrets, secretspec::SecretSpecError> {
+                prompt_missing: bool,
+                convert: impl FnOnce(&std::collections::HashMap<String, secretspec::SecretBytes>) -> Result<T, secretspec::SecretSpecError>,
+            ) -> Result<secretspec::Resolved<T>, secretspec::SecretSpecError> {
                 let mut spec = secretspec::Secrets::load()?;
                 // A typed loader expects the full generated struct shape, so an
                 // ambient `SECRETSPEC_SCOPE` must not silently narrow it below that
@@ -969,17 +982,7 @@ mod secret_spec_generation {
                 if let Some(caller) = caller {
                     spec = spec.with_caller(caller);
                 }
-                match spec.validate()? {
-                    Ok(valid_secrets) => Ok(valid_secrets),
-                    Err(validation_errors) if validation_errors.constraint_violations.is_empty() => {
-                        Err(secretspec::SecretSpecError::RequiredSecretMissing(
-                            validation_errors.missing_required.join(", ")
-                        ))
-                    }
-                    Err(validation_errors) => Err(secretspec::SecretSpecError::ValidationFailed(
-                        Box::new(validation_errors)
-                    ))
-                }
+                spec.load_typed(prompt_missing, convert)
             }
         }
     }
@@ -1033,16 +1036,11 @@ mod secret_spec_generation {
                     // The static `load` has no reason parameter; a reason is supplied
                     // via the SECRETSPEC_REASON env var (honored by `Secrets::load`)
                     // or through `SecretSpec::builder().with_reason(...)`.
-                    let validation_result = load_internal(provider_str, profile_str, None, None)?;
-
-                    let data = {
-                        let secrets = &validation_result.resolved.secrets;
-                        Self {
+                    load_internal(provider_str, profile_str, None, None, false, |secrets| {
+                        Ok(Self {
                             #(#load_assignments,)*
-                        }
-                    };
-
-                    Ok(validation_result.into_resolved(data))
+                        })
+                    })
                 }
 
                 pub fn set_as_env_vars(&self) {
@@ -1078,6 +1076,7 @@ mod builder_generation {
     ///     profile: Option<Box<dyn FnOnce() -> Result<Profile, String>>>,
     ///     reason: Option<String>,
     ///     caller: Option<secretspec::CallerContext>,
+    ///     prompt_missing: bool,
     /// }
     /// ```
     pub fn generate_struct() -> proc_macro2::TokenStream {
@@ -1087,6 +1086,7 @@ mod builder_generation {
                 profile: Option<Box<dyn FnOnce() -> Result<Profile, String>>>,
                 reason: Option<String>,
                 caller: Option<secretspec::CallerContext>,
+                prompt_missing: bool,
             }
         }
     }
@@ -1125,6 +1125,7 @@ mod builder_generation {
                         profile: None,
                         reason: None,
                         caller: None,
+                        prompt_missing: false,
                     }
                 }
 
@@ -1148,6 +1149,16 @@ mod builder_generation {
                 /// the `require_reason` policy.
                 pub fn with_caller(mut self, caller: secretspec::CallerContext) -> Self {
                     self.caller = Some(caller);
+                    self
+                }
+
+                /// Prompt for and store any missing required secrets interactively
+                /// instead of failing with `RequiredSecretMissing`, mirroring
+                /// `Secrets::ensure_secrets`. Only prompts when stdin is a real
+                /// terminal; otherwise falls back to the same error as when this
+                /// is left unset (the default).
+                pub fn prompt_missing(mut self, prompt_missing: bool) -> Self {
+                    self.prompt_missing = prompt_missing;
                     self
                 }
 
@@ -1272,21 +1283,16 @@ mod builder_generation {
                     let reason_str = self.reason.take();
                     let caller = self.caller.take();
 
-                    let validation_result = load_internal(
+                    load_internal(
                         provider_str,
                         profile_str,
                         reason_str,
                         caller,
-                    )?;
-
-                    let data = {
-                        let secrets = &validation_result.resolved.secrets;
-                        SecretSpec {
+                        self.prompt_missing,
+                        |secrets| Ok(SecretSpec {
                             #(#load_assignments,)*
-                        }
-                    };
-
-                    Ok(validation_result.into_resolved(data))
+                        }),
+                    )
                 }
 
                 pub fn load_profile(mut self) -> Result<secretspec::Resolved<SecretSpecProfile>, secretspec::SecretSpecError> {
@@ -1316,22 +1322,16 @@ mod builder_generation {
                         (profile_str, selected_profile)
                     };
 
-                    let validation_result = load_internal(
+                    load_internal(
                         provider_str,
                         profile_str,
                         reason_str,
                         caller,
-                    )?;
-
-                    let data_result: LoadResult<SecretSpecProfile> = {
-                        let secrets = &validation_result.resolved.secrets;
-                        match selected_profile {
+                        self.prompt_missing,
+                        |secrets| match selected_profile {
                             #(#load_profile_arms,)*
-                        }
-                    };
-                    let data = data_result?;
-
-                    Ok(validation_result.into_resolved(data))
+                        },
+                    )
                 }
             }
         }
@@ -1439,15 +1439,10 @@ fn generate_secret_spec_code(ir: CodegenIr) -> proc_macro2::TokenStream {
 
     // Combine all components
     quote! {
-        use ::secrecy::ExposeSecret;
-
         #secret_spec_struct
         #secret_spec_profile_enum
         #profile_code
 
-
-        // Type alias to help with type inference
-        type LoadResult<T> = Result<T, secretspec::SecretSpecError>;
 
         #load_internal
         #builder_code

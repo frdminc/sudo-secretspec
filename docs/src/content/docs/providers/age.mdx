@@ -3,13 +3,18 @@ title: age Provider
 description: Store secrets in an age-encrypted file committed alongside code
 ---
 
+import VersionCompatibility from '@cachix/site-kit/ui/VersionCompatibility.astro';
+
 import ProviderCredentials from '../../../components/ProviderCredentials.astro';
 
-:::note[Version compatibility]
-The age provider is added in SecretSpec 0.17.
-:::
+<VersionCompatibility version="0.17" />
 
-The age provider keeps secrets in a single [age](https://age-encryption.org)-encrypted file that you can commit to your repository. The plaintext inside is a dotenv-style `KEY=value` blob that SecretSpec encrypts to one or more age recipients and decrypts with your age identity. A read decrypts the blob; a write decrypts it, updates one key, and re-encrypts the whole blob to the current recipients.
+The [age](https://age-encryption.org) provider keeps secrets in a single
+age-encrypted file that you can commit to your repository. The plaintext inside
+is a dotenv-style `KEY=value` blob that SecretSpec encrypts to one or more age
+recipients and decrypts with your age identity. A read decrypts the blob; a
+write decrypts it, updates one key, and re-encrypts the whole blob to the
+current recipients.
 
 ## At a glance
 
@@ -96,7 +101,9 @@ post-quantum protection.
 
 ## Configuration
 
-### Discover declarations (0.18+)
+### Discover declarations {/* #discover-declarations-018 */}
+
+<VersionCompatibility version="0.18" />
 
 SecretSpec 0.18+ can initialize a manifest from the key names already in an
 age file. Reflection decrypts the file in memory to enumerate its keys but

@@ -9,6 +9,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `secretspec config show` displays computed project and global configuration,
+  including CLI and environment overrides, each setting's source, and merged
+  provider aliases. Use `--json` for structured output. No secrets are fetched;
+  `config global show` continues to display saved user-global configuration.
+
+- `secretspec run --config-env=clear` removes the manifest, profile, provider,
+  scope, and reason environment overrides from the spawned child. The default,
+  `--config-env=inherit`, preserves existing inheritance behavior.
+
+- `secretspec run` now masks exact secret values in command stdout and stderr
+  automatically, including file contents for `as_path` secrets. Filtering uses
+  pipes, which can change terminal detection and buffering in interactive programs.
+  Rust embedders can use `Redactor` and independent `RedactionStream`s to filter
+  their own output. `ValidatedSecrets::redactor` builds a filter from the same
+  validation snapshot, including original file contents and hidden inputs.
+
+- Rust integrations can implement the awaitable `AsyncProvider` trait or use
+  `AsyncProviderAdapter` to call existing providers without blocking async tasks.
+  `SyncProviderAdapter` exposes native async backends to the existing sync API;
+  `ProviderBase` carries their shared configuration and identity.
+  Async SDK, HTTP, and external IPC providers implement the trait directly,
+  retaining batch reads, metadata, authentication, and retry behavior. The
+  async URI factory selects native implementations automatically, and its boxed
+  providers can be passed to `SyncProviderAdapter`. External IPC sessions remain
+  usable across async and sync calls and after the caller's runtime is dropped.
+
+- Bitwarden Password Manager can load its `session` credential from another
+  provider, such as keyring, instead of requiring `BW_SESSION` in the shell.
+
+- Proton Pass refs accept `field` to read any field of an existing item, such
+  as `ref = { item = "test-item", field = "password" }` for a login's
+  password, a custom field, or `Section.field`. Refs with a `field` are
+  read-only, because `pass-cli` can only update a field by taking its value as
+  a command-line argument, visible to other local users in the process list.
+
+- Select the profile for `secretspec import` with `--profile` or `-P`,
+  including when moving secrets with `--delete-source`.
+
+- Pin static binary installations using a version in the installer URL, such
+  as `https://install.secretspec.dev/v0.21.1`. The URL without a version still
+  installs the latest release.
+
+- Generate passphrases, BIP-39 mnemonics, WireGuard private keys, signing JWKs,
+  age identities, and self-signed P-256 X.509 identities. Derive keys,
+  certificates, chains, and password-protected PKCS#12 archives from a declared
+  identity with `from`, `format`, and `credentials`, or select JSON/INI fields
+  from another declared secret with `from` and `extract`. Dependencies resolve
+  in order and scopes include hidden inputs without exposing their values.
+
+- Provider reads now retry recognized transient failures with bounded exponential
+  backoff, including CLI providers such as BWS. Set `[defaults.retry].max_attempts`
+  in user configuration or use `Secrets::with_retry_policy` in Rust to control
+  the attempt budget; one attempt disables retries. Safe Doppler value writes
+  also retry, while other mutations are not replayed by the shared wrapper.
+
+- `secretspec init` now adds the project schema directive to the top of new
+  manifests, enabling editor autocomplete and structural validation.
+
+- **Elixir SDK (0.22+)** (`secretspec-ex`) adds a pure Elixir client for
+  `secretspec.resolver/1`. It launches `secretspec serve` directly and requires
+  a compatible SecretSpec executable.
+
 - `skills/sudo-secretspec/scripts/secrets-collect.py` gained `--yes` for agents
   without a terminal: with `--clipboard` it takes one secret per run from the
   clipboard, requires an exact length, refuses stale or already-consumed
@@ -19,12 +81,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The sentinel carries the date, time and zone, and the error adds its age;
   if the value was copied before the stamp, re-collect both names.
   A run that stored but could not clear the clipboard exits 3 instead of 0.
+
 - `skills/sudo-secretspec/scripts/secrets-collect.py` gained `--declare`: it
   declares each name that is not already in the runtime manifest
   (`add --optional`) before storing, leaving already-declared names as-is.
   Storing into an undeclared name used to fail part-way through the store loop
   with `broker: Secret 'NAME' is not defined in profile 'default'`; that error
   now also names the fix (`add NAME --optional`, or re-run with `--declare`).
+
 - `sudo-secretspec` builds and runs on NixOS (Linux). Per-OS paths, the service
   identity rules and compile-time overrides (`SUDO_SECRETSPEC_SUDO`,
   `SUDO_SECRETSPEC_BROKER_PATH`, `SUDO_SECRETSPEC_CONFIG_PATH`) live in one
@@ -32,55 +96,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `restore` and the other broker-backed commands work through the same
   `sudo` + sudoers boundary. `install`, `uninstall`, `rollback` and `doctor`
   are macOS-only and refuse on Linux, pointing at the NixOS module.
+
 - A Nix flake (`flake.nix`) with `packages.<system>.sudo-secretspec` and
   `nixosModules.default` (`services.sudo-secretspec`), which declares the
   `sudo-secretspec` service user, the immutable broker store path (baked in at
   compile time, not a `/run` symlink), the vault under `/var/lib`, the
   root-owned `/etc/sudo-secretspec.toml` and the NOPASSWD sudoers rules.
 
-### Fixed
+- **SQLite provider** (`sqlite://`, 0.22+): stores each secret as one row in a
+  local SQLite database, behind a new `sqlite` feature (enabled by default).
+  Confidentiality comes entirely from filesystem permissions on the database
+  file, so identical code serves an ordinary user-owned store and a
+  privilege-boundary vault file with no code difference between them. Opt into
+  `?history=true` and every `set` and `delete` is retained in a hash-chained
+  history inside the same database, so a previous value can be recovered later.
+  Each entry binds the *digest* of every value rather than its bytes, which is
+  what lets a value be destroyed outright while the entry still proves what was
+  destroyed and when.
 
-- Concurrent opens of a history-enabled sqlite vault no longer fail with
-  `trigger … already exists` while finishing the schema. The open path used to
-  drop and recreate the append-only / write-once triggers without a write
-  transaction, so two connections could interleave and the second create
-  would lose the race. That batch now runs inside a single `BEGIN IMMEDIATE`
-  transaction so a concurrent opener waits on the busy timeout and sees the
-  finished triggers, and a failed finish rolls back rather than leaving a
-  partial trigger set.
-- `set`, `get`, and `delete` on a name that is not declared in the active
-  profile no longer print a garbled, doubly-quoted error such as
-  `Secret 'Secret 'NAME' is not defined in profile 'default' ...' not found`.
-  The message now reads once, still naming the available secrets. The
-  non-zero exit status this already returned is unchanged.
-- `install --adopt-existing` no longer refuses a vault that has already
-  migrated to the sqlite-only secret store. It required a legacy `.env` file
-  to exist even though `.env` has been vestigial since values moved into
-  `secrets.db`, so adopting (and therefore upgrading) a fully migrated vault
-  was refused with "adopted runtime file missing or symlinked: .../.env".
-  `.env` is now optional on adoption, matching how the broker itself already
-  treats it; a present `.env` still must be a real file, never a symlink.
-- Deleting or destroying a secret now erases its plaintext from the database
-  file instead of leaving it readable on a freed page. SQLite's
-  `secure_delete` is a per-connection setting that is off by default in the
-  library this build links, so removing a value only unlinked it from the
-  index while its bytes stayed on disk until something happened to overwrite
-  them — meaning `destroy`, whose purpose is to make a value unrecoverable,
-  did not. Every connection the vault and the broker open now enables it.
-  Note this applies to values removed from now on: plaintext already left
-  behind by an earlier delete stays until the database is compacted with
-  `VACUUM`.
-- The installed sudoers policy no longer lets an unattended `restore --all`
-  bypass authentication. Its NOPASSWD grant for `source-restore` used a `--*`
-  wildcard that also matched `--all`, so a whole-vault restore ran with no
-  prompt even though `--force` restores already required one. `--all` now
-  goes through the same auth-gated verb `--force` does.
-- `source-destroy` can now destroy the captured copies of a name that has no
-  live value left. It previously refused, to avoid tombstoning those copies
-  against an unrelated history entry — the copies were destroyed either way,
-  but the ledger recorded the wrong event as having destroyed them. It now
-  appends a history entry for the destroy itself, so the tombstones name the
-  event that actually caused them.
+- The privileged broker keeps an append-only, hash-chained history of the vault
+  manifest (`secretspec.toml`) in `broker-history.sqlite3`, verifiable with
+  `audit-verify`. Every mutating operation already copied the manifest aside
+  before touching it and deleted that copy on success; the copy is now archived
+  instead, so the declarations in force before any past change can be recovered.
+  A failed archive does not fail the operation — the mutation has already
+  committed — it leaves the copy on disk rather than losing it.
+
+- `sudo-secretspec install` reports the version it moved the boundary through
+  (`0.19.1-sudo.12 -> 0.19.1-sudo.13`, or `(reinstalled, unchanged)`) and the
+  media it installed from. Previously the success line was identical whether
+  the boundary had been upgraded or not, so confirming an upgrade meant
+  separately running `--version`.
+
+- `sudo-secretspec doctor` reports a build staged by the package manager but
+  never installed as the new advisory `UPGRADE_AVAILABLE`, naming the path to
+  run. Advisory, so it never fails `doctor`.
+
+- The protected config records the installer's `version`. Configs written by
+  earlier installers parse unchanged; until the first install that writes it,
+  `doctor` reports no upgrade rather than guessing at one.
+
+- A hash-chained history store (`broker-history.sqlite3`) behind the privilege
+  boundary in the vault, recording pre-mutation snapshots of the manifest and
+  secret values. Entries chain over metadata and per-value SHA-256 digests
+  rather than raw secret bytes, allowing individual values to be destroyed
+  later while keeping the history chain verifiable and tamper-evident. The
+  store shares the audit ledger's hardening (0600 mode, ownership verification,
+  and inode swap detection).
+
+- The broker now archives pre-mutation copies of the manifest and dotenv into
+  the vault history store on every mutation (`set`, `add`, `delete`,
+  `undeclare`) instead of deleting them on commit. If archiving fails after a
+  mutation commits, the operation succeeds and rollback copies are preserved
+  in the vault for recovery and reported by `doctor`. History listings verify
+  the hash chain on read and report entry metadata without exposing secret
+  values or digests.
 
 ### Changed
 
@@ -90,6 +160,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   store is a large risk to carry for a path nothing takes. A vault written by a
   *newer* version is refused too, rather than being written to by a build that
   does not understand it.
+
 - A destroyed history snapshot can no longer become restorable again. Setting a
   secret back to a value it previously held recreated the exact stored copy
   `destroy` had removed, and because snapshots referred to their bytes by
@@ -102,8 +173,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   snapshot is at fault, if it finds a destroyed snapshot that still holds its
   plaintext or a live one whose bytes are missing, rather than guessing which
   of the two records is right.
+
 - History rows can no longer be deleted, and a destroyed snapshot cannot be
   re-attributed to a different event once recorded.
+
 - The vault stores each distinct captured value once instead of repeating its
   plaintext in every history snapshot. History captures every secret on every
   operation, so the stored copies previously grew with entries x secrets. The
@@ -112,53 +185,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   verification are unaffected. Values are kept separately per secret name, so
   destroying one name never reaches another name's history even when the two
   hold the same value.
+
 - `source-restore`, `source-restore-force` and `source-destroy` no longer create
   an empty `secrets.db` when the vault has none. They refuse as before, but on
   the way out they used to leave a schema-less database behind.
+
 - `doctor` no longer fails because some unrelated file named `sudo-secretspec`
   sits on the caller's `PATH`. Only an executable regular file can shadow the
   installed client, which is what a shell would actually run; a non-executable
   file or a directory of that name is now ignored rather than treated as a hard
   stop.
+
 - A mutating operation that fails on a freshly installed boundary now reports a
   clean rollback rather than an unknown outcome. Its pre-state — no vault
   database yet — is known, and rolling back removes what the failed operation
   created.
+
 - A mutation that fails while taking its rollback copies no longer leaves the
   copy it had already made behind for the operator to find and judge.
+
 - The `sqlite` provider now enforces foreign keys, so a captured value can no
   longer reference a history entry that does not exist.
+
 - `undeclare` now takes the same rollback copy of the runtime manifest that
   every other mutating broker operation takes. It wrote the file directly, so an
   interrupted or failing write could leave the manifest truncated with no copy
   to restore it from — the one operation where that loss was unrecoverable.
+
 - The privileged broker now enables the `sqlite://` provider's history
   retention (`?history=true`). Without it the vault database held no history
   tables at all, so `restore` could never return anything and `destroy` removed
   the live value *before* failing on the missing tables — turning the absent
   feature into a path to irrecoverable loss.
+
 - `destroy` now tombstones the captured history it was meant to. It matched the
   bare secret name against `captured_values.item`, which holds the provider's
   full `{project}/{profile}/{key}` address, so it updated no rows and reported
   success while every captured copy of the value stayed readable.
+
 - `restore` now finds the values it is asked for. `captured_values.item` holds
   the provider's full `{project}/{profile}/{key}` address while `--name` and the
   write-back both speak bare secret names, so `restore --name` matched nothing
   and `restore --all` fed full addresses back in as if they were names. The
   translation now happens in one place.
+
 - The privileged broker links the `sqlite` provider feature. Its provider URI is
   a `sqlite://` one, so a build without the feature registered no backend and
   every operation failed with "Provider backend 'sqlite' not found".
+
 - `restore` no longer replaces a captured value that is not valid UTF-8 with an
   empty string, which would have overwritten a live secret with `""` and
   reported success. It refuses instead. Two query paths that could panic or
   silently yield nothing now report the error.
+
 - The per-invocation vault integrity gate now checks `secrets.db`, the store
   values actually live in, for symlinking, ownership, and mode `0600`. It
   checked only `secretspec.toml` and the now-retired `.env`, so the value store
   was unguarded. `secrets.db` and `.env` are checked when present rather than
   required, so a fresh vault without a database, or one whose retired `.env`
   has been removed, no longer refuses every operation.
+
 - The engine's JSONL audit log is written inside the vault instead of under a
   home directory nothing may write. Every operation previously warned
   "Operation not permitted" and dropped its audit event.
@@ -168,6 +254,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with an error. This is the state the optional `declarations` field was
   introduced for: on a host whose tracked declarations file has been retired,
   the check previously could never pass, which left `doctor` permanently red.
+
 - `undeclare` now proceeds when the root-owned config omits `declarations`,
   instead of refusing. A name cannot belong to a tracked template that does not
   exist, so nothing was being protected; refusing left the runtime manifest
@@ -175,131 +262,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   remove. A `declarations` path that *is* configured but cannot be read or
   parsed still fails closed, unchanged.
 
-### Changed
-
 - The privileged broker no longer requires `root` execution for mutation operations (`set`, `add`, `delete`, `undeclare`, etc.). These operations now execute securely as the dedicated `service_user` via `sudo -u`, dropping all incidental root privileges and strictly restricting the broker to the ownership bounds of its own vault directory.
+
 - `sudo-secretspec` sudoers policy generation updated to bind operator mutations exactly to `({service_user})` instead of `(root)`.
-
-### Added
-
-- **SQLite provider** (`sqlite://`, 0.20+): stores each secret as one row in a
-  local SQLite database, behind a new `sqlite` feature (enabled by default).
-  Confidentiality comes entirely from filesystem permissions on the database
-  file, so identical code serves an ordinary user-owned store and a
-  privilege-boundary vault file with no code difference between them. Opt into
-  `?history=true` and every `set` and `delete` is retained in a hash-chained
-  history inside the same database, so a previous value can be recovered later.
-  Each entry binds the *digest* of every value rather than its bytes, which is
-  what lets a value be destroyed outright while the entry still proves what was
-  destroyed and when.
-- The privileged broker keeps an append-only, hash-chained history of the vault
-  manifest (`secretspec.toml`) in `broker-history.sqlite3`, verifiable with
-  `audit-verify`. Every mutating operation already copied the manifest aside
-  before touching it and deleted that copy on success; the copy is now archived
-  instead, so the declarations in force before any past change can be recovered.
-  A failed archive does not fail the operation — the mutation has already
-  committed — it leaves the copy on disk rather than losing it.
-- The `secretspec` crate gains a `codegen-schema` feature, which exposes JSON
-  Schema emission from a manifest without enabling the full `cli` feature. It
-  exists for the same reason as `manifest-edit`: the privilege boundary needs
-  the emitter and must not pull `clap` and `inquire` into a root-privileged
-  process. Enabling `cli` turns it on, so nothing changes for existing users.
-- **Azure App Configuration provider** (`aac://`, 0.20+): select direct
-  values and Azure Key Vault references by label, prefix, and tags, with Entra
-  ID or connection-string authentication and guarded writes, deletion, and
-  declaration discovery. Azure Key Vault references can pin an exact secret
-  version, cached-route validation compares canonical vault endpoints
-  independently of authentication choice, and discovery rejects ambiguous or
-  invalid convention keys. HTTP redirects are rejected so reads and
-  secret-bearing writes remain confined to the configured store endpoint.
-- The Rust SDK can describe secrets without TOML through the public `Spec`,
-  `SpecBuilder`, `Profile`, and `Secret` API. TOML parsing and code generation
-  use the same validated model, so Rust-first and file-backed projects share
-  inheritance, generation, and provider behavior, including profile-level
-  requiredness defaults and explicit opt-outs from inherited path, prompt, and
-  generation settings. Existing specs can be copied or consumed back into a
-  builder to add, replace, or remove declarations before rebuilding a validated
-  spec. This validated declaration API replaces the previously exposed raw
-  configuration and code-generation implementation types. Custom provider
-  implementations should now return declarations such as
-  `Secret::required(...)` from `Provider::reflect` instead of constructing raw
-  configuration secrets.
-- Structured caller context lets CLI and SDK integrations identify the invoking
-  software, version, operation, and non-secret resource independently of the
-  user-supplied access reason. Audit records and providers receive the context,
-  but it never satisfies the `require_reason` policy.
-- A secret's declared `description` now reaches the generated JSON Schema as
-  a `description` key on its property. [quicktype](https://quicktype.io)
-  turns that into a native docstring in every target language, so SDKs
-  generated from a manifest carry the same descriptions the manifest already
-  declares, instead of losing them at the schema boundary.
-- The Fly.io `fly` provider publishes and deletes application secrets with
-  `secretspec set` and `secretspec delete`, and discovers their names with
-  `init --from`. Fly.io never exposes plaintext secret values, so the provider
-  clearly rejects read operations and CLI guidance recommends only supported
-  workflows. Writes keep values off process arguments by streaming them to
-  `flyctl secrets set` over stdin, refuse boundary whitespace that `flyctl`
-  would silently trim, and scrub ambient Fly token variables before injecting
-  the token selected through the provider credential mechanism.
-- `secretspec completions <shell>` generates completion scripts for Bash,
-  Elvish, Fish, Nushell, PowerShell, and Zsh directly from the CLI definition,
-  including descriptions and contextual suggestions for profiles, scopes,
-  secret names, providers, aliases, paths, and commands. Completion reads
-  configuration metadata only; it never queries providers or reads secret
-  values.
-- OnePassword: a batch resolution no longer degrades to per-secret `op read`
-  calls when some referenced items don't exist. The provider now identifies
-  missing items with one `op item list` per vault and retries the batch once
-  without them (measured: 153-secret resolve with 3 missing items dropped
-  from ~32s to ~6s). Authentication and unavailable-CLI errors during batch
-  resolution now fail immediately instead of retrying every secret
-  individually.
-- OnePassword optional references whose item names resemble authentication
-  diagnostics are omitted as missing instead of aborting batch resolution.
-
-- `sudo-secretspec install` reports the version it moved the boundary through
-  (`0.19.1-sudo.12 -> 0.19.1-sudo.13`, or `(reinstalled, unchanged)`) and the
-  media it installed from. Previously the success line was identical whether
-  the boundary had been upgraded or not, so confirming an upgrade meant
-  separately running `--version`.
-- `sudo-secretspec doctor` reports a build staged by the package manager but
-  never installed as the new advisory `UPGRADE_AVAILABLE`, naming the path to
-  run. Advisory, so it never fails `doctor`.
-- The protected config records the installer's `version`. Configs written by
-  earlier installers parse unchanged; until the first install that writes it,
-  `doctor` reports no upgrade rather than guessing at one.
-- A hash-chained history store (`broker-history.sqlite3`) behind the privilege
-  boundary in the vault, recording pre-mutation snapshots of the manifest and
-  secret values. Entries chain over metadata and per-value SHA-256 digests
-  rather than raw secret bytes, allowing individual values to be destroyed
-  later while keeping the history chain verifiable and tamper-evident. The
-  store shares the audit ledger's hardening (0600 mode, ownership verification,
-  and inode swap detection).
-- The broker now archives pre-mutation copies of the manifest and dotenv into
-  the vault history store on every mutation (`set`, `add`, `delete`,
-  `undeclare`) instead of deleting them on commit. If archiving fails after a
-  mutation commits, the operation succeeds and rollback copies are preserved
-  in the vault for recovery and reported by `doctor`. History listings verify
-  the hash chain on read and report entry metadata without exposing secret
-  values or digests.
-
-### Added
-
-- `Spec` can perform format-preserving single-declaration edits on the document
-  it was loaded from. `add_secret_to_text` and `remove_secret_from_text` return
-  a new fully revalidated `Spec` whose text differs only by that declaration,
-  leaving comments, key order, quoting, and unrepresented syntax byte for byte
-  intact; `declares_secret_in_text` reports whether a name is declared in this
-  document rather than inherited; `preserved_text` exposes the exact backing
-  text, and `to_toml` renders freshly formatted TOML for any spec, including one
-  built with `Spec::builder`, which has no backing text. Adding a declaration
-  and then removing it restores the original bytes, so tools that compare
-  manifests byte for byte can rely on the undo. A spec that inherits through
-  `project.extends` keeps its own root document as the preserved text and is
-  revalidated against its parents on every edit, so inherited declarations are
-  never inlined into the child file.
-
-### Changed
 
 - `sudo-secretspec install` now adopts the vault named by the installed
   root-owned config without `--adopt-existing`, announcing on stderr which
@@ -311,26 +276,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   secrets. The refusal for a fresh install onto an existing boundary now prints
   the full command that adopts it instead of only naming the missing flag.
 
-- Dotenv parsing and rendering now use dotenv-ng throughout the dotenv
-  provider, age-encrypted dotenv blobs, and `secretspec export --format
-  dotenv`. Values containing `$` remain literal, output uses only the quoting
-  needed to round-trip, and bcrypt-style strings containing `$2a$10$...` are
-  no longer corrupted while reading ([#73]). Dotenv keys may include hyphens,
-  leading digits, leading dots, and Unicode. Whitespace, `=`, `#`, and control
-  characters remain invalid in keys.
-
-  [#73]: https://github.com/cachix/secretspec/issues/73
-
-- Provider behavior, configuration, and supported URIs remain unchanged after
-  reorganizing the shared provider infrastructure into focused modules.
-- Applying an active profile preserves each provider's public URI and
-  storage/cache identities, so profile-aware native references continue to
-  match the same provider during planning and resolution.
-
 - `sudo-secretspec install --dry-run` now resolves and validates the source
   media, which it previously skipped entirely — the checks ran only after the
   dry-run had already returned, so a dry run could not report the most likely
   problem with an install.
+
 - An install that would copy the installed boundary onto itself, or that names
   incomplete source media, is now refused *before* elevating rather than after.
   Previously the operator paid an interactive authentication prompt to be told
@@ -345,6 +295,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hosts need had no CLI path to being optional short of hand-editing the
   manifest — and in a profile whose defaults set `required = false`, no path
   to being required either.
+
 - `sudo-secretspec schema --reason <why>` emits a JSON Schema of the runtime
   manifest's typed shape (declared names and whether each is required) to
   stdout. It reads no secret values, and emits no descriptions — the schema
@@ -355,15 +306,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   NOTE: unlike `template-check`, this needs a boundary reinstall — the older
   broker has no `source-schema` operation.
 
-
 - Downstream `sudo-secretspec` privilege-boundary companion: a single Rust
   binary with mediated credential operations, fail-closed SQLite audit,
   metadata-only doctor/drift checks, explicit install/adopt/rollback, and
   Homebrew packaging that never performs privileged installation side effects.
+
 - Short install UX: `sudo-secretspec install` / `install --adopt-existing`
   with declaration auto-detection and TTY prompts; long flags are overrides.
-- Fork docs: `sudo-secretspec/README.md`, `README.downstream.md`, `FORK-AI.md`.
 
+- Fork docs: `sudo-secretspec/README.md`, `README.downstream.md`, `FORK-AI.md`.
 
 - The project moved from `djbclark/sudo-secretspec` to
   `frdminc/sudo-secretspec`, and its Homebrew tap from
@@ -400,6 +351,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   installer created — an adopted account may have other dependents, so it is
   reported rather than deleted. Both are settled before anything is removed, so
   a refusal cannot arrive part-way through.
+
 - The generated sudoers policy now sets `timestamp_timeout=0` on the installed
   client path, so `install` and `rollback` require interactive authentication
   every time. Previously the gate was sudo's shared timestamp — five minutes by
@@ -409,6 +361,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   credential operations are unaffected: they run through the NOPASSWD broker
   path and never prompt. **Run `sudo-secretspec install --adopt-existing` to
   apply this to an existing policy.**
+
 - `sudo-secretspec doctor` now checks which `sudo-secretspec` would actually
   run, not only whether the installed one is intact. A different binary found on
   the executable search path is reported as `CLIENT_SHADOWED` and fails the
@@ -419,6 +372,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The client passes its own search path to the privileged check, since `sudo`
   replaces `PATH` with the policy's `secure_path`; a fixed list of standard
   directories is always scanned, so this can only widen the check.
+
 - `sudo-secretspec doctor` now reports neighbouring drop-ins in
   `/etc/sudoers.d` that are not doing what their owner expects. Three advisory
   codes, because sudo and `visudo -c` disagree about what is acceptable and the
@@ -445,8 +399,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ignored by sudo — its rules are live — even though `visudo -c` complains
   about it.
 
-### Changed
-
 - `sudo-secretspec add` and `undeclare` now edit the runtime manifest through
   the public `Spec` text API, so each edit is revalidated as a whole document:
   a declaration that would not load is refused before anything is written to
@@ -457,6 +409,110 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   restores the document byte for byte.
 
 ### Fixed
+
+- Scaleway: `secretspec set` on a secret that already exists adds a new version
+  instead of failing with HTTP 400 "cannot have same secret name in same path".
+
+- KDBX saves use the correct `DeletionTime` XML element, keeping databases
+  compatible with KeePass clients that strictly validate deletion metadata.
+
+- IPC writes of X.509 identities decode their declared text encoding before
+  storage, so protected and unprotected archives round-trip without corruption.
+
+- Imported X.509 identities accept self-issued certificates signed by a distinct
+  issuer with the same name and preserve supplementary Unicode in certificate
+  subjects for both leaf and issuer certificates when exporting PKCS#12,
+  including in builds using published dependencies.
+  Scoped explanations redact hidden derivation
+  source names.
+
+- X.509 identity generation, validation, and PKCS#12 conversion no longer
+  build or require OpenSSL. PKCS#12 passwords currently support the Unicode Basic
+  Multilingual Plane; unsupported characters produce a clear credential error.
+
+- Stored X.509 identities and their derived secrets retain credential expiry
+  and refresh deadlines so SDK consumers refresh them when their inputs change.
+
+- Secret declarations now warn about ignored unknown fields, with a suggestion
+  to use `composed` when `compose` is misspelled and a note that the field may
+  be supported in a newer version. Unknown fields remain accepted for
+  compatibility with manifests from newer versions.
+
+- IPC v1 now keeps timestamps, durations, retry delays, expiry values, and
+  counts within the JSON integer range that JavaScript clients can represent
+  exactly. Values outside that range are rejected instead of being rounded.
+  Far-future client deadlines are clamped before initialization, calls, and
+  shutdown so their requests remain interoperable. Very long cache `max_age`
+  values are clamped the same way, so expiring writes to external providers
+  and cached results from `secretspec serve` keep working.
+
+- Rust IPC clients now accept additional response, result, and error-data
+  members from later compatible v1 peers, while requests remain strict.
+
+- The C resolver client now accepts additional members in a later compatible
+  v1 server's initialization result, including its `server`, `limits`, and
+  `application` objects, instead of failing to open the session. The client's
+  own initialization offer is still validated strictly.
+
+- `ResolvedSecret` now redacts its value in `Debug` output, so logging a
+  `ResolveResponse` or `NamedResolution` with `{:?}` no longer prints secret
+  values. File paths and provenance remain visible.
+
+- The Rust library no longer panics when AWS, Google Cloud, Azure, Doppler,
+  Infisical, Cloudflare, Scaleway, Setec, or external providers are used from
+  inside a current-thread Tokio runtime, such as
+  `#[tokio::main(flavor = "current_thread")]` or `#[tokio::test]`.
+
+- `secretspec check` no longer leaves decrypted `as_path` secret files in the
+  temporary directory. It never printed their paths, so nothing could use
+  them.
+
+- Concurrent opens of a history-enabled sqlite vault no longer fail with
+  `trigger … already exists` while finishing the schema. The open path used to
+  drop and recreate the append-only / write-once triggers without a write
+  transaction, so two connections could interleave and the second create
+  would lose the race. That batch now runs inside a single `BEGIN IMMEDIATE`
+  transaction so a concurrent opener waits on the busy timeout and sees the
+  finished triggers, and a failed finish rolls back rather than leaving a
+  partial trigger set.
+
+- `set`, `get`, and `delete` on a name that is not declared in the active
+  profile no longer print a garbled, doubly-quoted error such as
+  `Secret 'Secret 'NAME' is not defined in profile 'default' ...' not found`.
+  The message now reads once, still naming the available secrets. The
+  non-zero exit status this already returned is unchanged.
+
+- `install --adopt-existing` no longer refuses a vault that has already
+  migrated to the sqlite-only secret store. It required a legacy `.env` file
+  to exist even though `.env` has been vestigial since values moved into
+  `secrets.db`, so adopting (and therefore upgrading) a fully migrated vault
+  was refused with "adopted runtime file missing or symlinked: .../.env".
+  `.env` is now optional on adoption, matching how the broker itself already
+  treats it; a present `.env` still must be a real file, never a symlink.
+
+- Deleting or destroying a secret now erases its plaintext from the database
+  file instead of leaving it readable on a freed page. SQLite's
+  `secure_delete` is a per-connection setting that is off by default in the
+  library this build links, so removing a value only unlinked it from the
+  index while its bytes stayed on disk until something happened to overwrite
+  them — meaning `destroy`, whose purpose is to make a value unrecoverable,
+  did not. Every connection the vault and the broker open now enables it.
+  Note this applies to values removed from now on: plaintext already left
+  behind by an earlier delete stays until the database is compacted with
+  `VACUUM`.
+
+- The installed sudoers policy no longer lets an unattended `restore --all`
+  bypass authentication. Its NOPASSWD grant for `source-restore` used a `--*`
+  wildcard that also matched `--all`, so a whole-vault restore ran with no
+  prompt even though `--force` restores already required one. `--all` now
+  goes through the same auth-gated verb `--force` does.
+
+- `source-destroy` can now destroy the captured copies of a name that has no
+  live value left. It previously refused, to avoid tombstoning those copies
+  against an unrelated history entry — the copies were destroyed either way,
+  but the ledger recorded the wrong event as having destroyed them. It now
+  appends a history entry for the destroy itself, so the tombstones name the
+  event that actually caused them.
 
 - `sudo-secretspec undeclare` now captures a rollback copy of the vault manifest
   before rewriting it, matching the protection `set`, `add`, and `delete`
@@ -480,110 +536,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   missing — an existing `secretspec.toml` or `.env` (including a symlink, which
   is no longer written through) is refused rather than overwritten.
 
-- `check` writes its report to stdout instead of stderr, so
-  `secretspec check | grep ...` sees it. Previously the header, every ✓/○/✗
-  line and the summary all went to stderr, leaving stdout empty — a pipeline
-  observed nothing while the report still appeared on the terminal, which made
-  the command look like it had found no secrets. This also corrects the
-  colouring: `colored` decides whether to emit ANSI escapes by testing
-  *stdout*, so a report written to stderr leaked raw escape bytes into
-  redirected log files and dropped colour from terminals reading stdout. Exit
-  codes are unchanged, and the error message for a missing required secret
-  stays on stderr where it belongs.
-
-  The report is written through a sink rather than `println!`, so a reader that
-  closes the pipe early — `check | head` — reports a broken pipe as an ordinary
-  error instead of panicking, the same way `export` already behaves. Note this
-  hazard only exists at all because the report moved to stdout; the previous
-  stderr-only behaviour could not encounter it.
-
-- Google Cloud Secret Manager convention names now use the readable,
-  versioned `secretspec2--{project}--{profile}--{key}` layout. Distinct logical
-  addresses such as `my-app/prod/K` and `my/app-prod/K` can no longer collide
-  on one stored secret. When the new id holds no value, reads fall back to the
-  matching 0.19 `secretspec-{project}-{profile}-{key}` secret and warn once per
-  run, so an upgraded project keeps working with no migration step and no new
-  permissions: the fallback only reads, and credentials that cannot create
-  secrets are unaffected. Writes always use the new id, so `secretspec set`
-  moves a secret, after which reads stop consulting the legacy id. The 0.19
-  secret is left in place for rollback and should only be deleted once its
-  value has been written under the new id. Names that releases through 0.19
-  accepted but the new layout cannot represent, such as a project containing
-  `--`, keep reading their 0.19 secret with a warning; writing them requires
-  renaming the component or addressing the secret with a `ref`.
-  Secret-level IAM bindings on 0.19 ids also keep working when an unbound new
-  id returns permission denied, while other access failures remain errors
-  instead of being mistaken for missing values. Explicit `ref` addresses
-  remain unchanged. ([#219])
-
-  [#219]: https://github.com/cachix/secretspec/issues/219
-
-- Bare `bws://<project-uuid>` provider URIs now target the Bitwarden US cloud
-  vault instead of the public marketing site, restoring reads and writes while
-  keeping the server pinned independently of ambient `bws` configuration.
-  ([#359](https://github.com/cachix/secretspec/issues/359))
-
-- Node SDK processes using `loadAsync()` or `reportAsync()` with AWS Secrets
-  Manager or Parameter Store now exit normally after resolution. Provider
-  runtime and TLS state is torn down on a short-lived resolver thread instead
-  of remaining attached to a persistent libuv worker during macOS process
-  shutdown. ([#343])
-
-  [#343]: https://github.com/cachix/secretspec/issues/343
-
-- The `awssm` and `scaleway` providers now treat a JSON `null` in a `ref` field
-  as no value, the same as an absent key, so the provider chain continues.
-  Previously it was rendered as the four-character string `null`, which
-  satisfied a required secret and reached the program as a password or token
-  spelled `n-u-l-l`. The `bw` and `dashlane` providers already behaved this way.
-  An `extract` pointer is unchanged: it names one location and still reports a
-  `null` there, and the two policies now sit next to each other in one place.
-- The Python and Ruby SDKs' `Resolved.close()`/`Resolved#close` now remove every
-  `as_path` temp file even when one of them cannot be removed, raising the first
-  such error only after the rest are cleaned up. Previously the first failure
-  aborted the loop and left the remaining secret files on disk, which is the
-  outcome `close` exists to prevent. This matches the Go SDK's `firstErr` and the
-  .NET SDK's `firstError`. The Ruby SDK also no longer skips a dangling symlink,
-  which `File.exist?` reports as absent.
-- The `awssm` provider now accepts a trailing slash in `?prefix=` without
-  inserting a second slash into the AWS secret name. For example,
-  `?prefix=myteam/` resolves to `myteam/secretspec/...`, matching
-  `?prefix=myteam`, and both spellings share one provider identity so import
-  diagnostics still recognize alias-specific references. This avoids silently
-  treating the secret as missing or writing to a distinct double-slash name. Closes
-  [#344](https://github.com/cachix/secretspec/issues/344).
-
-- `import --delete-source` no longer fails partway through, after already
-  writing the destination, for a provider that cannot delete. `check_deletable`
-  previously answered whether an address's coordinates resolve, not whether
-  the provider supports deletion at all, so a provider inheriting the default
-  `delete` (which errors) still passed preflight. A new `Provider::supports_delete`
-  capability lets `check_deletable` reject those providers up front, before the
-  copy phase runs.
-
-- Infisical secret references no longer require `?env=` in the provider URI: a
-  `ref` names a folder and key but never an environment, so it now falls back to
-  the profile the run resolves under. One alias can therefore serve every profile
-  while naming secrets flat — `ref = { item = "/{key}" }` — instead of needing
-  one alias per environment. An explicit `?env=` still pins the environment.
-  When every requested secret gets Infisical's ambiguous 404, SecretSpec now
-  checks the environment root once without requesting secret values and reports
-  a missing environment or project, naming whether the profile or `?env=`
-  selected it. A genuinely absent secret or folder in an existing environment
-  remains unset so provider fallback still works. A credential declared with a
-  `ref` still needs `?env=`, so it resolves the same way whichever profile is
-  running. ([#338])
-
-  [#338]: https://github.com/cachix/secretspec/issues/338
-
-- `secretspec set` against an Infisical secret names the environment in its
-  pre-write preview, which the previous description left out.
-
-- Infisical import collision checks now recognize when aliases target the same
-  secret through a profile-derived versus explicit environment, or through an
-  absolute ref that overrides different configured path defaults, preventing
-  aliased destinations from overwriting one another.
-
 - `sudo-secretspec install` refuses to install from the installed boundary
   itself instead of silently upgrading nothing. `install` copies from the tree
   its own executable lives in, and `/usr/local` is shaped exactly like the
@@ -604,6 +556,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failed at build time on a host that happened not to have them. The formula
   also declares `depends_on :macos`, since the privileged boundary it installs
   targets macOS paths and there is nothing for it to do on Linux.
+
 - `Cargo.lock` now matches the workspace version. The `0.19.1-sudo.4` bump
   updated `Cargo.toml` but not the lockfile, and because the formula builds
   with `cargo install --locked`, an install from that tag aborted before
@@ -622,21 +575,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   changed; the guarantee was always this one, and the note overstated it.
   `AI-GUIDANCE.md` also now records that secret values are not zeroized in
   the client, as accepted residual risk rather than an omission.
+
 - The in-binary refusal of boundary lifecycle through the NOPASSWD path now
   fails closed. It treated "this process cannot identify itself" and "no broker
   is installed" as the same answer and allowed `install`/`rollback`/`uninstall`
   in both. Only the second is a reason to allow them — that is the case a
   first install runs in — so an unidentifiable process is now refused.
+
 - `install` now requires `/usr/local/{bin,libexec,etc,share}` to be root-owned
   before writing into them, which it already documented but only enforced for
   the shared roots above them. A host carrying a legacy Intel-Homebrew
   `chown -R` of the prefix would otherwise let an unprivileged user replace
   the binary root executes through the NOPASSWD rule. The directories are also
   created at an explicit `0755` rather than inheriting the caller's umask.
+
 - The broker now requires the vault's manifest and dotenv to be exactly mode
   `0600`. It previously accepted anything closed to group and world, so `0700`
   and `0400` passed the enforcing check while `doctor` reported them — leaving
   the enforcing side more permissive than the reporting one.
+
 - `sudo-secretspec doctor` no longer writes to the audit ledger it is
   reporting on. Its drift check reached the ledger through the ordinary
   verification path, which opens read-write and normalises on the way in —
@@ -645,11 +602,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   metadata. Verification for checkers now opens read-only and reports what it
   finds; the repairing path stays with the broker, so a ledger left root-owned
   by an earlier install still recovers.
+
 - `audit-verify` now asserts who the ledger belongs to. Both it and the drift
   check passed no expected owner, which skipped the ownership comparison on
   the directory *and* the ledger — on the one command whose purpose is to
   prove the ledger is intact. The full boundary check is deliberately still
   not required, so a drifted install can continue to verify its own ledger.
+
 - A crashed credential mutation no longer wedges `doctor`. The broker's
   rollback backups are created by root with `fs::copy`, which carries the mode
   across but not the owner, so they landed root-owned inside a service-user
@@ -660,61 +619,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   own code instead of also judging it against the steady-state rule, so hosts
   carrying a backup from an older build recover too. A symlink in that
   position is still refused.
+
 - Every mediated operation now records a terminal audit event. A failure to
   create the rollback backups returned after the attempt event was already
   written, leaving an attempt with no outcome — indistinguishable in the
   ledger from a broker killed mid-operation.
+
 - `sudo-secretspec doctor --json` now emits only the JSON report. `visudo`
   printed `<path>: parsed OK` to the same stream first, so anything parsing the
   output as JSON failed on the first character.
+
 - `sudo-secretspec install` now prunes rollback snapshots instead of leaving one
   behind on every run. Snapshots that captured nothing — which is every first
   install, and which `rollback` refuses to restore from — are removed, and the
   three most recent restorable snapshots are retained. Install output gained a
   `pruned_snapshots=` line and reports `rollback_snapshot=none` when there was
   nothing to capture.
+
 - The Homebrew formula now declares its version explicitly. Homebrew parsed the
   trailing `.1` of the `v0.19.1-djbclark.1` tag as the entire version, so kegs
   were recorded as version `1` and upgrade detection did not work.
+
 - The Homebrew formula installs the companion to `libexec` instead of `bin`, so
   it is no longer linked onto `PATH`. The keg copy is only a bootstrap for the
   initial `install`; leaving it linked shadowed the client at
   `/usr/local/bin/sudo-secretspec` — the path the sudoers policy and installed
   manifest are pinned to — with a same-version, different-hash binary. Run the
   bootstrap from the path shown in `brew info sudo-secretspec` caveats.
+
 - `sudo-secretspec` now invokes `/usr/bin/sudo` by absolute path. It previously
   resolved `sudo` through `PATH`, so a `sudo` planted earlier in `PATH` could
   satisfy any credential operation with forged values and no audit record.
+
 - The generated sudoers policy grants NOPASSWD execution per subcommand
   (`__broker`, `doctor`) instead of for any arguments. The client and broker are
   the same binary, so the previous blanket grant exposed `install` and
   `rollback` — full boundary reconfiguration — without interactive
   authentication. The binary enforces the same restriction internally. **Run
   `sudo-secretspec install --adopt-existing` to replace an existing policy.**
+
 - `install` and `rollback` validate a sudoers policy before it can take effect,
   instead of writing it live and checking afterwards. The policy is staged under
   a name sudo ignores, accepted by `visudo`, and only then renamed into place;
   the whole configuration is re-checked afterwards and the previous policy is
   restored if that fails. An unparseable `sudoers.d` file makes sudo refuse to
   run at all, which would have left no way to elevate and repair it.
+
 - `rollback` verifies snapshots before restoring: destinations must be install
   artifacts, contents must match the snapshot manifest, and modes are taken from
   the installer rather than the snapshot. It no longer executes a `restore`
   program found in the snapshot directory.
+
 - `install` now captures the outgoing artifacts into its rollback snapshot.
   Snapshots were previously created empty, so every `rollback` failed with
   "snapshot contains no restorable prior artifacts".
+
 - `doctor` no longer fails on advisory findings. `LEGACY_VAULT_CLUTTER` and
   `PENDING_ROLLBACK` are reported under a passing check instead of permanently
   blocking automated callers, which are instructed to stop on drift.
+
 - The broker validates vault and runtime-file ownership, mode, and the resolved
   vault path before every operation, and records the expected owner uid with each
   audit event.
+
 - `run` passes `--` through to the target command, so `run -- cargo test --
   --nocapture` no longer tries to execute `--nocapture`.
+
 - `run` no longer panics when the environment contains non-UTF-8 variables.
+
 - A failed terminal audit append now exits 126 and reports the operation's real
   result code instead of masking it as a generic policy error.
+
 - `sudo-secretspec audit-verify` verifies the audit ledger's hash chain and
   prints its event count and tip hash. The privileged side has always
   implemented this and `AI-GUIDANCE.md` already told deployments to pin the
@@ -729,12 +704,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reminds you to mirror the declaration into the tracked declarations file.
   NOTE: unlike `template-check`, this needs a boundary reinstall — the older
   broker rejects the new `--description` argument.
+
 - `sudo-secretspec check` no longer prompts. The broker ran the engine's check
   with prompting enabled, inside a root process with no usable terminal: a
   missing secret dropped it into interactive value entry, reading from whatever
   stdin the caller passed and writing the answers into the vault. An operation
   named `check` could therefore write, and with stdout redirected the prompt was
   invisible and it simply hung. It is now read-only and reports missing secrets.
+
 - The downstream release workflow's tag trigger was pinned to the single
   literal `v0.19.1-djbclark.1`, so it fired exactly once in its entire history:
   `.2`, `.3`, `-sudo.4` and `-sudo.5` all published with the tag leg silently
@@ -742,9 +719,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   asserts the tag names the version the workspace is actually stamped with —
   the same invariant `packaging/release.py` enforces in preflight, and the one
   that would have caught `v0.19.1-sudo.4` shipping uninstallable.
+
 - `packaging/` and `tests/sudo_packaging/` are now formatted the way CI checks
   them. `ruff format --check` runs there on every pull request and had never
   passed.
+
 - `sudo-secretspec undeclare NAME --reason <why>` removes a declaration this
   client added at runtime — the inverse `add` never had. `add` edits the runtime
   manifest immediately over the unprivileged NOPASSWD broker path, but `delete`
@@ -856,12 +835,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   policy carries `env_keep-="HOME"` and `always_set_home` so the same
   guarantee holds before the process even starts. Re-run
   `sudo-secretspec install` to update the policy.
+
 - The broker now clears **every** `SECRETSPEC_*` variable rather than four of
   them. The engine reads roughly twenty, and four (`SECRETSPEC_OPCLI_PATH`,
   `SECRETSPEC_BWS_CLI_PATH`, `SECRETSPEC_PASSBOLT_CLI_PATH`,
   `SECRETSPEC_PROTONPASS_CLI_PATH`) name an executable it launches — as root.
   The purge is now a prefix rule, so a knob added upstream is covered the day
   it lands, and it runs before dispatch rather than partway through.
+
 - The reason for a credential operation is now hashed before it crosses the
   privilege boundary, which is what the design always claimed. It was passed
   to the broker as plaintext in `argv`, readable via `ps` and
@@ -872,12 +853,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   can be joined on it. A client newer than the installed broker fails with a
   message pointing at `sudo-secretspec install` rather than falling back to
   plaintext.
+
 - The manifest profile the broker resolves from is now recorded in the
   root-owned `/usr/local/etc/sudo-secretspec.toml` (new `profile` key,
   defaulting to `default`, settable with `sudo-secretspec install --profile`).
   It was previously allowed to fall through to the caller's user-global
   SecretSpec config. Existing configuration files without the key keep
   working.
+
 - The bundled agent skill (`skills/sudo-secretspec/SKILL.md`) now documents the
   full mediated surface — `add`, `undeclare`, `export`, `template-check`, and
   `audit-verify` were missing — along with the six engine subcommands that are
@@ -888,6 +871,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tells readers to check each `doctor` finding's `advisory` field instead of
   matching a hardcoded list of codes, and flags `CLIENT_SHADOWED` as a hard
   stop.
+
 - `doctor --config` can no longer be used to read an arbitrary file as root.
   The NOPASSWD sudoers grant allowed `sudo -n sudo-secretspec doctor --config
   <path>` to echo a file's contents — including files only root can read —
@@ -900,18 +884,569 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   installer writes it. Re-run `sudo-secretspec install` to pick up the
   rebuilt boundary.
 
-## [0.19.1] - 2026-08-11
+## [0.21.1] - 2026-09-27
+
+### Added
+
+- Rust callers can use `secretspec::providers()` to list built-in provider
+  names, descriptions, and example URIs, including providers whose Cargo
+  features are disabled.
+
+### Fixed
+
+- The published `secretspec` crate includes every fixture its tests need, so
+  its test suite runs from the crates.io source without the repository.
+- The C resolver client reports why opening a session failed when the endpoint
+  writes non-protocol text before its first response, instead of sometimes
+  returning `UNAVAILABLE` without an error message.
+
+## [0.21.0] - 2026-09-22
+
+SecretSpec 0.21 lets other programs request only the secrets they need, lets
+providers run outside SecretSpec, and preserves binary values from storage to
+the consuming application. It also adds Doppler and Tailscale Setec providers,
+project-wide provider defaults, and a Claude Code credential integration.
+
+### Changed
+
+- **Cached values use a new format to preserve binary secrets.** Existing cache
+  entries remain readable by 0.21. SecretSpec 0.20 and earlier cannot read new
+  entries; they fall back to the original provider and leave those entries
+  untouched. Avoid sharing a cache store between 0.20 and 0.21 clients.
+
+- **Command-generated values now include all stdout bytes**, including spaces
+  and a final newline. For example, `openssl rand -hex 32` produces a value
+  ending in `\n`; trim it in the command if that is unwanted. Existing stored
+  values do not change. Empty or whitespace-only output is still rejected.
+
+- **Piped `secretspec set` input remains trimmed text.** Use `--from-file -`
+  when whitespace or non-UTF-8 bytes must be preserved from stdin.
+
+- **`secretspec get` no longer adds a newline when writing to a pipe or file.**
+  This makes redirects preserve the exact value. Terminal output still ends in
+  a newline; shell command substitution behaves as before.
+
+- **Rust secrets are byte values.** `Secrets::set` now takes `SecretBytes`.
+  Replace `set(name, Some(value))` with `set_text(name, &value)` for text and
+  `set(name, None)` with `prompt_and_set(name)`. Custom providers must update
+  their `get`, `set`, and `get_many` implementations to use `SecretBytes`;
+  `Provider::name` now returns `&str`, and `generator::generate` returns bytes.
+
+- **Building the new C resolver client requires system yyjson.** Meson finds it
+  through pkg-config and CMake through `find_package(yyjson CONFIG)`. Static
+  consumers must link `-lyyjson`; `secretspec-resolver.pc` records the dependency.
+
+### Added
+
+- **Resolve secrets from another process.** `secretspec serve` exposes a
+  private, versioned stdio protocol so an application can request one declared
+  secret without loading the whole manifest into its own process. It can return
+  a value or a temporary file that is cleaned up when the session ends. Clients
+  can also answer prompts, store or delete declared secrets on the same provider
+  route, and receive expiry and revision information for their own caches.
+  `secretspec serve --read-only` refuses operations that would write, including
+  generation and prompting when they would store a value. Applications can use
+  the Rust `secretspec-ipc` crate (async or blocking), the C
+  `libsecretspec-resolver` library, or the protocol directly. Rust clients can
+  also connect over SSH or an existing authenticated stream.
+
+- **Install providers outside the SecretSpec release cycle.** Trusted external
+  executables can register as providers and serve a versioned provider protocol.
+  They can describe their capabilities, request credentials for their own URI,
+  and return an interaction reference that appears in the audit log for an
+  approval flow. `secretspec config provider login` and `secretspec set` can
+  collect missing credentials. SecretSpec passes each endpoint only the
+  base environment plus the variables it declared, keeping other providers'
+  tokens separate.
+
+- **Keep binary secrets intact.** Providers, fallback chains, imports, and the
+  cache now preserve arbitrary bytes. Use `secretspec set NAME --from-file FILE`
+  (or `--from-file -` for stdin) to store exact bytes, and `as_path = true` to
+  pass them to an application through a temporary file. The file, systemd
+  credential, environment, keyring, Google Secret Manager, Kubernetes, and
+  Scaleway providers support binary values; AWS Secrets Manager also supports
+  `SecretBinary`. Rust callers can use `resolve_bytes()` and
+  `resolve_named_bytes()`. Text-only outputs report a UTF-8 error naming the
+  secret. On Unix, `run` passes non-UTF-8 values to child processes; it rejects
+  NUL bytes before launching them.
+
+- **Doppler provider** (`doppler://PROJECT[/CONFIG]`): read, write, delete, and
+  discover secrets in an existing Doppler project. It keeps names unchanged so
+  secrets remain usable in the Doppler dashboard and `doppler run`. The active
+  SecretSpec profile selects the Doppler config unless the URI pins one.
+  Authenticate with `DOPPLER_TOKEN` or a `token` provider credential. Doppler
+  restrictions and values it cannot store unchanged are reported as errors.
+
+- **Tailscale Setec provider** (`setec://`): read, write, delete, and discover
+  secrets through a tailnet-authenticated Setec server. It supports binary
+  values and reads pinned to a Setec version.
+
+- **Set a project-wide provider chain** with `[defaults].providers`. Secrets
+  without their own or a profile-level chain use this default, so a checked-in
+  manifest can refer to an alias that each developer maps to their preferred
+  store. User-global alias `ref` templates can expand `{project}`, `{profile}`,
+  and `{key}`. Native SDK inline declarations support this through schema v2;
+  v1 declarations still work.
+
+- **Use SecretSpec credentials with Claude Code.** `secretspec claude configure`
+  installs an `apiKeyHelper` that retrieves Anthropic API or gateway credentials
+  from any provider. `login` and `logout` manage them by settings scope and API
+  resource; `unconfigure` removes the managed helper without replacing unrelated
+  settings. Repository, user, worktree, and `CLAUDE_CONFIG_DIR` settings are
+  supported.
+
+- **Get editor help for configuration.** Export JSON Schemas for
+  `secretspec.toml` and user `config.toml` with `secretspec schema --config
+  project` or `secretspec schema --config global` for autocomplete, field
+  descriptions, and validation.
+
+- **Generate OpenPGP and OpenSSH private keys.** Use
+  `type = "openpgp_private_key"` with `generate.user_id`, or
+  `type = "ssh_private_key"`. Both generate modern keys by default and offer
+  RSA for compatibility; OpenPGP keys can be limited to signing or encryption.
+
+- **Target a specific Bitwarden item** by UUID when several items share a name.
+  Reads and writes accept the UUID, and imports reject duplicate item fields
+  before making changes.
+
+- **Declare JVM SDK secrets inline** with `withInlineSpec` instead of requiring
+  a manifest file.
+
+### Fixed
+
+- **Stalled HTTP providers fail in bounded time.** Vault, OpenBao, Infisical,
+  Cloudflare, Scaleway, Azure App Configuration, Doppler, and Setec use a
+  10-second connection timeout and a 60-second request timeout. Vault and
+  OpenBao now retry timed-out requests as configured.
+
+- **macOS keyring access no longer asks for the login keychain password on
+  every run after an upgrade.** A new build may ask once per existing item;
+  choose "Always Allow" to keep later runs of that build quiet. Reads preserve
+  the item and its access settings, even if access is denied.
+
+- **KeePassXC KDBX 4.0 files can be written.** SecretSpec upgrades them to
+  KDBX 4.1 on write while preserving their encryption and key-derivation
+  settings.
+
+- **Bitwarden reads are faster and more consistent.** A batch uses one vault
+  listing, and a single read falls back to the full listing if Bitwarden's
+  search returns only similarly named items.
+
+- **pass, gopass, and LastPass handle whitespace and multiline values more
+  reliably.** The pass provider removes one final newline added by the `pass`
+  CLI on read. Existing gopass text entries still return their trimmed first
+  line until rewritten; new values requiring exact bytes use its binary-entry
+  format. Ordinary single-line gopass values remain readable by older tools.
+  LastPass rejects NUL bytes before writing rather than silently truncating
+  them.
+
+- **Cache planning avoids unnecessary provider reads** and refuses a cache
+  that would point to the same physical secret as its source under the active
+  profile, preventing an overwrite or deletion of the source value.
+
+## [0.20.0] - 2026-08-31
+
+### Changed
+
+- Provider names remain registered when their Cargo feature is disabled, so
+  selecting one now identifies the feature required by the build instead of
+  incorrectly reporting that the provider does not exist. Provider discovery
+  and enabled or disabled builds now share the same metadata catalog.
+
+- Interactive prompts now use the Console terminal backend, reducing CLI
+  dependencies and allowing Unix signal handling to use Signal Hook 0.4.
+
+- SecretSpec now builds against Rand 0.10 and the TOML 1.1 ecosystem, improving
+  compatibility with current Linux distribution Rust packages.
+
+- Secret resolution now applies provider fallbacks, generated and default
+  values, compositions, scopes, and presence constraints through one ordered
+  pipeline, keeping CLI and SDK resolution behavior aligned.
+
+- The embedded C ABI is named `libsecretspec` in 0.20+, replacing the
+  `secretspec-ffi` crate, `secretspec_ffi` library filenames, and
+  `secretspec_ffi.pc`. Its exported `secretspec_*` symbols and
+  `SECRETSPEC_FFI_LIB` override are unchanged. Runtime-loading SDKs retain
+  pre-0.20 shared-library filename fallbacks where supported.
+
+- The Infisical provider now uses a separate HTTP connection for Universal Auth
+  login, keeping the connection pool used for subsequent secret reads reliable.
+
+- The 1Password provider keeps batched reference resolution efficient when
+  some items are missing: it lists missing items once per vault and retries the
+  batch without them, instead of falling back to one `op read` process per
+  secret. Authentication and unavailable-CLI errors fail immediately, while
+  missing optional items whose names resemble authentication diagnostics remain
+  missing rather than aborting the batch.
+
+- The value-free resolution surfaces — `secretspec check --json`,
+  `check --explain`, and the SDKs' report and no-values resolutions — no longer
+  report a **required** `generate` secret as resolved while no provider holds
+  its value. Because these surfaces deliberately mint nothing, such a secret is
+  now reported as `missing_required` and the command exits non-zero, instead of
+  passing a CI gate against an empty store. Run `secretspec check` or
+  `secretspec run` once to generate and store the value; the preflight then
+  reports it as resolved from its provider. An optional `generate` secret, or
+  one routed to a provider that never retains generated values such as `null`,
+  is unaffected and still resolves. `check --explain` also phrases such an
+  entry as `will generate` rather than `generated`, since nothing was minted.
+
+- Git credential configuration now works on Windows, keeps repository-local
+  includes valid when repositories move, distinguishes percent-encoded reserved
+  path bytes, avoids persisting an ambient profile, and exits quietly when its
+  output pipe closes on Unix.
+
+- Dotenv parsing and rendering now use dotenv-ng throughout the dotenv
+  provider, age-encrypted dotenv blobs, and `secretspec export --format
+  dotenv`. Values containing `$` remain literal, output uses only the quoting
+  needed to round-trip, and bcrypt-style strings containing `$2a$10$...` are
+  no longer corrupted while reading ([#73]). Dotenv keys may include hyphens,
+  leading digits, leading dots, and Unicode. Whitespace, `=`, `#`, and control
+  characters remain invalid in keys.
+
+  [#73]: https://github.com/cachix/secretspec/issues/73
+
+- The Rust `secretspec-derive` macro now uses the support crates re-exported by
+  `secretspec`, so applications no longer need explicit `serde` or `secrecy`
+  dependencies just to compile generated types.
+
+- `secretspec check` writes its human-readable report to stdout, consistently
+  with `check --json` and `check --explain`, so it can be piped and redirected
+  without mixing the report with diagnostics. Scripts that captured the report
+  from stderr must capture stdout instead; `2>&1` continues to work. Rust SDK
+  callers can select a report sink with `Secrets::check_with_writer`, while
+  the existing `Secrets::check` API and its stderr behavior remain unchanged.
+
+### Added
+
+- The age provider supports deleting secrets in 0.20+: `secretspec delete`,
+  `secretspec import --delete-source`, and cache invalidation now work with it,
+  so an age-encrypted file can serve as the local store of a cached provider
+  alias.
+
+- Native SDKs (0.20+) can resolve a strict, versioned inline secret declaration
+  through the new `secretspec_call` C ABI entry point. Inline declarations use
+  an explicit logical base directory for relative providers, reject unknown
+  fields, and require the new symbol so an older library cannot silently fall
+  back to a filesystem manifest. The Go, Python, Node.js, Ruby, Haskell, PHP,
+  C#, and Swift SDKs expose this as their `WithInlineSpec` /
+  `with_inline_spec` builder method.
+
+- Static musl CLI release binaries for x64 and arm64 Linux are available in
+  0.20+, so the standalone installer and `secretspec-update` work on Alpine
+  without a glibc compatibility layer.
+
+- Rust SDK (0.20+): `Spec::schema_json` exposes the value-free JSON Schema
+  generated by `secretspec schema` to Rust SDK callers without enabling the CLI
+  feature.
+
+- Rust SDK (0.20+): `SpecBuilder` preserves comments, key order, quoting, and
+  unrelated syntax when adding, replacing, or removing declarations from a
+  `Spec` loaded from TOML. `preserved_text` exposes the exact edited root
+  document, while `to_toml` renders freshly formatted TOML when no preserved
+  document is available. Inherited declarations remain in their parent files
+  and are revalidated after every edit.
+
+- The Node.js SDK publishes musl builds of the native addon in 0.20+, so
+  `require("secretspec")` works on Alpine images such as `node:alpine`
+  ([#383]). npm picks the build that matches the host libc, on both x64 and
+  arm64.
+
+  [#383]: https://github.com/cachix/secretspec/issues/383
+
+- `extract` supports INI documents in SecretSpec 0.20+, selecting an
+  unsectioned key with `/key` or a named-section key with `/section/key`.
+
+- Rust SDK (0.20+): **`SecretSpecBuilder::prompt_missing`** lets the typed loader
+  generated by `declare_secrets!` prompt for and store missing required secrets
+  interactively, matching `Secrets::ensure_secrets` on the untyped SDK. It is
+  disabled by default (`RequiredSecretMissing` still fails fast, exactly as
+  before) and only prompts when stdin is a real terminal.
+
+- In 0.20+, a read-only `git-credential-secretspec` helper lets Git retrieve
+  HTTPS usernames and tokens through SecretSpec providers without duplicating
+  them in Git's credential store. Its built-in manifest keeps the default
+  independent of the current directory and isolates values by protocol, host,
+  and configured path; equivalent unreserved URL encodings select one canonical
+  credential, including for flat-key providers. `secretspec git login` and
+  `logout` manage those values explicitly, and manually registered embedded
+  helpers can use the stable `PASSWORD` and `USERNAME` aliases.
+  SMTP credential contexts support `git send-email` without writing
+  `sendemail.smtpPass`, with passwords isolated by case-insensitive server,
+  port, and username. Path-scoped HTTP(S) credentials take precedence over
+  host-wide fallbacks, and username-bearing Git requests select only the
+  matching credential.
+  `configure` and `unconfigure` safely manage repository or global Git
+  configuration without replacing existing helpers. The owner-only managed
+  file is durably written, custom-manifest symlinks are preserved, and failed
+  or repeated include removal leaves recoverable state. Only explicitly passed
+  provider and reason options are persisted, while `--file` retains the
+  custom-manifest workflow (0.20+).
+
+- **Kubernetes provider** (`k8s+<configmap|secret>://`, 0.20+): store, read,
+  delete, and discover values in a Kubernetes ConfigMap or Secret using the
+  current cluster.
+
+- **EJSON provider** (`ejson:`, 0.20+): read string values from an encrypted
+  EJSON file with RFC 6901 JSON Pointer references. The private key comes from
+  an explicit `private_key` provider credential, so an existing provider such
+  as Google Cloud Secret Manager can supply an exact key without putting it in
+  the URI, environment, process arguments, or a local key file. Batch
+  resolution decrypts each file once, and the initial provider is intentionally
+  read-only.
+
+- **Azure App Configuration provider** (`aac://`, 0.20+): select direct
+  values and Azure Key Vault references by label, prefix, and tags, with Entra
+  ID or connection-string authentication and guarded writes, deletion, and
+  declaration discovery. Azure Key Vault references can pin an exact secret
+  version, cached-route validation compares canonical vault endpoints
+  independently of authentication choice, and discovery rejects ambiguous or
+  invalid convention keys. HTTP redirects are rejected so reads and
+  secret-bearing writes remain confined to the configured store endpoint.
+
+- Rust SDK (0.20+): describe secrets without TOML through the public `Spec`,
+  `SpecBuilder`, `Profile`, and `Secret` API. TOML parsing and code generation
+  use the same validated model, so Rust-first and file-backed projects share
+  inheritance, generation, and provider behavior, including profile-level
+  requiredness defaults and explicit opt-outs from inherited path, prompt, and
+  generation settings. Existing specs can be copied or consumed back into a
+  builder to add, replace, or remove declarations before rebuilding a validated
+  spec. This validated declaration API replaces the previously exposed raw
+  configuration and code-generation implementation types. Custom provider
+  implementations should now return declarations such as
+  `Secret::required(...)` from `Provider::reflect` instead of constructing raw
+  configuration secrets.
+
+- Structured caller context (0.20+) lets CLI and SDK integrations identify the
+  invoking software, version, operation, and non-secret resource independently
+  of the user-supplied access reason. Audit records and providers receive the
+  context, but it never satisfies the `require_reason` policy.
+
+- Code generation (0.20+) carries each secret's declared `description` into the
+  generated JSON Schema as a `description` key on its property.
+  [quicktype](https://quicktype.io)
+  turns that into a native docstring in every target language, so SDKs
+  generated from a manifest carry the same descriptions the manifest already
+  declares, instead of losing them at the schema boundary.
+
+- The Fly.io `fly` provider (0.20+) publishes and deletes application secrets
+  with `secretspec set` and `secretspec delete`, and discovers their names with
+  `init --from`. Fly.io never exposes plaintext secret values, so the provider
+  clearly rejects read operations and CLI guidance recommends only supported
+  workflows. Writes keep values off process arguments by streaming them to
+  `flyctl secrets set` over stdin, refuse boundary whitespace that `flyctl`
+  would silently trim, and scrub ambient Fly token variables before injecting
+  the token selected through the provider credential mechanism.
+
+- The Cloudflare `cloudflare` provider (0.20+) publishes, replaces, deletes,
+  and discovers account-level Secrets Store entries through Cloudflare's API.
+  Cloudflare never returns plaintext values through its management API, so the
+  provider clearly reports its write-only behavior. Authentication can use a
+  SecretSpec `api_token` credential, `CLOUDFLARE_API_TOKEN`, or the current
+  Wrangler OAuth, API-token, or legacy API-key session; secret values are sent
+  only in HTTPS request bodies ([#84]).
+
+  [#84]: https://github.com/cachix/secretspec/issues/84
+
+- `secretspec completions <shell>` (0.20+) generates completion scripts for
+  Bash, Elvish, Fish, Nushell, PowerShell, and Zsh directly from the CLI
+  definition, including descriptions and contextual suggestions for profiles,
+  scopes, secret names, providers, aliases, paths, and commands. Completion
+  reads configuration metadata only; it never queries providers or reads
+  secret values.
+
+- In 0.20+, a read-only `docker-credential-secretspec` helper lets Docker
+  retrieve registry usernames and tokens through any SecretSpec provider.
+  `secretspec docker configure` and `unconfigure` safely manage per-registry
+  Docker credential-helper settings without replacing existing helpers, while
+  `secretspec docker login` and `logout` manage isolated embedded credentials;
+  custom manifests remain available through `--file` (0.20+).
+
+- **JVM SDK** (0.20+): use SecretSpec from languages such as Java or Kotlin.
+
+### Fixed
+
+- 1Password convention-secret batches now retrieve all matching items through
+  one `op item get` process instead of starting one process per secret, avoiding
+  desktop-app connection timeouts when resolving larger manifests. Batch input
+  uses the CLI's structured JSON interface so reads work consistently across
+  1Password CLI releases ([#398]).
+
+  [#398]: https://github.com/cachix/secretspec/issues/398
+
+- Bitwarden Password Manager convention secrets now use
+  `secretspec/{project}/{profile}/{key}` item titles, preventing a same-named
+  secret in another project or profile from being read or overwritten. The
+  existing `?folder=` option customizes that title prefix. Bare items created
+  by releases through 0.19 can be renamed to the namespaced title or retained
+  with an explicit `ref`; declaration discovery emits those legacy bare items
+  as refs automatically. Names remain isolated when a project or profile
+  contains `/`, and `secretspec init --from bw://` recognizes convention names
+  case-insensitively while preserving legacy items' native references. ([#369])
+
+  [#369]: https://github.com/cachix/secretspec/issues/369
+
+- On Unix, `secretspec run` now forwards `SIGTERM`, `SIGINT`, and `SIGHUP` to
+  the command it started, allowing graceful container shutdown even when
+  SecretSpec is PID 1. Commands terminated by a signal now produce the
+  conventional `128 + signal` exit status instead of always exiting 1
+  ([#382]).
+
+  [#382]: https://github.com/cachix/secretspec/issues/382
+
+- Format-preserving `Spec` edits now keep inherited declarations separate after
+  semantic builder changes, resolve parent specs independently of later working
+  directory changes, remove synthesized profile tables when additions are
+  undone, and apply description validation consistently across builder origins.
+
+- The Kubernetes provider now checks the correct Kubernetes Secret resource
+  permission and refuses `import --delete-source` before copying values when
+  the source object cannot be patched.
+
+- Closing the output pipe now ends the CLI quietly on Unix, so
+  `secretspec export | head` and `secretspec check --json | head` behave like
+  any other Unix tool. Previously `export` reported `IO error: Broken pipe`
+  and exited 1, and `check --json` panicked with `failed printing to stdout`,
+  because Rust ignores `SIGPIPE` by default and surfaced `EPIPE` instead. The
+  entry point now restores the default `SIGPIPE` disposition, which covers
+  every command that writes to stdout.
+
+- `cargo run` continues to launch the main SecretSpec CLI after installing the
+  Docker credential-helper binary in the same package (0.20+).
+
+- Embedded Docker credentials now remain isolated by registry and Docker
+  configuration when used with flat providers such as Dotenv. Provider keys
+  carry the same stable identity as the embedded project, preventing one
+  registry's login or logout from affecting another (0.20+).
+
+- Docker now reports when `configure` replaces a registry's existing
+  SecretSpec metadata and clarifies that the stored credential was not removed
+  (0.20+).
+
+- Docker can now manage the same registry independently in multiple
+  `DOCKER_CONFIG` directories. Helper lookup and embedded credential storage
+  are isolated by both registry and Docker configuration (0.20+).
+
+- Equivalent `DOCKER_CONFIG` paths that resolve through symlinked directories
+  now share one Docker credential identity, so helper lookup and cleanup work
+  regardless of which path spelling invokes them (0.20+).
+
+- Default Docker audit caller context no longer reports the SecretSpec release
+  as Docker's version. Docker remains identified as the caller while its
+  unknown version is omitted (0.20+).
+
+- Docker's managed credential state is now restricted to owner-only permissions
+  without changing the existing mode of Docker's own `config.json`. Atomic
+  updates and final-entry removal preserve a symlinked state file, and
+  interrupted removal can be resumed when Docker's helper entry was already
+  deleted (0.20+).
+
+- Docker credentials configured through a symlinked custom manifest now retain
+  that logical manifest path, so relative `extends` entries continue to resolve
+  from the directory where the symlink was selected (0.20+).
+
+- `secretspec docker` no longer treats exported `SECRETSPEC_FILE`,
+  `SECRETSPEC_PROFILE`, `SECRETSPEC_PROVIDER`, or `SECRETSPEC_REASON` as typed
+  configuration flags. Only an explicit `--provider` or `--reason` is saved for
+  later helper calls, and ambient manifest/profile settings no longer switch or
+  block the embedded credential workflow (0.20+).
+
+- Custom-manifest Docker credentials now pin a profile only when `--profile` is
+  explicitly supplied, preventing a shell's ambient profile from becoming a
+  permanent helper setting (0.20+).
+
+- Google Cloud Secret Manager convention names now use the readable,
+  versioned `secretspec2--{project}--{profile}--{key}` layout. Distinct logical
+  addresses such as `my-app/prod/K` and `my/app-prod/K` can no longer collide
+  on one stored secret. When the new id holds no value, reads fall back to the
+  matching 0.19 `secretspec-{project}-{profile}-{key}` secret and warn once per
+  run, so an upgraded project keeps working with no migration step and no new
+  permissions: the fallback only reads, and credentials that cannot create
+  secrets are unaffected. Writes always use the new id, so `secretspec set`
+  moves a secret, after which reads stop consulting the legacy id. The 0.19
+  secret is left in place for rollback and should only be deleted once its
+  value has been written under the new id. Names that releases through 0.19
+  accepted but the new layout cannot represent, such as a project containing
+  `--`, keep reading their 0.19 secret with a warning; writing them requires
+  renaming the component or addressing the secret with a `ref`.
+  Secret-level IAM bindings on 0.19 ids also keep working when an unbound new
+  id returns permission denied, while other access failures remain errors
+  instead of being mistaken for missing values. Explicit `ref` addresses
+  remain unchanged. ([#219])
+
+  [#219]: https://github.com/cachix/secretspec/issues/219
+
+- Bare `bws://<project-uuid>` provider URIs now target the Bitwarden US cloud
+  vault instead of the public marketing site, restoring reads and writes while
+  keeping the server pinned independently of ambient `bws` configuration.
+  ([#359](https://github.com/cachix/secretspec/issues/359))
+
+- Node SDK processes using `loadAsync()` or `reportAsync()` with AWS Secrets
+  Manager or Parameter Store now exit normally after resolution. Provider
+  runtime and TLS state is torn down on a short-lived resolver thread instead
+  of remaining attached to a persistent libuv worker during macOS process
+  shutdown. ([#343])
+
+  [#343]: https://github.com/cachix/secretspec/issues/343
+
+- The `awssm` and `scaleway` providers now treat a JSON `null` in a `ref` field
+  as no value, the same as an absent key, so the provider chain continues.
+  Previously it was rendered as the four-character string `null`, which
+  satisfied a required secret and reached the program as a password or token
+  spelled `n-u-l-l`. The `bw` and `dashlane` providers already behaved this way.
+  An `extract` pointer is unchanged: it names one location and still reports a
+  `null` there, and the two policies now sit next to each other in one place.
+
+- The Python and Ruby SDKs' `Resolved.close()`/`Resolved#close` now remove every
+  `as_path` temp file even when one of them cannot be removed, raising the first
+  such error only after the rest are cleaned up. Previously the first failure
+  aborted the loop and left the remaining secret files on disk, which is the
+  outcome `close` exists to prevent. This matches the Go SDK's `firstErr` and the
+  .NET SDK's `firstError`. The Ruby SDK also no longer skips a dangling symlink,
+  which `File.exist?` reports as absent.
+
+- The `awssm` provider now accepts a trailing slash in `?prefix=` without
+  inserting a second slash into the AWS secret name. For example,
+  `?prefix=myteam/` resolves to `myteam/secretspec/...`, matching
+  `?prefix=myteam`, and both spellings share one provider identity so import
+  diagnostics still recognize alias-specific references. This avoids silently
+  treating the secret as missing or writing to a distinct double-slash name
+  ([#344](https://github.com/cachix/secretspec/issues/344)).
+
+- `import --delete-source` now rejects providers that cannot delete during
+  preflight, before writing any destinations. Previously the import could copy
+  a value successfully and fail only when source cleanup began.
+
+- Infisical secret references no longer require `?env=` in the provider URI: a
+  `ref` names a folder and key but never an environment, so it now falls back to
+  the profile the run resolves under. One alias can therefore serve every profile
+  while naming secrets flat — `ref = { item = "/{key}" }` — instead of needing
+  one alias per environment. An explicit `?env=` still pins the environment.
+  When every requested secret gets Infisical's ambiguous 404, SecretSpec now
+  checks the environment root once without requesting secret values and reports
+  a missing environment or project, naming whether the profile or `?env=`
+  selected it. A genuinely absent secret or folder in an existing environment
+  remains unset so provider fallback still works. A credential declared with a
+  `ref` still needs `?env=`, so it resolves the same way whichever profile is
+  running. ([#338])
+
+  [#338]: https://github.com/cachix/secretspec/issues/338
+
+- `secretspec set` against an Infisical secret names the environment in its
+  pre-write preview, which the previous description left out.
+
+- Infisical import collision checks now recognize when aliases target the same
+  secret through a profile-derived versus explicit environment, or through an
+  absolute ref that overrides different configured path defaults, preventing
+  aliased destinations from overwriting one another.
+
+## [0.19.1] - 2026-08-12
 
 Republishes 0.19.0's command-line artifacts. The library and CLI behave exactly
 as in 0.19.0.
 
 ### Added
 
-- The age provider supports deleting secrets: `secretspec delete`,
-  `secretspec import --delete-source`, and cache invalidation now work with
-  it, so an age-encrypted file can serve as the local store of a cached
-  provider alias — an encrypted-at-rest cache with no keyring daemon or OS
-  keychain involved.
 - Windows ARM64 CLI release artifacts (`aarch64-pc-windows-msvc`), attached to
   the GitHub Release as `secretspec-aarch64-pc-windows-msvc.zip` with a
   checksum. The static installer keeps selecting the x86_64 build on Windows
@@ -930,7 +1465,6 @@ as in 0.19.0.
 ## [0.19.0] - 2026-08-10
 
 ### Changed
-
 
 - A provider URI may no longer carry a credential. A URI with a password
   (`scheme://user:PASSWORD@host`) is rejected, and `onepassword+token://` no

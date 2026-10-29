@@ -78,48 +78,16 @@ the right shape depends on an upstream answer we have not received yet. Revisit
 each one when the corresponding thread moves, **even if there is no functional
 gain** — the point is to stop depending on surfaces upstream has disclaimed.
 
-### `source-schema` goes through `__private` + a local feature (0.19.1-sudo.15)
+### `source-schema` went through `__private` + a local feature (retired in 0.21.1-sudo.1)
 
-`sudo-secretspec-cli/src/broker.rs` `emit_schema` reaches codegen through
-`secretspec::__private::codegen::{build_ir, schema}`. Upstream marks that
-module `#[doc(hidden)]` and says in its own doc comment:
-
-> These document types are not part of the supported Rust SDK. Use `Spec` and
-> its builder API instead.
-
-So we are knowingly building on a surface upstream disclaims, and it can change
-without notice in any release.
-
-There are **two** parts to this debt, and only the first is pure `__private`:
-
-1. `build_ir` is already exported from `__private::codegen` upstream, so using
-   it costs no patch — just a dependency on a disclaimed surface.
-2. `schema::emit` is `pub(crate)` **and** `#[cfg(feature = "cli")]` upstream,
-   so it is not reachable even through `__private`. We carry a fork-local patch
-   for it: a `codegen-schema` feature (`secretspec/Cargo.toml`) that widens
-   `codegen::schema` to `pub` and re-exports it from `__private::codegen`. It
-   mirrors the existing `manifest-edit` feature and, like it, exists so the
-   root-privileged broker never takes `clap`/`inquire`. `cli` implies it, so
-   nothing changes for upstream users.
-
-- **Why we did it:** the upstream merge moved `build_ir` to take `&Spec` and
-  left `codegen::schema` closed, so there is no supported path to JSON Schema
-  emission for a library consumer. The alternative was blocking a release that
-  also carries the `check` stdout fix.
-- **The clean shape:** `Spec::schema_json(profile) -> Result<String>` upstream.
-  **Now filed as issue #371** with the PR offered.
-- **Checked against #362 (2026-08-16): it does NOT retire this.** The client
-  protocol is five methods with no manifest-shape reflection, and `provider.reflect`
-  describes the *endpoint*, not the manifest; no `spec.rs`/`codegen.rs` changes
-  in its 216 files. Do not assume the 0.20 IPC work supplies a schema path.
-- **Revisit when:** #371 gets a maintainer response, or any upstream release
-  changes `__private` or the `codegen` module layout. If `schema::emit` becomes
-  reachable, drop the `codegen-schema` feature and migrate **even though
-  nothing the user can observe changes** — the point is to stop patching
-  upstream internals.
-- **Canary:** if a future upstream merge breaks `emit_schema` compilation, or
-  the `codegen-schema` patch stops applying cleanly, that is this debt coming
-  due, not a new bug. Fix it by pressing #371, not by reaching deeper.
+Until the 0.21.1 merge, `sudo-secretspec-cli/src/broker.rs` `emit_schema`
+reached codegen through `secretspec::__private::codegen::{build_ir, schema}`
+plus a fork-local `codegen-schema` feature that widened `codegen::schema` to
+`pub`. Upstream since shipped `Spec::schema_json(profile)` (0.20), the shape
+issue #371 asked for, and `emit_schema` now calls it. The `codegen-schema`
+feature and the fork's `manifest-edit` feature are gone; the broker's manifest
+edits go through upstream's `SpecBuilder::add_secret`/`remove_secret`, which
+preserve the retained TOML text.
 
 Note the broker no longer uses `Secrets::config()`: it loads a `Spec` from the
 protected manifest path instead, which let `secretspec/src/secrets.rs` return to

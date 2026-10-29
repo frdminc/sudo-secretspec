@@ -2,6 +2,12 @@ name: "Test"
 
 on:
   workflow_call:
+    inputs:
+      pre_release:
+        description: Run as part of the canonical pre-release suite
+        required: false
+        type: boolean
+        default: false
   workflow_dispatch:
   pull_request:
   push:
@@ -18,6 +24,10 @@ concurrency:
 jobs:
   changes:
     name: Classify changes
+    if: >-
+      inputs.pre_release ||
+      github.event_name != 'pull_request' ||
+      !startsWith(github.event.pull_request.title, 'Release ')
     runs-on: ubuntu-latest
     outputs:
       code: ${{ steps.classify.outputs.code }}
@@ -53,6 +63,7 @@ jobs:
         code=false
         while IFS= read -r path; do
           case "$path" in
+            docs/public/schema/*) code=true; break ;;
             docs/*|*.md|*.mdx) ;;
             *) code=true; break ;;
           esac
@@ -61,12 +72,16 @@ jobs:
 
   docs:
     name: Documentation
+    if: >-
+      inputs.pre_release ||
+      github.event_name != 'pull_request' ||
+      !startsWith(github.event.pull_request.title, 'Release ')
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         persist-credentials: false
-    - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+    - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
       with:
         node-version: 24
         cache: npm
@@ -76,14 +91,10 @@ jobs:
     - name: Build documentation
       run: npm --prefix docs run build
     - name: Check documentation links
-      uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
+      uses: cachix/site-kit/check-links@59a4fbfbe8e105aeb7f6e32c90055342f10d2b8a
       with:
-        lycheeVersion: v0.21.0
-        workingDirectory: docs
-        args: >-
-          --root-dir "${{ github.workspace }}/docs/dist"
-          --remap "^https://secretspec\\.dev file://${{ github.workspace }}/docs/dist"
-          "dist/**/*.html"
+        working-directory: docs
+        site: https://secretspec.dev
 
   tests:
     needs: changes
@@ -115,9 +126,15 @@ jobs:
         rustup toolchain install
         rustup component add rustfmt clippy
     - name: Cache Rust builds
-      uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
       with:
         key: ${{ matrix.os }}
+    # libsecretspec-resolver takes yyjson from the system rather than vendoring
+    # it, and this job has no Nix to supply it. The Rust conformance package
+    # compiles the same C sources, so this has to precede every cargo step too.
+    - name: Install yyjson
+      shell: bash
+      run: bash scripts/install-yyjson.sh
 
     # Formatting and linting are platform-independent; run them once on Linux.
     # The PHP extension is checked in the SDK workflow, where PHP headers are
@@ -134,6 +151,28 @@ jobs:
       run: cargo clippy --workspace --exclude secretspec-php-native --exclude sudo-secretspec-cli
     - name: Run tests
       run: cargo test --workspace --exclude secretspec-php-native --exclude sudo-secretspec-cli
+    # The C client is standalone C11, so it is built with its own build systems
+    # rather than the devenv shell: this job installs Rust directly and has no
+    # Nix, and Windows runners cannot run devenv at all.
+    - name: Install Meson and Ninja
+      shell: bash
+      # pipx rather than pip: the macOS runner's Python is externally managed
+      # (PEP 668), so a plain --user install is refused there.
+      run: |
+        pipx install meson
+        pipx install ninja
+    - name: Build standalone C IPC client with Meson
+      shell: bash
+      run: |
+        meson setup libsecretspec-resolver/build-meson libsecretspec-resolver
+        meson compile -C libsecretspec-resolver/build-meson
+        meson test -C libsecretspec-resolver/build-meson --print-errorlogs
+    - name: Build standalone C IPC client with CMake
+      shell: bash
+      run: |
+        cmake -S libsecretspec-resolver -B libsecretspec-resolver/build-cmake
+        cmake --build libsecretspec-resolver/build-cmake
+        ctest --test-dir libsecretspec-resolver/build-cmake --output-on-failure
 
   # Each optional provider must compile on its own, not just in the default
   # feature set. `cargo test` above cannot catch a missing feature gate: it
@@ -152,11 +191,11 @@ jobs:
     - name: Install Rust
       run: rustup toolchain install stable --profile minimal
     - name: Cache Rust builds
-      uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
     - name: Check each provider feature standalone
       run: |
         set -euo pipefail
-        for feature in cli keyring keeper gcsm awssm vault openbao infisical bws akv aac sops bw; do
+        for feature in cli keyring kdbx keeper gcsm awssm awsps vault openbao infisical doppler bws akv aac age ejson sops bw kubernetes cloudflare scaleway setec sqlite; do
           echo "::group::$feature"
           cargo check --package secretspec --no-default-features --features "$feature"
           echo "::endgroup::"
@@ -210,7 +249,13 @@ jobs:
     - name: Install Rust
       run: rustup toolchain install stable --profile minimal
     - name: Cache Rust builds
-      uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
+    # This runner has no pkg-config, so the script also exports the explicit
+    # YYJSON_INCLUDE_DIR / YYJSON_LIB_DIR pair that the conformance build script
+    # falls back to.
+    - name: Install yyjson
+      shell: bash
+      run: bash scripts/install-yyjson.sh
     - name: cargo test
       # Exclude secretspec-php-native: it is an ext-php-rs extension that needs a
       # PHP dev toolchain (php-config/headers) this bare runner does not have, and
@@ -219,3 +264,14 @@ jobs:
       # sudo-secretspec-cli is excluded for the same reason as the Linux leg
       # above: it is a macOS-only companion and does not build on Windows.
       run: cargo test --workspace --exclude secretspec-php-native --exclude sudo-secretspec-cli
+    # The Rust conformance build compiles the Windows C launcher, but only the
+    # standalone suite executes its process/environment regressions. Keep this
+    # native CMake run on Windows so ACL-adjacent launch behavior cannot be
+    # "covered" solely by Linux and macOS tests of the POSIX implementation.
+    - name: Build and test standalone C IPC client
+      shell: pwsh
+      run: |
+        cmake -S libsecretspec-resolver -B libsecretspec-resolver/build-cmake
+        cmake --build libsecretspec-resolver/build-cmake --config Release
+        ctest --test-dir libsecretspec-resolver/build-cmake `
+          --build-config Release --output-on-failure

@@ -1,75 +1,78 @@
-//! `check` must write its report to stdout, not stderr.
-//!
-//! The report is the output the user asked for, so `secretspec check | grep
-//! ...` has to see it. It previously went to stderr in its entirety, which
-//! made every pipeline silently observe an empty report while the text
-//! appeared on the terminal anyway.
-//!
-//! These assert the stream split rather than the wording: the report on
-//! stdout, diagnostics and the failure message on stderr, and the exit codes
-//! unchanged in both directions.
-//!
-//! One of them guards the hazard that moving to stdout introduced: a reader
-//! that closes the pipe early (`check | head -1`) makes the next write fail
-//! with EPIPE, and Rust's `println!` *panics* on that. Writing through a sink
-//! turns it into an ordinary error instead.
-
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use tempfile::TempDir;
 
-const MANIFEST: &str = r#"
-[project]
-name = "stream-demo"
-revision = "1.0"
-
-[profiles.default]
-DATABASE_URL = { description = "app database", required = true }
-SENTRY_DSN = { description = "error reporting", required = false }
-"#;
+const SECRET_NAME: &str = "SECRETSPEC_CHECK_STREAM_DATABASE_URL";
 
 fn config_home(project: &Path) -> PathBuf {
     project.join("config")
 }
 
-/// Run `check` against a dotenv file inside the project directory.
-fn run_check(project: &Path, dotenv: &str) -> Output {
-    let env_path = project.join(dotenv);
-    Command::new(env!("CARGO_BIN_EXE_secretspec"))
-        .args([
-            "--file",
-            project.join("secretspec.toml").to_str().unwrap(),
-            "--reason",
-            "checking the report stream",
-            "check",
-            "--no-prompt",
-            "--provider",
-            &format!("dotenv://{}", env_path.display()),
-        ])
+fn run_check(project: &Path, present: bool) -> Output {
+    run(project, present, &["check", "--no-prompt"])
+}
+
+fn run(project: &Path, present: bool, args: &[&str]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_secretspec"));
+    command
+        .args(["--file", project.join("secretspec.toml").to_str().unwrap()])
+        .args(args)
+        .args(["--provider", "env"])
         .current_dir(project)
-        // Keep the subprocess hermetic: no user aliases, defaults, profile, or
-        // audit path may influence the check under test.
+        .env("TMPDIR", temp_dir(project))
+        .env("TMP", temp_dir(project))
+        .env("TEMP", temp_dir(project))
         .env("HOME", project)
         .env("XDG_CONFIG_HOME", config_home(project))
         .env("XDG_STATE_HOME", project.join("state"))
-        // Windows ignores the XDG variables: there the config and audit
-        // directories come from APPDATA and the cache from LOCALAPPDATA.
         .env("APPDATA", config_home(project))
         .env("LOCALAPPDATA", project.join("state"))
         .env_remove("SECRETSPEC_PROVIDER")
         .env_remove("SECRETSPEC_PROFILE")
         .env_remove("SECRETSPEC_SCOPE")
         .env_remove("SECRETSPEC_REASON")
-        .output()
-        .expect("run secretspec check")
+        .env_remove(SECRET_NAME);
+
+    if present {
+        command.env(SECRET_NAME, "postgres://localhost/example");
+    }
+
+    command.output().expect("run secretspec check")
 }
 
-fn project_with(dotenv_name: &str, dotenv_body: &str) -> TempDir {
-    let dir = TempDir::new().expect("temp project");
-    fs::write(dir.path().join("secretspec.toml"), MANIFEST).unwrap();
-    fs::write(dir.path().join(dotenv_name), dotenv_body).unwrap();
-    dir
+fn temp_dir(project: &Path) -> PathBuf {
+    project.join("tmp")
+}
+
+fn project() -> tempfile::TempDir {
+    project_with(false)
+}
+
+fn project_with(as_path: bool) -> tempfile::TempDir {
+    let project = tempfile::tempdir().unwrap();
+    fs::create_dir(temp_dir(project.path())).unwrap();
+    fs::write(
+        project.path().join("secretspec.toml"),
+        format!(
+            r#"[project]
+name = "stream-test"
+revision = "1.0"
+require_reason = false
+
+[profiles.default]
+{SECRET_NAME} = {{ description = "database URL", as_path = {as_path} }}
+"#
+        ),
+    )
+    .unwrap();
+    project
+}
+
+fn temp_files(project: &Path) -> Vec<PathBuf> {
+    fs::read_dir(temp_dir(project))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect()
 }
 
 fn stdout(output: &Output) -> String {
@@ -81,110 +84,83 @@ fn stderr(output: &Output) -> String {
 }
 
 #[test]
-fn a_passing_check_writes_its_whole_report_to_stdout() {
-    let project = project_with(".env", "DATABASE_URL=postgres://localhost/demo\n");
-    let output = run_check(project.path(), ".env");
+fn passing_check_writes_the_report_to_stdout() {
+    let project = project();
+    let output = run_check(project.path(), true);
 
     assert!(
         output.status.success(),
-        "check should succeed, got {}:\n{}",
+        "check failed with {}:\n{}",
         output.status,
         stderr(&output)
     );
+    assert!(stdout(&output).contains("Checking secrets in stream-test"));
+    assert!(stdout(&output).contains(SECRET_NAME));
+    assert!(stdout(&output).contains("Summary:"));
+    assert!(!stderr(&output).contains("Checking secrets in stream-test"));
+    assert!(!stderr(&output).contains("Summary:"));
+}
 
-    let out = stdout(&output);
-    assert!(
-        out.contains("Checking secrets in stream-demo"),
-        "header missing from stdout:\n{out}"
-    );
-    assert!(
-        out.contains("DATABASE_URL"),
-        "per-secret line missing from stdout:\n{out}"
-    );
-    assert!(
-        out.contains("Summary:"),
-        "summary missing from stdout:\n{out}"
-    );
+#[test]
+fn failing_check_keeps_the_report_separate_from_diagnostics() {
+    let project = project();
+    let output = run_check(project.path(), false);
 
-    // The whole point: a pipeline reading stdout sees the report, and nothing
-    // of it is duplicated onto stderr.
-    let err = stderr(&output);
-    assert!(
-        !err.contains("Checking secrets in"),
-        "report leaked onto stderr:\n{err}"
-    );
-    assert!(
-        !err.contains("Summary:"),
-        "summary leaked onto stderr:\n{err}"
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stdout(&output).contains(SECRET_NAME));
+    assert!(stdout(&output).contains("Summary:"));
+    assert!(!stderr(&output).contains("Summary:"));
+    assert!(stderr(&output).contains("Failed to check secrets"));
+}
+
+#[test]
+fn get_keeps_the_as_path_file_it_prints() {
+    let project = project_with(true);
+    let output = run(project.path(), true, &["get", SECRET_NAME]);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let printed = PathBuf::from(stdout(&output).trim());
+    assert_eq!(temp_files(project.path()), vec![printed.clone()]);
+    assert_eq!(
+        fs::read_to_string(printed).unwrap(),
+        "postgres://localhost/example"
     );
 }
 
 #[test]
-fn a_failing_check_reports_on_stdout_but_errors_on_stderr() {
-    // An empty store leaves the required secret unset.
-    let project = project_with("empty.env", "");
-    let output = run_check(project.path(), "empty.env");
+fn check_leaves_no_as_path_files_behind() {
+    let project = project_with(true);
+    let output = run_check(project.path(), true);
 
-    assert_eq!(
-        output.status.code(),
-        Some(1),
-        "a missing required secret must still exit 1"
-    );
-
-    let out = stdout(&output);
-    assert!(
-        out.contains("DATABASE_URL"),
-        "the report belongs on stdout even when the check fails:\n{out}"
-    );
-    assert!(
-        out.contains("Summary:"),
-        "summary missing from stdout:\n{out}"
-    );
-
-    // The failure message itself is a diagnostic and stays on stderr, so the
-    // two streams remain distinguishable.
-    let err = stderr(&output);
-    assert!(
-        err.contains("DATABASE_URL"),
-        "the error naming the missing secret belongs on stderr:\n{err}"
-    );
-    assert!(
-        !err.contains("Summary:"),
-        "the report's summary must not appear on stderr:\n{err}"
-    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(temp_files(project.path()), Vec::<PathBuf>::new());
 }
 
 // Unix-only: this drives a real `sh` pipeline with `head`, and EPIPE is the
-// Unix mechanism under test. The other two tests in this file are portable and
-// do run on the Windows leg.
+// Unix mechanism under test.
 #[cfg(unix)]
 #[test]
 fn a_reader_that_closes_the_pipe_early_does_not_panic() {
-    // Moving the report to stdout put it on a stream a reader can close early.
-    // `println!` panics on EPIPE ("failed printing to stdout: Broken pipe"),
-    // exiting 101 — so before the sink was introduced, the very pipeline this
-    // change exists to enable would abort the process partway through the
-    // report. Worse for the downstream broker: a panic unwinds past the audit
-    // bookkeeping, stranding an operation that has an attempt event and no
-    // terminal one.
+    // The report is on a stream a reader can close early. `println!` panics on
+    // EPIPE ("failed printing to stdout: Broken pipe"), exiting 101, so the
+    // very pipeline the stdout report exists to enable would abort partway
+    // through. A panic also unwinds past audit bookkeeping, stranding an
+    // operation with an attempt event and no terminal one.
     //
     // Driven through `sh` because the hazard is the shell pipeline itself: the
     // reader must exit while the writer still has lines to emit.
-    let project = project_with(".env", "DATABASE_URL=postgres://localhost/demo\n");
-    let env_path = project.path().join(".env");
-
+    let project = project();
     let script = format!(
-        "{bin} --file {manifest} --reason 'closing the pipe early' \
-         check --no-prompt --provider 'dotenv://{env}' | head -1",
+        "{bin} --file {manifest} check --no-prompt --provider env | head -1",
         bin = shell_quote(env!("CARGO_BIN_EXE_secretspec")),
         manifest = shell_quote(project.path().join("secretspec.toml").to_str().unwrap()),
-        env = env_path.display(),
     );
 
     let output = Command::new("sh")
         .arg("-c")
         .arg(&script)
         .current_dir(project.path())
+        .env("TMPDIR", temp_dir(project.path()))
         .env("HOME", project.path())
         .env("XDG_CONFIG_HOME", config_home(project.path()))
         .env("XDG_STATE_HOME", project.path().join("state"))
@@ -192,6 +168,7 @@ fn a_reader_that_closes_the_pipe_early_does_not_panic() {
         .env_remove("SECRETSPEC_PROFILE")
         .env_remove("SECRETSPEC_SCOPE")
         .env_remove("SECRETSPEC_REASON")
+        .env(SECRET_NAME, "postgres://localhost/example")
         .output()
         .expect("run the pipeline");
 
@@ -204,19 +181,15 @@ fn a_reader_that_closes_the_pipe_early_does_not_panic() {
         !err.contains("failed printing to stdout"),
         "check hit the `println!` EPIPE panic:\n{err}"
     );
-
-    // `head` consumed the first line, so the pipeline itself succeeded.
     assert!(
-        stdout(&output).contains("Checking secrets in stream-demo"),
+        stdout(&output).contains("Checking secrets in stream-test"),
         "the reader should still have received the first line: {:?}",
         stdout(&output)
     );
 }
 
+/// Single-quote a path for `sh -c`.
 #[cfg(unix)]
-/// Single-quote a path for `sh -c`. The temp paths here never contain quotes,
-/// but constructing a shell command without escaping is a habit worth not
-/// forming.
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }

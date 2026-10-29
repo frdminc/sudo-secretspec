@@ -3,15 +3,22 @@ title: Scaleway Secret Manager Provider
 description: Scaleway Secret Manager integration
 ---
 
+import VersionCompatibility from '@cachix/site-kit/ui/VersionCompatibility.astro';
+
 import ProviderCredentials from '../../../components/ProviderCredentials.astro';
 
-:::note
-The Scaleway Secret Manager provider is available in SecretSpec 0.17+.
-:::
+<VersionCompatibility version="0.17" />
 
-The Scaleway Secret Manager provider stores secrets in [Scaleway Secret
-Manager](https://www.scaleway.com/en/secret-manager/) through its `v1beta1`
-REST API.
+<VersionCompatibility version="0.21" kind="changed">
+Whole secret values preserve arbitrary bytes on reads and writes. SecretSpec
+handles the API's base64 representation automatically; manifest `encoding`
+is not needed for binary storage. Selecting a JSON `field` still requires a
+UTF-8 document.
+</VersionCompatibility>
+
+The [Scaleway Secret Manager](https://www.scaleway.com/en/secret-manager/)
+provider stores secrets in Scaleway Secret Manager through its `v1beta1` REST
+API.
 
 ## At a glance
 

@@ -73,6 +73,8 @@ export interface CallerContext {
 
 export class Builder {
   withPath(path: string): this;
+  /** Resolve strict inline-spec v2 at `baseDir` (SecretSpec 0.21+). */
+  withInlineSpec(spec: Record<string, unknown>, baseDir: string): this;
   withProvider(provider: string): this;
   withProfile(profile: string): this;
   /** Limit resolution to a named manifest scope (SecretSpec 0.17+). */

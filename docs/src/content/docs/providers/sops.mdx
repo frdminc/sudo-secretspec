@@ -5,14 +5,15 @@ tableOfContents:
   maxHeadingLevel: 4
 ---
 
+import VersionCompatibility from '@cachix/site-kit/ui/VersionCompatibility.astro';
+
 import ProviderCredentials from '../../../components/ProviderCredentials.astro';
 
-The `sops` provider reads and writes secrets in files encrypted with
-<a href="https://getsops.io" target="_blank" rel="noopener noreferrer">SOPS</a>.
+<VersionCompatibility version="0.17" />
 
-:::caution[Version compatibility]
-The `sops` provider was added in SecretSpec 0.17.
-:::
+The [`sops`](https://getsops.io) provider reads and writes secrets in files
+encrypted with SOPS.
+
 
 ## At a glance
 
@@ -88,6 +89,12 @@ creation_rules:
 ```
 
 ## Provider credentials
+
+<VersionCompatibility version="0.21" kind="changed">
+Explicit provider credentials preserve non-UTF-8 bytes in the SOPS subprocess
+environment on Unix. NUL bytes are rejected before SOPS starts; other
+platforms require UTF-8 credentials.
+</VersionCompatibility>
 
 Secret values used to authenticate SOPS belong in a provider alias's
 `credentials` map, not in the SOPS URI.

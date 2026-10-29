@@ -62,10 +62,15 @@
 //! secretspec check --provider 'aac://shared?tag=app=payments&tag=stage=production'
 //! ```
 
+use super::ProviderBase as _;
+use super::async_provider::map_concurrently;
 use super::{
-    Address, DiscoveryContext, Provider, ProviderCredentials, ProviderUrl, credential_or_env,
-    get_each_concurrency, map_concurrently,
+    Address, DiscoveryContext, ProviderCredentials, ProviderUrl, credential_or_env,
+    get_each_concurrency,
 };
+#[cfg(test)]
+use super::{Provider, SyncProviderAdapter};
+use crate::SecretBytes;
 use crate::config::NativeAddress;
 use crate::{Result, SecretSpecError};
 use azure_core::credentials::{Secret as AzureSecret, TokenCredential};
@@ -73,7 +78,6 @@ use reqwest::header::{
     AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, IF_MATCH, IF_NONE_MATCH,
 };
 use reqwest::{Method, StatusCode};
-use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -87,9 +91,6 @@ const DEFAULT_KEY_VAULT_SUFFIX: &str = "vault.azure.net";
 const KEY_VAULT_REFERENCE_TYPE: &str = "application/vnd.microsoft.appconfig.keyvaultref+json";
 const AZURE_SPECIAL_PREFIX: &str = "application/vnd.microsoft.appconfig.";
 const AZURE_APPCONFIG_CONNECTION_STRING_ENV: &str = "AZURE_APPCONFIG_CONNECTION_STRING";
-const TENANT_ID: &str = "tenant_id";
-const CLIENT_ID: &str = "client_id";
-const CLIENT_SECRET: &str = "client_secret";
 const CONNECTION_STRING: &str = "connection_string";
 const MAX_TAG_FILTERS: usize = 5;
 const MAX_VAULT_CLIENTS: usize = 16;
@@ -451,6 +452,7 @@ struct SyncToken {
 
 /// Azure App Configuration provider, available in SecretSpec 0.20+.
 pub struct AacProvider {
+    retry_policy: super::RetryPolicy,
     config: AacConfig,
     credentials: ProviderCredentials,
     http: OnceLock<reqwest::Client>,
@@ -466,16 +468,8 @@ pub struct AacProvider {
 crate::register_provider! {
     struct: AacProvider,
     config: AacConfig,
-    name: "aac",
-    description: "Azure App Configuration (0.20+)",
-    schemes: ["aac"],
-    examples: [
-        "aac://payments-production",
-        "aac://shared?label=production&prefix=payments:",
-        "aac://shared?tag=app=payments&tag=stage=production",
-    ],
-    credential_names: [TENANT_ID, CLIENT_ID, CLIENT_SECRET, CONNECTION_STRING],
-    deletes: true,
+    metadata: &super::catalog::AAC,
+    native_async: true,
 }
 
 impl AacProvider {
@@ -483,6 +477,7 @@ impl AacProvider {
         Self {
             config,
             credentials: ProviderCredentials::new(),
+            retry_policy: super::RetryPolicy::default(),
             http: OnceLock::new(),
             auth: OnceLock::new(),
             key_vault_credential: OnceLock::new(),
@@ -495,7 +490,7 @@ impl AacProvider {
     }
 
     fn http_client_builder() -> reqwest::ClientBuilder {
-        reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
+        super::http::client_builder().redirect(reqwest::redirect::Policy::none())
     }
 
     fn http(&self) -> Result<&reqwest::Client> {
@@ -529,7 +524,7 @@ impl AacProvider {
                 "auth=connection_string requires the connection_string provider credential or {AZURE_APPCONFIG_CONNECTION_STRING_ENV}"
             ))
         })?;
-        parse_connection_string(&connection_string, &self.config.endpoint)
+        parse_connection_string(connection_string.try_as_utf8()?, &self.config.endpoint)
             .map(ResolvedAuth::ConnectionString)
     }
 
@@ -683,12 +678,34 @@ impl AacProvider {
             }
         };
 
-        let response = request.send().await.map_err(|error| {
-            operation_error(format!(
-                "Azure App Configuration request failed for {}: {error}",
-                safe_request_target(&url)
-            ))
-        })?;
+        let action = if method == Method::GET || method == Method::HEAD {
+            "read"
+        } else if method == Method::DELETE {
+            "delete"
+        } else {
+            "write"
+        };
+        let response = super::http::send_checked(
+            self.retry_policy,
+            "Azure App Configuration",
+            request,
+            false,
+            |response| async {
+                if super::http::transient_status(response.status().as_u16()) {
+                    let hint = response
+                        .headers()
+                        .get(reqwest::header::RETRY_AFTER)
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(super::http::retry_after);
+                    return Err(super::retry::transient(
+                        self.response_error(action, response).await,
+                        hint,
+                    ));
+                }
+                super::http::checked_response("Azure App Configuration", response).await
+            },
+        )
+        .await?;
         self.merge_sync_tokens(response.headers());
         Ok(response)
     }
@@ -754,6 +771,7 @@ fn parse_connection_string(value: &str, configured_endpoint: &str) -> Result<Con
     })
 }
 
+#[cfg(test)]
 fn safe_request_target(url: &Url) -> String {
     match url.query() {
         Some(query) => format!("{}?{query}", url.path()),
@@ -886,7 +904,7 @@ enum ValueType {
 }
 
 enum SelectedValue {
-    Direct(SecretString),
+    Direct(SecretBytes),
     Reference {
         key: String,
         reference: VaultReference,
@@ -1019,9 +1037,12 @@ impl AacProvider {
 
     async fn parse_key_value(&self, action: &str, response: reqwest::Response) -> Result<KeyValue> {
         let bytes = response.bytes().await.map_err(|error| {
-            operation_error(format!(
-                "failed to read Azure App Configuration {action} response: {error}"
-            ))
+            super::http::body_error(
+                operation_error(format!(
+                    "failed to read Azure App Configuration {action} response: {error}"
+                )),
+                error,
+            )
         })?;
         serde_json::from_slice(&bytes).map_err(|error| {
             operation_error(format!(
@@ -1096,7 +1117,7 @@ impl AacProvider {
         match Self::value_type(record.content_type.as_deref()) {
             ValueType::Direct => record
                 .value
-                .map(|value| SelectedValue::Direct(SecretString::new(value.into())))
+                .map(|value| SelectedValue::Direct(SecretBytes::from_utf8(value)))
                 .ok_or_else(|| {
                     operation_error(format!(
                         "Azure App Configuration key '{key}' has no direct value"
@@ -1168,7 +1189,8 @@ impl AacProvider {
         Ok(Some(record))
     }
 
-    async fn set_async(&self, key: &str, value: &SecretString) -> Result<()> {
+    async fn set_async(&self, key: &str, value: &SecretBytes) -> Result<()> {
+        let value = super::require_utf8("aac", value)?;
         let existing = self.mutation_record(key).await?;
         let created_tags;
         let (tags, content_type, description, conditional) = match &existing {
@@ -1189,7 +1211,7 @@ impl AacProvider {
             }
         };
         let body = serde_json::to_vec(&KeyValueWrite {
-            value: value.expose_secret(),
+            value,
             content_type,
             tags,
             description,
@@ -1434,9 +1456,9 @@ impl AacProvider {
             reference.vault_host.clone(),
             super::akv::AuthMethod::Env,
         );
-        let provider = Arc::new(super::akv::AkvProvider::with_token_credential(
-            config, credential,
-        ));
+        let mut provider = super::akv::AkvProvider::with_token_credential(config, credential);
+        provider.set_retry_policy(self.retry_policy);
+        let provider = Arc::new(provider);
         let mut vaults = self.vaults.lock().unwrap();
         if let Some(existing) = vaults.get(&reference.vault_host) {
             return Ok(Arc::clone(existing));
@@ -1450,27 +1472,29 @@ impl AacProvider {
         Ok(provider)
     }
 
-    fn resolve_vault_reference(&self, reference: &VaultReference) -> Result<SecretString> {
+    async fn resolve_vault_reference(&self, reference: &VaultReference) -> Result<SecretBytes> {
         let provider = self.vault_provider(reference)?;
         let address = NativeAddress {
             item: reference.secret_name.clone(),
             version: reference.version.clone(),
             ..Default::default()
         };
-        provider.get(Address::Native(&address))?.ok_or_else(|| {
-            operation_error(format!(
-                "Azure App Configuration contains a dangling Key Vault reference to host '{}'",
-                reference.vault_host
-            ))
-        })
+        super::AsyncProvider::get(provider.as_ref(), Address::Native(&address))
+            .await?
+            .ok_or_else(|| {
+                operation_error(format!(
+                    "Azure App Configuration contains a dangling Key Vault reference to host '{}'",
+                    reference.vault_host
+                ))
+            })
     }
 
-    fn resolve_selected_reference(
+    async fn resolve_selected_reference(
         &self,
         key: &str,
         reference: &VaultReference,
-    ) -> Result<SecretString> {
-        self.resolve_vault_reference(reference).map_err(|error| {
+    ) -> Result<SecretBytes> {
+        self.resolve_vault_reference(reference).await.map_err(|error| {
             operation_error(format!(
                 "failed to resolve Key Vault reference from Azure App Configuration key '{key}' through vault '{}': {error}",
                 reference.vault_host
@@ -1478,23 +1502,26 @@ impl AacProvider {
         })
     }
 
-    fn get_selected(&self, addr: Address<'_>) -> Result<Option<SelectedValue>> {
+    async fn get_selected(&self, addr: Address<'_>) -> Result<Option<SelectedValue>> {
         self.initial_request
-            .run(|| super::block_on(self.selected_value_async(addr)))
+            .run_async(|| self.selected_value_async(addr))
+            .await
     }
 
-    fn get_many_selected(
+    async fn get_many_selected(
         &self,
         requests: &[(&str, Address<'_>)],
-    ) -> Result<HashMap<String, SecretString>> {
+    ) -> Result<HashMap<String, SecretBytes>> {
         let mut groups: HashMap<Address<'_>, Vec<&str>> = HashMap::new();
         for (name, address) in requests {
             groups.entry(*address).or_default().push(name);
         }
         let groups = groups.into_iter().collect::<Vec<_>>();
-        let selected = map_concurrently(&groups, get_each_concurrency(), |(address, names)| {
-            (names.clone(), self.get_selected(*address))
-        });
+        let selected =
+            map_concurrently(&groups, get_each_concurrency(), |(address, names)| async {
+                (names.clone(), self.get_selected(*address).await)
+            })
+            .await;
 
         let mut values = HashMap::new();
         let mut references: HashMap<VaultReference, (Vec<&str>, BTreeSet<String>)> = HashMap::new();
@@ -1521,8 +1548,8 @@ impl AacProvider {
         let resolved = map_concurrently(
             &references,
             get_each_concurrency(),
-            |(reference, names, keys)| {
-                let result = self.resolve_vault_reference(reference).map_err(|error| {
+            |(reference, names, keys)| async {
+                let result = self.resolve_vault_reference(reference).await.map_err(|error| {
                     operation_error(format!(
                         "failed to resolve Key Vault reference for {} from Azure App Configuration key(s) {} through vault '{}': {error}",
                         names.join(", "),
@@ -1532,7 +1559,7 @@ impl AacProvider {
                 });
                 (names.clone(), result)
             },
-        );
+        ).await;
         for (names, result) in resolved {
             let value = result?;
             for name in names {
@@ -1647,9 +1674,12 @@ impl AacProvider {
                 return Err(self.response_error("discovery", response).await);
             }
             let bytes = response.bytes().await.map_err(|error| {
-                operation_error(format!(
-                    "failed to read Azure App Configuration discovery response: {error}"
-                ))
+                super::http::body_error(
+                    operation_error(format!(
+                        "failed to read Azure App Configuration discovery response: {error}"
+                    )),
+                    error,
+                )
             })?;
             let page: KeyValueList = serde_json::from_slice(&bytes).map_err(|error| {
                 operation_error(format!(
@@ -1675,7 +1705,15 @@ impl AacProvider {
     }
 }
 
-impl Provider for AacProvider {
+impl super::ProviderBase for AacProvider {
+    fn retry_ownership(&self) -> super::RetryOwnership {
+        super::RetryOwnership::Managed
+    }
+
+    fn set_retry_policy(&mut self, policy: super::RetryPolicy) {
+        self.retry_policy = policy;
+    }
+
     fn convention_address(&self, project: &str, profile: &str, key: &str) -> Result<NativeAddress> {
         Ok(NativeAddress {
             item: self.convention_key(project, profile, key)?,
@@ -1687,67 +1725,8 @@ impl Provider for AacProvider {
         self.credentials = credentials;
     }
 
-    fn get(&self, addr: Address<'_>) -> Result<Option<SecretString>> {
-        match self.get_selected(addr)? {
-            Some(SelectedValue::Direct(value)) => Ok(Some(value)),
-            Some(SelectedValue::Reference { key, reference }) => {
-                self.resolve_selected_reference(&key, &reference).map(Some)
-            }
-            None => Ok(None),
-        }
-    }
-
-    fn get_many(&self, requests: &[(&str, Address<'_>)]) -> Result<HashMap<String, SecretString>> {
-        self.get_many_selected(requests)
-    }
-
-    fn set(&self, addr: Address<'_>, value: &SecretString) -> Result<()> {
-        if matches!(addr, Address::Native(_)) {
-            return self.check_writable(addr);
-        }
-        let key = self.resolve_key(addr)?;
-        self.initial_request
-            .run(|| super::block_on(self.set_async(&key, value)))
-    }
-
-    fn check_writable(&self, addr: Address<'_>) -> Result<()> {
-        self.resolve_coords(addr)?;
-        if matches!(addr, Address::Native(_)) {
-            return Err(operation_error(
-                "aac native references are read-only and cannot be written".to_string(),
-            ));
-        }
-        let key = self.resolve_key(addr)?;
-        self.initial_request
-            .run(|| super::block_on(self.mutation_record(&key)).map(|_| ()))
-    }
-
-    fn delete(&self, addr: Address<'_>) -> Result<bool> {
-        if matches!(addr, Address::Native(_)) {
-            self.check_deletable(addr)?;
-            return Err(operation_error(
-                "aac native deletion is not implemented".to_string(),
-            ));
-        }
-        let key = self.resolve_key(addr)?;
-        self.initial_request
-            .run(|| super::block_on(self.delete_async(&key)))
-    }
-
     fn supports_delete(&self) -> bool {
         true
-    }
-
-    fn check_deletable(&self, addr: Address<'_>) -> Result<()> {
-        self.resolve_coords(addr)?;
-        if matches!(addr, Address::Native(_)) {
-            return Err(operation_error(
-                "aac native references are read-only and cannot be deleted".to_string(),
-            ));
-        }
-        let key = self.resolve_key(addr)?;
-        self.initial_request
-            .run(|| super::block_on(self.mutation_record(&key)).map(|_| ()))
     }
 
     fn describe_write_target(&self, addr: Address<'_>) -> Result<String> {
@@ -1765,7 +1744,7 @@ impl Provider for AacProvider {
         ))
     }
 
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         Self::PROVIDER_NAME
     }
 
@@ -1822,10 +1801,84 @@ impl Provider for AacProvider {
     fn entry_container_identity(&self) -> String {
         format!("{}|label={:?}", self.config.endpoint, self.config.label)
     }
+}
 
-    fn reflect(&self, context: DiscoveryContext<'_>) -> Result<HashMap<String, crate::Secret>> {
+#[async_trait::async_trait]
+impl super::AsyncProvider for AacProvider {
+    async fn get(&self, addr: Address<'_>) -> Result<Option<SecretBytes>> {
+        match self.get_selected(addr).await? {
+            Some(SelectedValue::Direct(value)) => Ok(Some(value)),
+            Some(SelectedValue::Reference { key, reference }) => self
+                .resolve_selected_reference(&key, &reference)
+                .await
+                .map(Some),
+            None => Ok(None),
+        }
+    }
+
+    async fn get_many(
+        &self,
+        requests: &[(&str, Address<'_>)],
+    ) -> Result<HashMap<String, SecretBytes>> {
+        self.get_many_selected(requests).await
+    }
+
+    async fn set(&self, addr: Address<'_>, value: &SecretBytes) -> Result<()> {
+        if matches!(addr, Address::Native(_)) {
+            return super::AsyncProvider::check_writable(self, addr).await;
+        }
+        let key = self.resolve_key(addr)?;
         self.initial_request
-            .run(|| super::block_on(self.reflect_async(context)))
+            .run_async(|| async { self.set_async(&key, value).await })
+            .await
+    }
+
+    async fn check_writable(&self, addr: Address<'_>) -> Result<()> {
+        self.resolve_coords(addr)?;
+        if matches!(addr, Address::Native(_)) {
+            return Err(operation_error(
+                "aac native references are read-only and cannot be written".to_string(),
+            ));
+        }
+        let key = self.resolve_key(addr)?;
+        self.initial_request
+            .run_async(|| async { self.mutation_record(&key).await.map(|_| ()) })
+            .await
+    }
+
+    async fn delete(&self, addr: Address<'_>) -> Result<bool> {
+        if matches!(addr, Address::Native(_)) {
+            super::AsyncProvider::check_deletable(self, addr).await?;
+            return Err(operation_error(
+                "aac native deletion is not implemented".to_string(),
+            ));
+        }
+        let key = self.resolve_key(addr)?;
+        self.initial_request
+            .run_async(|| async { self.delete_async(&key).await })
+            .await
+    }
+
+    async fn check_deletable(&self, addr: Address<'_>) -> Result<()> {
+        self.resolve_coords(addr)?;
+        if matches!(addr, Address::Native(_)) {
+            return Err(operation_error(
+                "aac native references are read-only and cannot be deleted".to_string(),
+            ));
+        }
+        let key = self.resolve_key(addr)?;
+        self.initial_request
+            .run_async(|| async { self.mutation_record(&key).await.map(|_| ()) })
+            .await
+    }
+
+    async fn reflect(
+        &self,
+        context: DiscoveryContext<'_>,
+    ) -> Result<HashMap<String, crate::Secret>> {
+        self.initial_request
+            .run_async(|| async { self.reflect_async(context).await })
+            .await
     }
 }
 
@@ -1864,6 +1917,7 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
     struct StubResponse {
         status: u16,
         headers: Vec<(String, String)>,
@@ -2055,11 +2109,11 @@ mod tests {
         AacConfig::try_from(&ProviderUrl::new(Url::parse(uri).unwrap())).unwrap()
     }
 
-    fn provider(uri: &str) -> AacProvider {
-        AacProvider::new(config(uri))
+    fn provider(uri: &str) -> SyncProviderAdapter<AacProvider> {
+        SyncProviderAdapter::from_async(AacProvider::new(config(uri)))
     }
 
-    fn fixture_provider(endpoint: &str, uri: &str) -> AacProvider {
+    fn fixture_provider(endpoint: &str, uri: &str) -> SyncProviderAdapter<AacProvider> {
         let mut provider = provider(uri);
         provider.config.endpoint = endpoint.to_string();
         provider.allow_insecure_loopback = true;
@@ -2438,14 +2492,17 @@ mod tests {
 
         for status in [400, 401, 403, 409, 412, 429] {
             let failure = HttpFixture::start(|_| {
-                vec![StubResponse::json(
-                    status,
-                    json!({
-                        "name": "tags",
-                        "title": "request failed",
-                        "detail": "sensitive response detail"
-                    }),
-                )]
+                vec![
+                    StubResponse::json(
+                        status,
+                        json!({
+                            "name": "tags",
+                            "title": "request failed",
+                            "detail": "sensitive response detail"
+                        }),
+                    );
+                    if status == 429 { 3 } else { 1 }
+                ]
             });
             let provider = fixture_provider(&failure.endpoint, "aac://shared");
             let error =
@@ -2457,7 +2514,7 @@ mod tests {
             assert!(error.to_string().contains("parameter 'tags'"), "{error}");
             assert!(!error.to_string().contains("request failed"), "{error}");
             assert!(!error.to_string().contains("sensitive"), "{error}");
-            assert_eq!(failure.finish().len(), 1);
+            assert_eq!(failure.finish().len(), if status == 429 { 3 } else { 1 });
         }
 
         let oversized = HttpFixture::start(|_| {
@@ -2563,7 +2620,7 @@ mod tests {
         );
         super::super::block_on(provider.set_async(
             "secretspec:checkout:prod:API_KEY",
-            &SecretString::new("new-value".to_string().into()),
+            &SecretBytes::from_utf8("new-value"),
         ))
         .unwrap();
 
@@ -2636,7 +2693,7 @@ mod tests {
         let secret = "redirect-secret-value";
 
         let error = super::super::block_on(
-            provider.set_async("redirected", &SecretString::new(secret.to_string().into())),
+            provider.set_async("redirected", &SecretBytes::from_utf8(secret.to_string())),
         )
         .unwrap_err();
         assert!(error.to_string().contains("HTTP 307"), "{error}");
@@ -2669,10 +2726,9 @@ mod tests {
             ]
         });
         let provider = fixture_provider(&fixture.endpoint, "aac://shared?tag=app=payments");
-        let error = super::super::block_on(
-            provider.set_async("key", &SecretString::new("new".to_string().into())),
-        )
-        .unwrap_err();
+        let error =
+            super::super::block_on(provider.set_async("key", &SecretBytes::from_utf8("new")))
+                .unwrap_err();
         assert!(
             error.to_string().contains("changed concurrently"),
             "{error}"
@@ -2695,10 +2751,9 @@ mod tests {
             vec![StubResponse::json(200, record)]
         });
         let provider = fixture_provider(&fixture.endpoint, "aac://shared?tag=app=payments");
-        let error = super::super::block_on(
-            provider.set_async("key", &SecretString::new("new".to_string().into())),
-        )
-        .unwrap_err();
+        let error =
+            super::super::block_on(provider.set_async("key", &SecretBytes::from_utf8("new")))
+                .unwrap_err();
         assert!(
             error.to_string().contains("does not match configured tag"),
             "{error}"
@@ -2727,10 +2782,9 @@ mod tests {
                 vec![StubResponse::json(200, record)]
             });
             let provider = fixture_provider(&fixture.endpoint, "aac://shared");
-            let error = super::super::block_on(
-                provider.set_async("key", &SecretString::new("new".to_string().into())),
-            )
-            .unwrap_err();
+            let error =
+                super::super::block_on(provider.set_async("key", &SecretBytes::from_utf8("new")))
+                    .unwrap_err();
             assert!(error.to_string().contains(expected), "{error}");
             let requests = fixture.finish();
             assert_eq!(requests.len(), 1);
@@ -2827,10 +2881,9 @@ mod tests {
             .unwrap();
         assert_eq!(read.value.as_deref(), Some("value"));
 
-        let write_error = super::super::block_on(
-            provider.set_async("key", &SecretString::new("new".to_string().into())),
-        )
-        .unwrap_err();
+        let write_error =
+            super::super::block_on(provider.set_async("key", &SecretBytes::from_utf8("new")))
+                .unwrap_err();
         assert!(write_error.to_string().contains("HTTP 403"));
         assert!(!write_error.to_string().contains("must stay private"));
 
@@ -2953,8 +3006,8 @@ mod tests {
                 ("SECOND", Address::Native(&address)),
             ])
             .unwrap();
-        assert_eq!(values["FIRST"].expose_secret(), "secret-value");
-        assert_eq!(values["SECOND"].expose_secret(), "secret-value");
+        assert_eq!(values["FIRST"].expose_secret(), b"secret-value");
+        assert_eq!(values["SECOND"].expose_secret(), b"secret-value");
         assert_eq!(fixture.finish().len(), 1);
     }
 
@@ -2987,8 +3040,8 @@ mod tests {
                 ("SECOND", Address::Native(&second)),
             ])
             .unwrap();
-        assert_eq!(values["FIRST"].expose_secret(), "resolved-value");
-        assert_eq!(values["SECOND"].expose_secret(), "resolved-value");
+        assert_eq!(values["FIRST"].expose_secret(), b"resolved-value");
+        assert_eq!(values["SECOND"].expose_secret(), b"resolved-value");
         assert_eq!(transport.paths.lock().unwrap().len(), 1);
         assert_eq!(fixture.finish().len(), 2);
     }
@@ -3073,7 +3126,7 @@ mod tests {
                 .values()
                 .map(|value| value.expose_secret())
                 .collect::<BTreeSet<_>>(),
-            BTreeSet::from(["first-value", "second-value"])
+            BTreeSet::from([b"first-value".as_slice(), b"second-value".as_slice()])
         );
         assert_eq!(first_transport.paths.lock().unwrap().len(), 1);
         assert_eq!(second_transport.paths.lock().unwrap().len(), 1);
@@ -3330,8 +3383,7 @@ mod tests {
         let SelectedValue::Reference { key, reference } = selected else {
             panic!("expected Key Vault reference");
         };
-        let error = provider
-            .resolve_selected_reference(&key, &reference)
+        let error = super::super::block_on(provider.resolve_selected_reference(&key, &reference))
             .unwrap_err();
         assert!(
             error.to_string().contains(

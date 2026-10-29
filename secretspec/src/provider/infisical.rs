@@ -73,13 +73,14 @@
 //! and folders. The resulting error names the environment and whether the
 //! profile or `?env=` selected it.
 
-use super::{
-    Address, Provider, ProviderCredentials, ProviderUrl, credential_or_env, join_slash_path,
-};
+use super::ProviderBase as _;
+use super::{Address, ProviderCredentials, ProviderUrl, credential_or_env, join_slash_path};
+#[cfg(test)]
+use super::{Provider, SyncProviderAdapter};
+use crate::SecretBytes;
 use crate::config::NativeAddress;
 use crate::{Result, SecretSpecError};
 use reqwest::StatusCode;
-use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
@@ -132,7 +133,7 @@ impl InfisicalConfig {
     ///
     /// The URI names a host, so the endpoint is a host too: a domain carrying
     /// a path is refused rather than accepted into a config that
-    /// [`uri`](Provider::uri) could not render back.
+    /// [`uri`](super::Provider::uri) could not render back.
     ///
     /// A trailing `/api` is the exception, and is dropped rather than refused.
     /// Infisical's own CLI appends `/api` to the domain unless it is already
@@ -272,12 +273,13 @@ struct Location {
 /// The distinction an environment diagnostic needs to retain after a secret
 /// read. An HTTP 200 without a usable value is not Infisical's ambiguous 404.
 enum SecretRead {
-    Response(Option<SecretString>),
+    Response(Option<SecretBytes>),
     NotFound,
 }
 
 /// Infisical provider.
 pub struct InfisicalProvider {
+    retry_policy: super::RetryPolicy,
     config: InfisicalConfig,
     /// Credentials supplied by the provider alias.
     credentials: ProviderCredentials,
@@ -291,17 +293,17 @@ pub struct InfisicalProvider {
     /// then discard all but one. Infisical supports client secrets with a
     /// one-use limit, for which the surplus exchanges are not just waste but a
     /// hard failure.
-    token: tokio::sync::OnceCell<SecretString>,
+    token: tokio::sync::OnceCell<SecretBytes>,
     /// One HTTP client for every request, so a run of secrets reuses the
     /// connection rather than building a pool per call.
     http: OnceLock<reqwest::Client>,
-    /// The session's profile, set by [`Provider::set_profile`] before any I/O.
+    /// The session's profile, set by [`super::Provider::set_profile`] before any I/O.
     ///
     /// A convention address names the profile itself, so this only answers for a
     /// `ref`, whose coordinates name a folder and key but never an environment.
     /// It is deliberately not part of [`InfisicalConfig`]: the environment a
-    /// profile implies must not reach [`uri`](Provider::uri) or
-    /// [`storage_identity`](Provider::storage_identity), or the same store would
+    /// profile implies must not reach [`uri`](super::Provider::uri) or
+    /// [`storage_identity`](super::Provider::storage_identity), or the same store would
     /// take one identity per profile.
     profile: Mutex<Option<String>>,
 }
@@ -309,11 +311,8 @@ pub struct InfisicalProvider {
 crate::register_provider! {
     struct: InfisicalProvider,
     config: InfisicalConfig,
-    name: "infisical",
-    description: "Infisical secret management",
-    schemes: ["infisical"],
-    examples: ["infisical://app.infisical.com/{project-id}"],
-    credential_names: [CLIENT_ID, CLIENT_SECRET, TOKEN],
+    metadata: &super::catalog::INFISICAL,
+    native_async: true,
 }
 
 impl InfisicalProvider {
@@ -322,6 +321,7 @@ impl InfisicalProvider {
         Self {
             config,
             credentials: ProviderCredentials::new(),
+            retry_policy: super::RetryPolicy::default(),
             token: tokio::sync::OnceCell::new(),
             http: OnceLock::new(),
             profile: Mutex::new(None),
@@ -330,10 +330,10 @@ impl InfisicalProvider {
 
     /// The shared HTTP client.
     fn http(&self) -> &reqwest::Client {
-        self.http.get_or_init(reqwest::Client::new)
+        self.http.get_or_init(super::http::default_client)
     }
 
-    /// The profile this session resolves under, if [`Provider::set_profile`] has
+    /// The profile this session resolves under, if [`super::Provider::set_profile`] has
     /// run.
     ///
     /// A blank profile is treated as absent: an empty environment slug would
@@ -465,17 +465,17 @@ impl InfisicalProvider {
     /// The login is awaited rather than blocked on: this runs inside the
     /// runtime that [`block_on`](super::block_on) already entered for the
     /// request, and blocking there would panic.
-    async fn resolve_token(&self) -> Result<&SecretString> {
+    async fn resolve_token(&self) -> Result<&SecretBytes> {
         // `get_or_try_init` runs one initializer at a time: a concurrent caller
         // waits for the in-flight exchange and takes its token rather than
         // starting a second one. On failure the cell stays empty, so a later
         // call retries instead of caching the error.
         self.token
             .get_or_try_init(|| async {
-                // `credential_or_env` never yields an empty value, so a blank
-                // INFISICAL_TOKEN reads as absent rather than as a broken token.
+                // An absent credential permits login; an explicit value is
+                // always used, with validation at the request boundary.
                 match credential_or_env(&self.credentials, TOKEN, INFISICAL_TOKEN_ENV) {
-                    Some(token) => Ok(SecretString::new(token.into())),
+                    Some(token) => Ok(token),
                     None => self.login().await,
                 }
             })
@@ -483,7 +483,7 @@ impl InfisicalProvider {
     }
 
     /// Exchanges the machine identity's credentials for an access token.
-    async fn login(&self) -> Result<SecretString> {
+    async fn login(&self) -> Result<SecretBytes> {
         let client_id = credential_or_env(&self.credentials, CLIENT_ID, INFISICAL_CLIENT_ID_ENV);
         let client_secret = credential_or_env(
             &self.credentials,
@@ -519,23 +519,20 @@ impl InfisicalProvider {
 
         let url = format!("{}/api/v1/auth/universal-auth/login", self.config.endpoint);
         let body = serde_json::json!({
-            "clientId": client_id,
-            "clientSecret": client_secret,
+            "clientId": client_id.try_as_utf8()?,
+            "clientSecret": client_secret.try_as_utf8()?,
         });
 
-        let response = self
-            .http()
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| {
-                SecretSpecError::ProviderOperationFailed(format!(
-                    "Failed to connect to Infisical at {}: {}",
-                    self.config.endpoint,
-                    crate::error::display_error_chain(&e)
-                ))
-            })?;
+        // Keep the authentication connection out of the pool used for secret reads.
+        let auth_client = super::http::default_client();
+        let response = super::http::send(
+            self.retry_policy,
+            "Infisical",
+            auth_client.post(&url).json(&body),
+            false,
+        )
+        .await
+        .map_err(super::retry::terminal)?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -546,12 +543,19 @@ impl InfisicalProvider {
             )));
         }
 
-        let parsed: serde_json::Value = response.json().await.map_err(|e| {
-            SecretSpecError::ProviderOperationFailed(format!(
-                "Failed to parse Infisical login response: {}",
-                crate::error::display_error_chain(&e)
-            ))
-        })?;
+        let parsed: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| {
+                super::http::body_error(
+                    SecretSpecError::ProviderOperationFailed(format!(
+                        "Failed to parse Infisical login response: {}",
+                        crate::error::display_error_chain(&e)
+                    )),
+                    e,
+                )
+            })
+            .map_err(super::retry::terminal)?;
 
         let token = parsed["accessToken"].as_str().ok_or_else(|| {
             SecretSpecError::ProviderOperationFailed(
@@ -559,7 +563,7 @@ impl InfisicalProvider {
             )
         })?;
 
-        Ok(SecretString::new(token.to_string().into()))
+        Ok(SecretBytes::from_utf8(token.to_string()))
     }
 
     /// Infisical's error envelope carries a human-readable `message`; the
@@ -576,10 +580,13 @@ impl InfisicalProvider {
     async fn response_body(response: reqwest::Response) -> Result<String> {
         let status = response.status();
         response.text().await.map_err(|e| {
-            SecretSpecError::ProviderOperationFailed(format!(
-                "Failed to read Infisical HTTP {status} response body: {}",
-                crate::error::display_error_chain(&e)
-            ))
+            super::http::body_error(
+                SecretSpecError::ProviderOperationFailed(format!(
+                    "Failed to read Infisical HTTP {status} response body: {}",
+                    crate::error::display_error_chain(&e)
+                )),
+                e,
+            )
         })
     }
 
@@ -630,7 +637,7 @@ impl InfisicalProvider {
     /// `secretValueHidden` is set. Passing that placeholder on would export a
     /// literal `<hidden-by-infisical>` to the process SecretSpec runs, so it is
     /// reported as the refusal it is.
-    fn secret_value(secret: &serde_json::Value, key: &str) -> Result<Option<SecretString>> {
+    fn secret_value(secret: &serde_json::Value, key: &str) -> Result<Option<SecretBytes>> {
         if secret["secretValueHidden"].as_bool() == Some(true) {
             return Err(SecretSpecError::ProviderOperationFailed(format!(
                 "Infisical withheld the value of '{key}': this identity may see that the \
@@ -639,7 +646,7 @@ impl InfisicalProvider {
         }
         Ok(secret["secretValue"]
             .as_str()
-            .map(|v| SecretString::new(v.to_string().into())))
+            .map(|v| SecretBytes::from_utf8(v.to_string())))
     }
 
     /// The URL naming one secret.
@@ -711,7 +718,7 @@ impl InfisicalProvider {
     /// in reverse, taking the first value it finds for a key).
     fn merge_imports(
         parsed: &serde_json::Value,
-        listed: &mut HashMap<String, SecretString>,
+        listed: &mut HashMap<String, SecretBytes>,
     ) -> Result<()> {
         // Absent rather than empty on an instance that predates imports, or on
         // a folder that imports nothing.
@@ -749,7 +756,7 @@ impl InfisicalProvider {
         &self,
         environment: &str,
         secret_path: &str,
-    ) -> Result<Option<HashMap<String, SecretString>>> {
+    ) -> Result<Option<HashMap<String, SecretBytes>>> {
         let url = format!("{}/api/v4/secrets", self.config.endpoint);
         let query = self.read_query(environment, secret_path);
 
@@ -798,7 +805,9 @@ impl InfisicalProvider {
     async fn ensure_environment_exists_async(&self, environment: &str) -> Result<()> {
         let url = format!("{}/api/v4/secrets", self.config.endpoint);
         let query = self.environment_probe_query(environment);
-        let response = self.send(reqwest::Method::GET, &url, &query, None).await?;
+        let response = self
+            .send_response(reqwest::Method::GET, &url, &query, None, false)
+            .await?;
         let status = response.status();
 
         match status {
@@ -818,7 +827,7 @@ impl InfisicalProvider {
     /// fails and stores nothing, not even part of the path. Each request is
     /// chosen from the status of the one before it, so updating an existing
     /// secret costs a single call, and only a new secret costs more.
-    async fn set_async(&self, loc: &Location, value: &SecretString) -> Result<()> {
+    async fn set_async(&self, loc: &Location, value: &SecretBytes) -> Result<()> {
         // A secret that is merely absent, and a folder that is absent, both
         // answer 404 here.
         if self
@@ -860,14 +869,15 @@ impl InfisicalProvider {
         &self,
         method: reqwest::Method,
         loc: &Location,
-        value: &SecretString,
+        value: &SecretBytes,
     ) -> Result<bool> {
+        let value = super::require_utf8("infisical", value)?;
         let url = self.secret_url(&loc.key)?;
         let body = serde_json::json!({
             "projectId": self.config.project_id,
             "environment": loc.environment,
             "secretPath": loc.secret_path,
-            "secretValue": value.expose_secret(),
+            "secretValue": value,
         });
 
         let response = self.send(method, &url, &[], Some(body)).await?;
@@ -965,22 +975,44 @@ impl InfisicalProvider {
         query: &[(&str, &str)],
         body: Option<serde_json::Value>,
     ) -> Result<reqwest::Response> {
+        self.send_response(method, url, query, body, true).await
+    }
+
+    async fn send_response(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        query: &[(&str, &str)],
+        body: Option<serde_json::Value>,
+        consume_success: bool,
+    ) -> Result<reqwest::Response> {
         let token = self.resolve_token().await?;
         let mut request = self
             .http()
             .request(method, url)
-            .bearer_auth(token.expose_secret())
+            .header(
+                reqwest::header::AUTHORIZATION,
+                super::credentials::credential_bearer_header(token.expose_secret())?,
+            )
             .query(query);
         if let Some(body) = body {
             request = request.json(&body);
         }
-        request.send().await.map_err(|e| {
-            SecretSpecError::ProviderOperationFailed(format!(
-                "Failed to connect to Infisical at {}: {}",
-                self.config.endpoint,
-                crate::error::display_error_chain(&e)
-            ))
-        })
+        let response = super::http::send_checked(
+            self.retry_policy,
+            "Infisical",
+            request,
+            false,
+            |response| async move {
+                if consume_success {
+                    super::http::checked_response("Infisical", response).await
+                } else {
+                    super::http::checked_status("Infisical", response).await
+                }
+            },
+        )
+        .await?;
+        Ok(response)
     }
 
     /// Renders a failed response, naming the likely cause for the statuses a
@@ -1007,22 +1039,21 @@ impl InfisicalProvider {
     }
 }
 
-impl Provider for InfisicalProvider {
-    /// Keeps the session's profile as the environment a `ref` reads from when
-    /// the URI names none. Last write wins, matching the other session hooks.
+impl super::ProviderBase for InfisicalProvider {
+    fn retry_ownership(&self) -> super::RetryOwnership {
+        super::RetryOwnership::Managed
+    }
+
+    fn set_retry_policy(&mut self, policy: super::RetryPolicy) {
+        self.retry_policy = policy;
+    }
+
     fn set_profile(&self, profile: &str) {
         if let Ok(mut held) = self.profile.lock() {
             *held = Some(profile.to_string());
         }
     }
 
-    /// Names the environment as well as the folder and key.
-    ///
-    /// The environment is half the destination and is not in the coordinates,
-    /// which the default rendering shows; where the URI does not pin it, it is
-    /// not in [`uri`](Provider::uri) either, so a preview built from those two
-    /// would leave the profile-derived environment invisible on the one
-    /// operation that overwrites a value.
     fn describe_write_target(&self, addr: Address<'_>) -> Result<String> {
         let loc = self.locate(addr)?;
         Ok(format!(
@@ -1033,10 +1064,6 @@ impl Provider for InfisicalProvider {
         ))
     }
 
-    /// A profile's secrets share one folder under the configured prefix, each
-    /// under its own key. `item` carries the folder and the key together; the
-    /// environment is resolved separately in [`locate`](Self::locate), since
-    /// SecretSpec's `ref` table has no coordinate for it.
     fn convention_address(&self, project: &str, profile: &str, key: &str) -> Result<NativeAddress> {
         for (label, value) in [("project", project), ("profile", profile), ("key", key)] {
             if value.is_empty() {
@@ -1080,10 +1107,7 @@ impl Provider for InfisicalProvider {
         })
     }
 
-    /// Resolves every part of the entry identity that Infisical sends to the
-    /// API. In particular, the environment may come from session profile
-    /// context rather than the provider URI or native coordinates.
-    fn entry_coordinates<'a>(
+    fn configured_entry_coordinates<'a>(
         &self,
         addr: Address<'a>,
     ) -> Result<std::borrow::Cow<'a, NativeAddress>> {
@@ -1114,14 +1138,10 @@ impl Provider for InfisicalProvider {
         self.credentials = credentials;
     }
 
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         Self::PROVIDER_NAME
     }
 
-    /// The inverse of parsing: every knob the config holds is rendered, so the
-    /// URI naming this store in an audit record or a warning is one that reads
-    /// back as the same store. `tls` is the one that bites -- a plain-HTTP
-    /// endpoint rendered without it comes back as HTTPS.
     fn uri(&self) -> String {
         self.render_uri(
             self.config.environment.as_deref(),
@@ -1129,30 +1149,24 @@ impl Provider for InfisicalProvider {
         )
     }
 
-    /// The environment and path are part of the resolved entry coordinates,
-    /// not the Infisical instance and project container. Omitting both here
-    /// lets an unpinned provider under profile `prod` compare equal to
-    /// `?env=prod`, and lets an absolute ref override different path defaults;
-    /// [`storage_identity`](Provider::storage_identity) remains the public URI
-    /// with its configured defaults and never absorbs session profile context.
     fn entry_container_identity(&self) -> String {
         self.render_uri(None, None)
     }
 
-    /// Infisical versions its secrets, so a `ref` may pin one. Its values are
-    /// single strings with no sub-components, so `field`, `section` and
-    /// `vault` are rejected.
     fn supported_coords(&self) -> &'static [&'static str] {
         &["version"]
     }
+}
 
-    fn get(&self, addr: Address<'_>) -> Result<Option<SecretString>> {
+#[async_trait::async_trait]
+impl super::AsyncProvider for InfisicalProvider {
+    async fn get(&self, addr: Address<'_>) -> Result<Option<SecretBytes>> {
         let loc = self.locate(addr)?;
         let version = match addr {
             Address::Native(native) => native.version.as_deref(),
             Address::Convention { .. } => None,
         };
-        super::block_on(async {
+        (async {
             let read = self.get_async(&loc, version).await?;
             if matches!(&read, SecretRead::NotFound) {
                 self.ensure_environment_exists_async(&loc.environment)
@@ -1163,12 +1177,13 @@ impl Provider for InfisicalProvider {
                 SecretRead::NotFound => None,
             })
         })
+        .await
     }
 
-    /// Secrets sharing a folder and environment are read with one list call
-    /// each, rather than one round trip per secret: Infisical's cloud rate
-    /// limits are per-minute, and a fan-out of single reads burns them.
-    fn get_many(&self, requests: &[(&str, Address<'_>)]) -> Result<HashMap<String, SecretString>> {
+    async fn get_many(
+        &self,
+        requests: &[(&str, Address<'_>)],
+    ) -> Result<HashMap<String, SecretBytes>> {
         // A pinned version names one historical value, which the folder
         // listing (always latest) cannot answer.
         let (versioned, listable): (Vec<_>, Vec<_>) = requests.iter().partition(
@@ -1184,27 +1199,31 @@ impl Provider for InfisicalProvider {
         let mut resolved = if versioned.is_empty() {
             HashMap::new()
         } else {
-            super::get_each_with(&versioned, |addr| {
-                let loc = self.locate(addr)?;
-                let version = match addr {
-                    Address::Native(native) => native.version.as_deref(),
-                    Address::Convention { .. } => None,
-                };
-                match super::block_on(self.get_async(&loc, version))? {
-                    SecretRead::Response(value) => Ok(value),
-                    SecretRead::NotFound => {
-                        versioned_misses
-                            .lock()
-                            .map_err(|_| {
-                                SecretSpecError::ProviderOperationFailed(
-                                    "Infisical batch diagnostic state was poisoned".to_string(),
-                                )
-                            })?
-                            .insert(loc.environment);
-                        Ok(None)
+            super::async_provider::get_each_with(&versioned, |addr| {
+                let versioned_misses = &versioned_misses;
+                async move {
+                    let loc = self.locate(addr)?;
+                    let version = match addr {
+                        Address::Native(native) => native.version.as_deref(),
+                        Address::Convention { .. } => None,
+                    };
+                    match self.get_async(&loc, version).await? {
+                        SecretRead::Response(value) => Ok(value),
+                        SecretRead::NotFound => {
+                            versioned_misses
+                                .lock()
+                                .map_err(|_| {
+                                    SecretSpecError::ProviderOperationFailed(
+                                        "Infisical batch diagnostic state was poisoned".to_string(),
+                                    )
+                                })?
+                                .insert(loc.environment);
+                            Ok(None)
+                        }
                     }
                 }
-            })?
+            })
+            .await?
         };
         let versioned_environments = versioned_misses.into_inner().map_err(|_| {
             SecretSpecError::ProviderOperationFailed(
@@ -1212,7 +1231,7 @@ impl Provider for InfisicalProvider {
             )
         })?;
 
-        super::block_on(async {
+        (async {
             // One list call per distinct folder and environment.
             let mut folders: HashMap<(String, String), Vec<(&str, String)>> = HashMap::new();
             for (name, addr) in &listable {
@@ -1263,17 +1282,16 @@ impl Provider for InfisicalProvider {
 
             Ok(resolved)
         })
+        .await
     }
 
-    fn set(&self, addr: Address<'_>, value: &SecretString) -> Result<()> {
-        self.check_writable(addr)?;
+    async fn set(&self, addr: Address<'_>, value: &SecretBytes) -> Result<()> {
+        super::AsyncProvider::check_writable(self, addr).await?;
         let loc = self.locate(addr)?;
-        super::block_on(self.set_async(&loc, value))
+        self.set_async(&loc, value).await
     }
 
-    /// A pinned version names a value that already exists; writing one would
-    /// mean rewriting history, which Infisical does not offer.
-    fn check_writable(&self, addr: Address<'_>) -> Result<()> {
+    async fn check_writable(&self, addr: Address<'_>) -> Result<()> {
         match addr {
             Address::Native(native) if native.version.is_some() => {
                 Err(SecretSpecError::ProviderOperationFailed(
@@ -1290,8 +1308,15 @@ impl Provider for InfisicalProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{BufRead, BufReader, Write};
-    use std::net::{SocketAddr, TcpListener};
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
+    };
+    use std::thread;
+    use std::time::Duration;
     use url::Url;
 
     const PROJECT: &str = "7e2f1a4c-0000-0000-0000-000000000000";
@@ -1300,11 +1325,172 @@ mod tests {
         InfisicalConfig::try_from(&ProviderUrl::new(Url::parse(s).unwrap())).unwrap()
     }
 
-    fn provider(s: &str) -> InfisicalProvider {
-        InfisicalProvider::new(config(s))
+    fn provider(s: &str) -> SyncProviderAdapter<InfisicalProvider> {
+        SyncProviderAdapter::from_async(InfisicalProvider::new(config(s)))
     }
 
-    fn provider_with_token(endpoint: SocketAddr, environment: Option<&str>) -> InfisicalProvider {
+    fn read_request(reader: &mut BufReader<TcpStream>) -> Option<String> {
+        let mut request_line = String::new();
+        if reader.read_line(&mut request_line).ok()? == 0 {
+            return None;
+        }
+
+        let mut content_length = 0;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).ok()?;
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                if name.eq_ignore_ascii_case("content-length") {
+                    content_length = value.trim().parse().ok()?;
+                }
+            }
+        }
+
+        if content_length > 0 {
+            let mut body = vec![0; content_length];
+            reader.read_exact(&mut body).ok()?;
+        }
+
+        Some(request_line.trim_end().to_string())
+    }
+
+    struct RecordingServer {
+        endpoint: SocketAddr,
+        stop: Arc<AtomicBool>,
+        server: thread::JoinHandle<Vec<(usize, String)>>,
+    }
+
+    impl RecordingServer {
+        /// Stops accepting, waits for the connection workers, and returns each
+        /// recorded request with the connection that carried it.
+        fn finish(self) -> Vec<(usize, String)> {
+            self.stop.store(true, Ordering::Release);
+            // The accept loop blocks; one more connection wakes it to see the flag.
+            TcpStream::connect(self.endpoint).unwrap();
+            self.server.join().unwrap()
+        }
+    }
+
+    /// Keeps responses alive and records the accepted connection for each request.
+    ///
+    /// The accept loop blocks until `RecordingServer::finish`, so a missing
+    /// request fails the caller's assertions instead of hanging the test.
+    fn connection_recording_server() -> RecordingServer {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::clone(&stop);
+        let server = thread::spawn(move || {
+            let mut workers = Vec::new();
+
+            for (connection_id, stream) in listener.incoming().enumerate() {
+                if stopped.load(Ordering::Acquire) {
+                    break;
+                }
+                let stream = stream.unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let sender = sender.clone();
+                let request_count = Arc::clone(&request_count);
+                workers.push(thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut writer = stream;
+                    while let Some(request) = read_request(&mut reader) {
+                        let seen = request_count.fetch_add(1, Ordering::AcqRel) + 1;
+                        sender.send((connection_id, request.clone())).unwrap();
+
+                        let body = if request
+                            .starts_with("POST /api/v1/auth/universal-auth/login ")
+                        {
+                            r#"{"accessToken":"test-token"}"#
+                        } else if request.starts_with("GET /api/v4/secrets/DATABASE_HOST?") {
+                            r#"{"secret":{"secretKey":"DATABASE_HOST","secretValue":"db.internal","secretValueHidden":false}}"#
+                        } else {
+                            r#"{"message":"unexpected request"}"#
+                        };
+                        write!(
+                            writer,
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .unwrap();
+                        writer.flush().unwrap();
+                        if seen >= 2 {
+                            break;
+                        }
+                    }
+                }));
+            }
+
+            for worker in workers {
+                worker.join().unwrap();
+            }
+            drop(sender);
+            receiver.into_iter().collect()
+        });
+        RecordingServer {
+            endpoint,
+            stop,
+            server,
+        }
+    }
+
+    #[test]
+    fn universal_auth_and_secret_read_use_distinct_tcp_connections() {
+        let server = connection_recording_server();
+        let mut provider = provider(&format!(
+            "infisical://{}/{PROJECT}?tls=false&env=development",
+            server.endpoint
+        ));
+        provider.with_credentials(ProviderCredentials::from([
+            (
+                CLIENT_ID.to_string(),
+                SecretBytes::from_utf8("test-client-id"),
+            ),
+            (
+                CLIENT_SECRET.to_string(),
+                SecretBytes::from_utf8("test-client-secret"),
+            ),
+        ]));
+        let address = NativeAddress {
+            item: "/DATABASE_HOST".into(),
+            ..Default::default()
+        };
+
+        let value = provider
+            .get(Address::Native(&address))
+            .expect("the secret read must succeed")
+            .expect("the fixture must return DATABASE_HOST");
+        assert_eq!(value.expose_secret(), b"db.internal");
+
+        let requests = server.finish();
+        assert_eq!(requests.len(), 2, "{requests:#?}");
+        assert!(
+            requests[0]
+                .1
+                .starts_with("POST /api/v1/auth/universal-auth/login ")
+        );
+        assert!(
+            requests[1]
+                .1
+                .starts_with("GET /api/v4/secrets/DATABASE_HOST?")
+        );
+        assert_ne!(
+            requests[0].0, requests[1].0,
+            "Universal Auth and secret reads must use different TCP connections"
+        );
+    }
+
+    fn provider_with_token(
+        endpoint: SocketAddr,
+        environment: Option<&str>,
+    ) -> SyncProviderAdapter<InfisicalProvider> {
         let environment =
             environment.map_or_else(String::new, |environment| format!("&env={environment}"));
         let mut provider = provider(&format!(
@@ -1312,7 +1498,7 @@ mod tests {
         ));
         provider.with_credentials(ProviderCredentials::from([(
             TOKEN.to_string(),
-            SecretString::new("test-token".to_string().into()),
+            SecretBytes::from_utf8("test-token"),
         )]));
         provider
     }
@@ -1631,7 +1817,7 @@ mod tests {
         let refusal = p.check_writable(Address::Native(&addr)).unwrap_err();
         assert!(refusal.to_string().contains("read-only"), "{refusal}");
         let err = p
-            .set(Address::Native(&addr), &SecretString::new("v".into()))
+            .set(Address::Native(&addr), &SecretBytes::from_utf8("v"))
             .unwrap_err();
         assert_eq!(err.to_string(), refusal.to_string());
     }
@@ -1666,7 +1852,7 @@ mod tests {
         let value = InfisicalProvider::secret_value(&visible, "API_KEY")
             .unwrap()
             .expect("a readable value");
-        assert_eq!(value.expose_secret(), "s3cret");
+        assert_eq!(value.expose_secret(), b"s3cret");
     }
 
     /// Builds a list-response import entry holding one key.
@@ -1683,14 +1869,14 @@ mod tests {
     }
 
     fn merged(parsed: &serde_json::Value, direct: &[(&str, &str)]) -> HashMap<String, String> {
-        let mut listed: HashMap<String, SecretString> = direct
+        let mut listed: HashMap<String, SecretBytes> = direct
             .iter()
-            .map(|(k, v)| (k.to_string(), SecretString::new((*v).into())))
+            .map(|(k, v)| (k.to_string(), SecretBytes::from_utf8(*v)))
             .collect();
         InfisicalProvider::merge_imports(parsed, &mut listed).expect("merge");
         listed
             .into_iter()
-            .map(|(k, v)| (k, v.expose_secret().to_string()))
+            .map(|(k, v)| (k, v.try_as_utf8().unwrap().to_string()))
             .collect()
     }
 

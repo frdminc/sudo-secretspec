@@ -19,7 +19,7 @@
 //! optional secret is nullable, while required, defaulted, and generated secrets
 //! are guaranteed to have a value when resolution succeeds.
 
-use crate::manifest::{CompiledSecret, CompiledSpec};
+use crate::compiled_spec::{CompiledSecret, CompiledSpec};
 use crate::spec::Spec;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -184,11 +184,7 @@ pub(crate) fn build_ir_from_manifest(manifest: &CompiledSpec) -> CodegenIr {
 /// drop the converter or rename the type). By default it describes the union
 /// `SecretSpec` (safe for any profile); with a profile it describes that
 /// profile's exact fields. Pair it with `quicktype --top-level <Name>`.
-// `pub` rather than `pub(crate)` so `__private::codegen` can re-export it for
-// the privilege boundary; `codegen` itself is a private module, so this adds
-// nothing to the supported public API.
-#[cfg(any(feature = "cli", feature = "codegen-schema", test))]
-pub mod schema {
+pub(crate) mod schema {
     use super::{CodegenIr, IrField, capitalize};
     use serde_json::{Map, Value, json};
 
@@ -296,6 +292,7 @@ mod tests {
             );
         }
         Config {
+            defaults: None,
             project: Project {
                 name: "ir-test".to_string(),
                 ..Default::default()

@@ -4,10 +4,11 @@ use crate::{Result, SecretSpecError};
 /// Information about a secret storage provider.
 ///
 /// Contains metadata used for displaying available providers to users,
-/// including the provider's name, description, and example URIs.
+/// including the provider's name, description, and example URIs. Returned by
+/// [`providers`]. Available in the public Rust API since SecretSpec 0.22.
 #[derive(Debug, Clone)]
 pub struct ProviderInfo {
-    /// The canonical name of the provider (e.g., "keyring", "1password").
+    /// The canonical name of the provider (e.g., "keyring", "onepassword").
     pub name: &'static str,
     /// A human-readable description of what the provider does.
     #[cfg_attr(not(any(feature = "cli", test)), allow(dead_code))]
@@ -54,15 +55,24 @@ impl ProviderInfo {
     }
 }
 
-/// Returns a list of all available providers with their metadata.
+/// Returns metadata for all built-in providers.
 ///
-/// This includes the provider name, description, and example URIs for each
-/// supported provider type.
-#[cfg(feature = "cli")]
+/// This includes providers whose implementation was disabled at compile time;
+/// attempting to construct one reports the Cargo feature the build requires.
+/// External providers discovered at runtime are not included.
+/// Available in the public Rust API since SecretSpec 0.22.
+///
+/// # Example
+///
+/// ```
+/// for provider in secretspec::providers() {
+///     println!("{}: {}", provider.name, provider.description);
+/// }
+/// ```
 pub fn providers() -> Vec<ProviderInfo> {
     PROVIDER_REGISTRY
         .iter()
-        .map(|reg| reg.info.clone())
+        .map(|reg| reg.metadata.info.clone())
         .collect()
 }
 
@@ -83,7 +93,7 @@ pub(super) fn split_spec(spec: &str) -> (&str, &str) {
 pub(super) fn registration_for_scheme(scheme: &str) -> Option<&'static ProviderRegistration> {
     PROVIDER_REGISTRY
         .iter()
-        .find(|reg| reg.schemes.contains(&scheme))
+        .find(|reg| reg.metadata.schemes.contains(&scheme))
 }
 
 /// Whether `spec` names a registered provider: a bare name (`keyring`), a
@@ -109,15 +119,36 @@ pub(crate) fn spec_names_known_provider(spec: &str) -> Result<bool> {
             file::MISSING_DIRECTORY_ERROR.to_string(),
         ));
     }
-    Ok(registration_for_scheme(scheme).is_some())
+    if registration_for_scheme(scheme).is_some() {
+        return Ok(true);
+    }
+    Ok(super::external::discover(scheme)?.is_some())
 }
 
 /// The semantic credential names accepted by the provider named by `spec`, or
 /// an empty slice for an unknown scheme. Lets alias validation reject a
 /// declaration the provider would silently ignore.
-pub(crate) fn credential_names_for_spec(spec: &str) -> &'static [&'static str] {
+pub(crate) fn credential_names_for_spec(spec: &str) -> Result<Vec<String>> {
     let (scheme, _) = split_spec(spec);
-    registration_for_scheme(scheme).map_or(&[], |reg| reg.credential_names)
+    if let Some(registration) = registration_for_scheme(scheme) {
+        return Ok(registration
+            .metadata
+            .credential_names
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect());
+    }
+    super::external::discover(scheme).map(|_| Vec::new())
+}
+
+/// Whether `spec` names an external endpoint whose credential requirements
+/// are negotiated at runtime rather than registered statically (0.21+).
+pub(crate) fn spec_uses_dynamic_credentials(spec: &str) -> Result<bool> {
+    let (scheme, _) = split_spec(spec);
+    if registration_for_scheme(scheme).is_some() {
+        return Ok(false);
+    }
+    Ok(super::external::discover(scheme)?.is_some())
 }
 
 /// Whether the provider named by `spec` can return plaintext secret values.
@@ -127,16 +158,16 @@ pub(crate) fn credential_names_for_spec(spec: &str) -> &'static [&'static str] {
 #[cfg_attr(not(any(feature = "cli", test)), allow(dead_code))]
 pub(crate) fn spec_provider_reads(spec: &str) -> bool {
     let (scheme, _) = split_spec(spec);
-    registration_for_scheme(scheme).is_some_and(|reg| reg.reads)
+    registration_for_scheme(scheme).is_some_and(|reg| reg.metadata.reads)
 }
 
 /// Whether the provider `spec` names implements deletion.
 ///
 /// Read from registration metadata so routing can validate an invalidatable
 /// store while planning, before a provider is constructed.
-pub(crate) fn spec_provider_deletes(spec: &str) -> bool {
+pub(crate) fn static_delete_capability(spec: &str) -> Option<bool> {
     let (scheme, _) = split_spec(spec);
-    registration_for_scheme(scheme).is_some_and(|reg| reg.deletes)
+    registration_for_scheme(scheme).map(|registration| registration.metadata.deletes)
 }
 
 /// The names of every provider that implements deletion, sorted. Used to say
@@ -144,8 +175,8 @@ pub(crate) fn spec_provider_deletes(spec: &str) -> bool {
 pub(crate) fn deleting_provider_names() -> Vec<&'static str> {
     let mut names: Vec<&'static str> = PROVIDER_REGISTRY
         .iter()
-        .filter(|reg| reg.deletes)
-        .map(|reg| reg.info.name)
+        .filter(|reg| reg.metadata.deletes)
+        .map(|reg| reg.metadata.info.name)
         .collect();
     names.sort_unstable();
     names
@@ -157,7 +188,7 @@ pub(crate) fn deleting_provider_names() -> Vec<&'static str> {
 pub(crate) fn provider_display_name_for_spec(spec: &str) -> String {
     let (scheme, _) = split_spec(spec);
     registration_for_scheme(scheme)
-        .map(|reg| reg.info.name.to_string())
+        .map(|reg| reg.metadata.info.name.to_string())
         .unwrap_or_else(|| scheme.to_string())
 }
 

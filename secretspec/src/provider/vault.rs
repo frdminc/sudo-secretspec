@@ -62,11 +62,14 @@
 //! secretspec check --provider vault://team-a@vault.example.com:8200/secret
 //! ```
 
-use super::vault_common::{KvConfig, KvProvider, Product, ROLE_ID, SECRET_ID, TOKEN};
-use super::{Address, Provider, ProviderCredentials, ProviderUrl};
+use super::ProviderBase as _;
+use super::vault_common::{KvConfig, KvProvider, Product};
+use super::{Address, ProviderCredentials, ProviderUrl};
+#[cfg(test)]
+use super::{Provider, SyncProviderAdapter};
+use crate::SecretBytes;
 use crate::config::NativeAddress;
 use crate::{Result, SecretSpecError};
-use secrecy::SecretString;
 
 /// HashiCorp Vault provider configuration.
 ///
@@ -95,12 +98,8 @@ pub struct VaultProvider {
 crate::register_provider! {
     struct: VaultProvider,
     config: VaultConfig,
-    name: "vault",
-    description: "HashiCorp Vault secret management",
-    schemes: ["vault"],
-    examples: ["vault://vault.example.com:8200/secret"],
-    credential_names: [ROLE_ID, SECRET_ID, TOKEN],
-    deletes: true,
+    metadata: &super::catalog::VAULT,
+    native_async: true,
 }
 
 impl VaultProvider {
@@ -112,8 +111,15 @@ impl VaultProvider {
     }
 }
 
-impl Provider for VaultProvider {
-    /// Convention secrets use one KV path per secret and the `value` map field.
+impl super::ProviderBase for VaultProvider {
+    fn set_retry_policy(&mut self, policy: super::RetryPolicy) {
+        self.core.set_retry_policy(policy);
+    }
+
+    fn retry_ownership(&self) -> super::RetryOwnership {
+        super::RetryOwnership::Managed
+    }
+
     fn convention_address(&self, project: &str, profile: &str, key: &str) -> Result<NativeAddress> {
         self.core.convention_address(project, profile, key)
     }
@@ -122,7 +128,7 @@ impl Provider for VaultProvider {
         self.core.with_credentials(credentials);
     }
 
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         Self::PROVIDER_NAME
     }
 
@@ -138,62 +144,54 @@ impl Provider for VaultProvider {
         self.core.supported_coords()
     }
 
-    /// A native reference must identify the field inside the KV entry's map.
-    fn get(&self, addr: Address<'_>) -> Result<Option<SecretString>> {
-        let coords = self.resolve_coords(addr)?;
-        self.core.get(&coords)
-    }
-
-    /// Reuses one operation-scoped login across the batch while retaining the
-    /// default address deduplication and concurrency cap.
-    fn get_many(
-        &self,
-        requests: &[(&str, Address<'_>)],
-    ) -> Result<std::collections::HashMap<String, SecretString>> {
-        self.core.get_many(requests)
-    }
-
-    /// Only convention addresses are writable; see [`Self::check_writable`].
-    fn set(&self, addr: Address<'_>, value: &SecretString) -> Result<()> {
-        self.check_writable(addr)?;
-        let coords = self.resolve_coords(addr)?;
-        self.core.set(&coords, value)
-    }
-
-    /// KV v2 expires the written version through the path's
-    /// `delete_version_after` metadata, so a cached copy of another store's
-    /// secret disappears on its own.
-    fn set_expiring(
-        &self,
-        addr: Address<'_>,
-        value: &SecretString,
-        max_age: std::time::Duration,
-    ) -> Result<()> {
-        self.check_writable(addr)?;
-        let coords = self.resolve_coords(addr)?;
-        self.core.set_expiring(&coords, value, max_age)
-    }
-
-    /// Deletes the whole KV path, so it is confined to entries SecretSpec owns;
-    /// see [`Self::check_writable`] for the same reasoning about `ref`s.
-    fn delete(&self, addr: Address<'_>) -> Result<bool> {
-        self.core.check_deletable(addr)?;
-        let coords = self.resolve_coords(addr)?;
-        self.core.delete(&coords)
-    }
-
     fn supports_delete(&self) -> bool {
         true
     }
+}
 
-    fn check_deletable(&self, addr: Address<'_>) -> Result<()> {
-        self.core.check_deletable(addr)
+#[async_trait::async_trait]
+impl super::AsyncProvider for VaultProvider {
+    async fn get(&self, addr: Address<'_>) -> Result<Option<SecretBytes>> {
+        let coords = self.resolve_coords(addr)?;
+        self.core.get(&coords).await
     }
 
-    /// Refuses native writes because replacing a KV entry to change one field
-    /// would silently discard every sibling field.
-    fn check_writable(&self, addr: Address<'_>) -> Result<()> {
+    async fn get_many(
+        &self,
+        requests: &[(&str, Address<'_>)],
+    ) -> Result<std::collections::HashMap<String, SecretBytes>> {
+        self.core.get_many(requests).await
+    }
+
+    async fn set(&self, addr: Address<'_>, value: &SecretBytes) -> Result<()> {
+        super::AsyncProvider::check_writable(self, addr).await?;
+        let coords = self.resolve_coords(addr)?;
+        self.core.set(&coords, value).await
+    }
+
+    async fn set_expiring(
+        &self,
+        addr: Address<'_>,
+        value: &SecretBytes,
+        max_age: std::time::Duration,
+    ) -> Result<()> {
+        super::AsyncProvider::check_writable(self, addr).await?;
+        let coords = self.resolve_coords(addr)?;
+        self.core.set_expiring(&coords, value, max_age).await
+    }
+
+    async fn delete(&self, addr: Address<'_>) -> Result<bool> {
+        self.core.check_deletable(addr)?;
+        let coords = self.resolve_coords(addr)?;
+        self.core.delete(&coords).await
+    }
+
+    async fn check_writable(&self, addr: Address<'_>) -> Result<()> {
         self.core.check_writable(addr)
+    }
+
+    async fn check_deletable(&self, addr: Address<'_>) -> Result<()> {
+        self.core.check_deletable(addr)
     }
 }
 
@@ -217,7 +215,9 @@ mod tests {
 
     #[test]
     fn convention_address_is_the_writable_value_field() {
-        let provider = VaultProvider::new(config("vault://vault.example.com:8200/secret"));
+        let provider = SyncProviderAdapter::from_async(VaultProvider::new(config(
+            "vault://vault.example.com:8200/secret",
+        )));
         let address = provider
             .resolve_coords(Address::convention("app", "prod", "DATABASE_URL"))
             .unwrap();
@@ -232,7 +232,9 @@ mod tests {
 
     #[test]
     fn native_address_requires_a_field() {
-        let provider = VaultProvider::new(config("vault://vault.example.com:8200/secret"));
+        let provider = SyncProviderAdapter::from_async(VaultProvider::new(config(
+            "vault://vault.example.com:8200/secret",
+        )));
         let address = NativeAddress {
             item: "myapp/config".into(),
             ..Default::default()
@@ -243,7 +245,9 @@ mod tests {
 
     #[test]
     fn native_address_is_read_only() {
-        let provider = VaultProvider::new(config("vault://vault.example.com:8200/secret"));
+        let provider = SyncProviderAdapter::from_async(VaultProvider::new(config(
+            "vault://vault.example.com:8200/secret",
+        )));
         let address = NativeAddress {
             item: "myapp/config".into(),
             field: Some("db_password".into()),
@@ -254,14 +258,16 @@ mod tests {
             .unwrap_err();
         assert!(refusal.to_string().contains("read-only"), "{refusal}");
         let error = provider
-            .set(Address::Native(&address), &SecretString::new("v".into()))
+            .set(Address::Native(&address), &SecretBytes::from_utf8("v"))
             .unwrap_err();
         assert_eq!(error.to_string(), refusal.to_string());
     }
 
     #[test]
     fn native_address_rejects_version() {
-        let provider = VaultProvider::new(config("vault://vault.example.com:8200/secret"));
+        let provider = SyncProviderAdapter::from_async(VaultProvider::new(config(
+            "vault://vault.example.com:8200/secret",
+        )));
         let address = NativeAddress {
             item: "myapp/config".into(),
             field: Some("db_password".into()),

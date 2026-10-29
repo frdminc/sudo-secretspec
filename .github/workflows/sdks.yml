@@ -2,10 +2,16 @@ name: "SDKs"
 
 # Runs every language SDK's full test suite (unit + cross-language conformance +
 # the schema/quicktype codegen pipeline) against a freshly built cdylib, so the
-# Python/Go/Ruby/Node/Haskell/C#/PHP/Swift bindings cannot silently rot.
+# Python/Go/Ruby/Node/Haskell/C#/PHP/Swift/Elixir bindings cannot silently rot.
 
 on:
   workflow_call:
+    inputs:
+      pre_release:
+        description: Run as part of the canonical pre-release suite
+        required: false
+        type: boolean
+        default: false
   workflow_dispatch:
   pull_request:
     paths-ignore:
@@ -24,6 +30,10 @@ permissions:
 
 jobs:
   sdks:
+    if: >-
+      inputs.pre_release ||
+      github.event_name != 'pull_request' ||
+      !startsWith(github.event.pull_request.title, 'Release ')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -45,8 +55,8 @@ jobs:
             echo "Skipping cleanup: ${available_gb}GB available"
           fi
           df -h /
-      - uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
-      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
+      - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31.11.2
+      - uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
         with:
           name: devenv
       - name: Install devenv.sh
@@ -56,6 +66,10 @@ jobs:
 
   swift:
     name: Swift SDK
+    if: >-
+      inputs.pre_release ||
+      github.event_name != 'pull_request' ||
+      !startsWith(github.event.pull_request.title, 'Release ')
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -66,12 +80,12 @@ jobs:
       - name: Build the native resolver
         env:
           MACOSX_DEPLOYMENT_TARGET: "12.0"
-        run: cargo build -p secretspec-ffi
+        run: cargo build -p libsecretspec
       - name: Build the local XCFramework
         run: >-
           bash scripts/build-swift-xcframework.sh
           secretspec-swift/Artifacts/CSecretSpec.xcframework
-          target/debug/libsecretspec_ffi.dylib
+          target/debug/libsecretspec.dylib
       - name: Run the Swift SDK and conformance tests
         run: |
           swift build --target SecretSpecExamples

@@ -814,10 +814,11 @@ fn run_audit_verify(_broker: &Broker) -> Result<(), i32> {
 
 /// The runtime manifest with one declaration added, revalidated as a whole.
 ///
-/// Goes through [`secretspec::Spec`] rather than `manifest_edit` directly, so
-/// the edit is re-derived through the same validated path every other load
-/// takes: a declaration that would not load is refused here instead of being
-/// written into the vault and surfacing at the next `check`.
+/// Goes through [`secretspec::SpecBuilder`]'s format-preserving edit rather
+/// than raw TOML surgery, so the edit is re-derived through the same validated
+/// path every other load takes: a declaration that would not load is refused
+/// here instead of being written into the vault and surfacing at the next
+/// `check`.
 ///
 /// `Spec::from_toml` is the deliberate constructor. It never touches the
 /// filesystem and refuses `project.extends`, so this root process cannot be
@@ -834,7 +835,9 @@ fn manifest_with_declaration(
 ) -> Result<String, String> {
     let spec = secretspec::Spec::from_toml(source).map_err(|e| e.to_string())?;
     let edited = spec
-        .add_secret_to_text(profile, name, secret)
+        .into_builder()
+        .add_secret(profile, name, secret)
+        .build()
         .map_err(|e| e.to_string())?;
     preserved(edited)
 }
@@ -848,7 +851,9 @@ fn manifest_with_declaration(
 fn manifest_without_declaration(source: &str, profile: &str, name: &str) -> Result<String, String> {
     let spec = secretspec::Spec::from_toml(source).map_err(|e| e.to_string())?;
     let edited = spec
-        .remove_secret_from_text(profile, name)
+        .into_builder()
+        .remove_secret(profile, name)
+        .build()
         .map_err(|e| e.to_string())?;
     preserved(edited)
 }
@@ -881,18 +886,18 @@ fn preserved(edited: secretspec::Spec) -> Result<String, String> {
 /// nothing could ever move it back — the exact asymmetry this verb exists to
 /// fix.
 ///
-/// Stays on `manifest_edit` while the sibling edits go through `Spec`, for two
+/// Answered from the TOML text itself rather than through `Spec`, for two
 /// reasons specific to this guard:
 ///
-/// 1. `Spec::declares_secret_in_text` answers `bool`, treating an unparseable
-///    document as "not declared" — the fail-*open* answer this must never give.
-/// 2. Reaching it needs a `Spec`, and the only filesystem-free constructor,
+/// 1. An unparseable document must be an `Err`, never "not declared" — the
+///    fail-*open* answer this must never give.
+/// 2. Reaching a `Spec` needs a constructor, and the only filesystem-free one,
 ///    `Spec::from_toml`, refuses `project.extends`. The template is
 ///    operator-controlled Git content; the day it inherits, `undeclare` would
 ///    start refusing every name.
 ///
-/// A question about text is answered by the function that takes text and
-/// returns `Result`.
+/// Parsed, not searched: a substring test would match the name inside a
+/// comment or another secret's description, silently.
 fn tracked_source_protects(
     template: Option<&str>,
     profile: &str,
@@ -900,8 +905,16 @@ fn tracked_source_protects(
 ) -> Result<bool, String> {
     match template {
         None => Ok(false),
-        Some(text) => secretspec::manifest_edit::declares_secret(text, profile, name)
-            .map_err(|e| e.to_string()),
+        Some(text) => {
+            let doc: toml::Table = toml::from_str(text)
+                .map_err(|e| format!("Failed to parse secretspec.toml: {e}"))?;
+            Ok(doc
+                .get("profiles")
+                .and_then(toml::Value::as_table)
+                .and_then(|profiles| profiles.get(profile))
+                .and_then(toml::Value::as_table)
+                .is_some_and(|table| table.contains_key(name)))
+        }
     }
 }
 
@@ -1116,7 +1129,7 @@ fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>
                 }
             }
         }
-        "source-set" => match secrets.set(name, None) {
+        "source-set" => match secrets.prompt_and_set(name) {
             Ok(()) => (0, vec![name.into()]),
             Err(e) => {
                 eprintln!("broker: {e}");
@@ -1464,7 +1477,7 @@ fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>
 
                 let mut restored_names = Vec::new();
                 for (n, val) in items_to_restore {
-                    if let Err(e) = secrets.set(&n, Some(val)) {
+                    if let Err(e) = secrets.set_text(&n, &val) {
                         eprintln!("broker: cannot restore {n}: {e}");
                         return (1, restored_names);
                     }
@@ -1555,20 +1568,10 @@ fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>
 
 /// JSON Schema of a manifest for one profile.
 ///
-/// Value-free: `codegen` reads declarations only. The caller supplies the
-/// profile; the broker always passes the one from the root-owned config.
-///
-/// Both halves come from `secretspec::__private`, which upstream marks
-/// `#[doc(hidden)]` and disclaims. That is deliberate and temporary: upstream
-/// consolidated the public API on `Spec` but left no `Spec`-shaped path to
-/// schema emission, so there is no supported alternative today. The clean
-/// shape is a `Spec::schema_json(profile)` method upstream — tracked in
-/// `sudo-secretspec/UPSTREAM-CONTACT.md` under "shape debt". If a future merge
-/// breaks this function, that is the debt coming due; ask for the `Spec`
-/// method rather than reaching further into internals.
+/// Value-free: `Spec::schema_json` reads declarations only. The caller supplies
+/// the profile; the broker always passes the one from the root-owned config.
 fn emit_schema(spec: &secretspec::Spec, profile: &str) -> Result<String, String> {
-    let ir = secretspec::__private::codegen::build_ir(spec);
-    secretspec::__private::codegen::schema::emit(&ir, Some(profile))
+    spec.schema_json(Some(profile)).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -2208,7 +2211,7 @@ BETA = { description = "second", required = false }
         let (_vault, cfg) = execute_fixture();
         let secrets = fixture_secrets(&cfg);
 
-        secrets.set("ALPHA", Some("original".into())).unwrap(); // sequence 1
+        secrets.set_text("ALPHA", "original").unwrap(); // sequence 1
         secrets.delete("ALPHA").unwrap(); // sequence 2, ALPHA already gone
         assert_eq!(
             live_value(&cfg, "ALPHA"),
@@ -2238,8 +2241,8 @@ BETA = { description = "second", required = false }
         let (_vault, cfg) = execute_fixture();
         let secrets = fixture_secrets(&cfg);
 
-        secrets.set("ALPHA", Some("original".into())).unwrap(); // sequence 1
-        secrets.set("ALPHA", Some("current".into())).unwrap(); // sequence 2
+        secrets.set_text("ALPHA", "original").unwrap(); // sequence 1
+        secrets.set_text("ALPHA", "current").unwrap(); // sequence 2
 
         let mut broker = broker_op("source-restore");
         broker.name = Some("ALPHA".into());
@@ -2275,8 +2278,8 @@ BETA = { description = "second", required = false }
         let (_vault, cfg) = execute_fixture();
         let secrets = fixture_secrets(&cfg);
 
-        secrets.set("ALPHA", Some("a1".into())).unwrap(); // sequence 1
-        secrets.set("BETA", Some("b1".into())).unwrap(); // sequence 2: both present
+        secrets.set_text("ALPHA", "a1").unwrap(); // sequence 1
+        secrets.set_text("BETA", "b1").unwrap(); // sequence 2: both present
         secrets.delete("ALPHA").unwrap();
         secrets.delete("BETA").unwrap();
 
@@ -2379,7 +2382,7 @@ BETA = { description = "second", required = false }
         let _guard = EXECUTE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (_vault, cfg) = execute_fixture();
         let secrets = fixture_secrets(&cfg);
-        secrets.set("ALPHA", Some("original".into())).unwrap(); // sequence 1
+        secrets.set_text("ALPHA", "original").unwrap(); // sequence 1
 
         let conn = rusqlite::Connection::open(cfg.vault.join("secrets.db")).unwrap();
         conn.execute(
@@ -2414,8 +2417,8 @@ BETA = { description = "second", required = false }
         let _guard = EXECUTE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (_vault, cfg) = execute_fixture();
         let secrets = fixture_secrets(&cfg);
-        secrets.set("ALPHA", Some("leaked".into())).unwrap(); // sequence 1
-        secrets.set("BETA", Some("keep-me".into())).unwrap(); // sequence 2: both captured
+        secrets.set_text("ALPHA", "leaked").unwrap(); // sequence 1
+        secrets.set_text("BETA", "keep-me").unwrap(); // sequence 2: both captured
 
         let mut broker = broker_op("source-destroy");
         broker.name = Some("ALPHA".into());
@@ -2487,7 +2490,7 @@ BETA = { description = "second", required = false }
         let (_vault, cfg) = execute_fixture();
         let secrets = fixture_secrets(&cfg);
 
-        secrets.set("ALPHA", Some("recurring".into())).unwrap(); // sequence 1
+        secrets.set_text("ALPHA", "recurring").unwrap(); // sequence 1
 
         let mut destroy = broker_op("source-destroy");
         destroy.name = Some("ALPHA".into());
@@ -2496,7 +2499,7 @@ BETA = { description = "second", required = false }
 
         // The same value comes back under the same name, so the blob destroy
         // deleted is written again -- byte-identical, same digest, same item.
-        secrets.set("ALPHA", Some("recurring".into())).unwrap(); // sequence 3
+        secrets.set_text("ALPHA", "recurring").unwrap(); // sequence 3
         secrets.delete("ALPHA").unwrap(); // sequence 4; clears the live value
 
         let conn = rusqlite::Connection::open(cfg.vault.join("secrets.db")).unwrap();
@@ -2654,7 +2657,7 @@ BETA = { description = "second", required = false }
         let (_vault, cfg) = execute_fixture();
 
         let secrets = fixture_secrets(&cfg);
-        secrets.set("ALPHA", Some("a1".to_string())).unwrap();
+        secrets.set_text("ALPHA", "a1").unwrap();
         assert!(secrets.delete("ALPHA").unwrap(), "fixture must remove it");
 
         let tip_before: i64 = {
