@@ -44,6 +44,13 @@ jobs:
           set -euo pipefail
           curl -fsSL -o /usr/local/bin/sops https://github.com/getsops/sops/releases/download/v3.13.2/sops-v3.13.2.linux.amd64
           sudo chmod 0755 /usr/local/bin/sops
+      # Upstream 0.21+ builds libsecretspec-resolver's C sources in the
+      # conformance runner, against a system yyjson that ubuntu-latest lacks.
+      # Same pinned install upstream's test.yml runs; a tree that predates the
+      # script has nothing to build against it.
+      - name: Install yyjson
+        run: |
+          if [ -f scripts/install-yyjson.sh ]; then bash scripts/install-yyjson.sh; fi
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Run Clippy
