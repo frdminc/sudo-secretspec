@@ -87,6 +87,22 @@ jobs:
           PKG_CONFIG_PATH: /opt/homebrew/opt/sqlite/lib/pkgconfig
           LIBRARY_PATH: /opt/homebrew/opt/sqlite/lib
         run: cargo test -p sudo-secretspec-cli --locked
+      # Emit the installable CLI binary so a hotfix can be installed on the Mac
+      # without a full release ceremony (C1 privileged-config fix, 2026-10-28).
+      # Same Homebrew-SQLite env as the test step above (rusqlite is not
+      # `bundled` here, matching release.py's own build).
+      - name: Build release binary
+        env:
+          PKG_CONFIG_PATH: /opt/homebrew/opt/sqlite/lib/pkgconfig
+          LIBRARY_PATH: /opt/homebrew/opt/sqlite/lib
+        run: cargo build --release -p sudo-secretspec-cli --locked
+      - name: Upload release binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: sudo-secretspec-macos
+          path: target/release/sudo-secretspec
+          if-no-files-found: error
+          retention-days: 7
       - name: Test release helper
         run: |
           python -m ruff check packaging tests/sudo_packaging
