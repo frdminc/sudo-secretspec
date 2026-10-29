@@ -95,7 +95,9 @@ mod os {
     pub const VAULT_REAL_PARENT: &str = "/var/lib";
     pub const DEFAULT_USER: &str = "sudo-secretspec";
     pub const DEFAULT_GROUP: &str = "sudo-secretspec";
-    pub const CLIENT_PATH: &str = "/usr/bin/sudo-secretspec";
+    /// The public client on NixOS lives in the current system profile; there is
+    /// no `/usr/bin`.
+    pub const CLIENT_PATH: &str = "/run/current-system/sw/bin/sudo-secretspec";
     /// Linux has no leading-underscore convention for service accounts.
     pub const SERVICE_USER_REQUIRES_UNDERSCORE: bool = false;
     pub const SERVICE_IDENTITY_ALLOWS_HYPHEN: bool = true;

@@ -95,3 +95,37 @@ jobs:
           cmp schema/resolution-report.schema.json "$fixture"
           cargo package --package secretspec --list |
             grep -Fx 'src/fixtures/resolution-report.schema.json'
+
+  # The NixOS half of the Linux port: `nix flake check` builds the package and
+  # runs the VM test (nix/test.nix), which boots a minimal NixOS machine and
+  # asserts the sudoers boundary (11 NOPASSWD grants, the exact broker
+  # Defaults! line, no doctor/timestamp_timeout, and runtime sudo behaviour).
+  # This is the only place that proof runs: the module's import-from-derivation
+  # (`print-sudoers`) needs `allow-import-from-derivation = true`, and the VM
+  # test needs QEMU, neither of which a macOS dev box has. There is no
+  # committed flake.lock (single nixpkgs input), so the job generates it first.
+  nix:
+    name: nix (flake check: build + VM test)
+    runs-on: ubuntu
+    # NixOS test boots a QEMU VM; the Hyades runner has no KVM, so QEMU falls
+    # back to TCG. The minimal boot + assertions are a few minutes, but the
+    # first run also builds/downloads the NixOS closure, so leave headroom.
+    timeout-minutes: 90
+    steps:
+      - uses: https://github.com/actions/checkout@v4
+      - name: Install Nix
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -sSf -L https://install.determinate.systems/nix -o /tmp/nix-install.sh
+          sh /tmp/nix-install.sh install \
+            --no-confirm \
+            --extra-conf "experimental-features = nix-command flakes" \
+            --extra-conf "allow-import-from-derivation = true"
+          . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+          printf '%s\n' "/nix/var/nix/profiles/default/bin" >> "$GITHUB_PATH"
+      - name: nix flake check
+        run: |
+          set -euo pipefail
+          . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+          nix flake lock
+          nix flake check

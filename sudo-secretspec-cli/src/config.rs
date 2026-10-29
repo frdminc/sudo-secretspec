@@ -121,6 +121,16 @@ fn direct_child<'a>(path: &'a Path, parent: &Path) -> Result<&'a std::ffi::OsStr
     if components.next().is_some() {
         return Err(ConfigError::Invalid("vault must be one direct child"));
     }
+    // A `.` or `..` component slips past the "one direct child" check and would
+    // let a config author aim the vault at `/var/lib` itself (`.`) or its
+    // parent (`..`); the module's tmpfiles rule would then re-own a system
+    // state directory on every activation. Refuse the traversal components.
+    if matches!(
+        name,
+        std::path::Component::CurDir | std::path::Component::ParentDir
+    ) {
+        return Err(ConfigError::Invalid("vault name must not be '.' or '..'"));
+    }
     Ok(name.as_os_str())
 }
 

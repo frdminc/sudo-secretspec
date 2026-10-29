@@ -384,12 +384,14 @@ fn main() {
         Cmd::PrintSudoers {
             operator,
             service_user,
-        } => {
-            print!(
-                "{}",
-                sudo_secretspec_cli::install::sudoers_text_for_platform(&operator, &service_user)
-            );
-        }
+        } => match sudo_secretspec_cli::install::sudoers_text_for_platform(&operator, &service_user)
+        {
+            Ok(text) => print!("{text}"),
+            Err(message) => {
+                eprintln!("sudo-secretspec: {message}");
+                std::process::exit(2);
+            }
+        },
     }
 }
 

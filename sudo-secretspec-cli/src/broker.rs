@@ -1133,6 +1133,20 @@ fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>
         "source-restore" | "source-restore-force" | "source-destroy" => {
             let op = broker.operation.as_str();
 
+            // `--all` and `--force` on the *plain* `source-restore` verb are
+            // refused here. The NOPASSWD grant for the plain verb is a `--*`
+            // glob, which also matches `source-restore --all`/`--force`, so a
+            // caller who invokes sudo directly (not the client, which routes
+            // those flags to `source-restore-force`) could reach an unattended
+            // whole-vault restore through the NOPASSWD grant. The authorisation
+            // gate must be the sudoers verb, not client routing.
+            if op == "source-restore" && (broker.all || broker.force) {
+                eprintln!(
+                    "broker: source-restore --all/--force must run through source-restore-force"
+                );
+                return (2, vec![]);
+            }
+
             let db_path = cfg.vault.join("secrets.db");
             // `Connection::open` defaults to SQLITE_OPEN_CREATE, so on a fresh
             // vault these verbs used to *create* an empty, schema-less
@@ -2266,7 +2280,7 @@ BETA = { description = "second", required = false }
         secrets.delete("ALPHA").unwrap();
         secrets.delete("BETA").unwrap();
 
-        let mut broker = broker_op("source-restore");
+        let mut broker = broker_op("source-restore-force");
         broker.all = true;
         broker.to = Some("2".into());
 
@@ -2277,6 +2291,36 @@ BETA = { description = "second", required = false }
         assert_eq!(names, vec!["ALPHA".to_string(), "BETA".to_string()]);
         assert_eq!(live_value(&cfg, "ALPHA").as_deref(), Some("a1"));
         assert_eq!(live_value(&cfg, "BETA").as_deref(), Some("b1"));
+    }
+
+    #[test]
+    fn plain_source_restore_refuses_all_and_force() {
+        // M2: the plain verb's NOPASSWD grant is a `--*` glob that also matches
+        // `--all`/`--force`, so a direct sudo caller could reach an unattended
+        // whole-vault restore. The broker must refuse, so the gate is the
+        // sudoers verb and not client routing.
+        let _guard = EXECUTE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_vault, cfg) = execute_fixture();
+        fixture_secrets(&cfg).set("ALPHA", Some("a1".into())).unwrap();
+
+        let mut all = broker_op("source-restore");
+        all.all = true;
+        all.to = Some("1".into());
+        assert_eq!(
+            execute(&all, &cfg, &fixture_reason()).0,
+            2,
+            "source-restore --all must refuse on the plain verb"
+        );
+
+        let mut force = broker_op("source-restore");
+        force.force = true;
+        force.name = Some("ALPHA".into());
+        force.to = Some("1".into());
+        assert_eq!(
+            execute(&force, &cfg, &fixture_reason()).0,
+            2,
+            "source-restore --force must refuse on the plain verb"
+        );
     }
 
     #[test]

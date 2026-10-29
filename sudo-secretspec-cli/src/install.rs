@@ -921,14 +921,47 @@ pub fn sudoers_text(operator: &str, service_user: &str) -> String {
 /// Printed by the hidden `print-sudoers` subcommand and embedded by the NixOS
 /// module via import-from-derivation, so the module's sudoers text and the
 /// binary's own view of the broker path can never drift apart.
-pub fn linux_sudoers_text(operator: &str, service_user: &str) -> String {
-    format!(
+/// Whether a name is acceptable as the grantee of a Linux NOPASSWD sudoers
+/// line (the operator) or as the service user the broker runs as.
+///
+/// Same grammar as `config.rs::valid_service_identity` on Linux (a-z/`_` first,
+/// then a-z/0-9/`_`/`-`, at most 31 chars), plus the sudoers principal cases
+/// that helper does not cover: `ALL` is a sudoers keyword that grants every
+/// account, and `root` is the superuser — neither may name the grantee of a
+/// NOPASSWD line. The operator and service user are formatted verbatim into the
+/// sudoers text (`operator_grant_lines`), so a config author who writes a group
+/// (`%wheel`), a uid (`#1000`), a comma list, or a newline-injected rule would
+/// emit a policy that `visudo -c` happily accepts; refuse them here so the IFD
+/// build fails instead of silently widening the grant.
+fn linux_identity_valid(value: &str) -> bool {
+    if value == "ALL" || value == "root" || value.is_empty() || value.len() > 31 {
+        return false;
+    }
+    value.bytes().enumerate().all(|(index, byte)| match byte {
+        b'a'..=b'z' | b'_' => true,
+        b'0'..=b'9' | b'-' => index > 0,
+        _ => false,
+    })
+}
+
+pub fn linux_sudoers_text(operator: &str, service_user: &str) -> Result<String, String> {
+    if !linux_identity_valid(operator) {
+        return Err(format!(
+            "refusing to emit sudoers: operator {operator:?} is not a valid sudoers principal"
+        ));
+    }
+    if !linux_identity_valid(service_user) {
+        return Err(format!(
+            "refusing to emit sudoers: service user {service_user:?} is not a valid identity"
+        ));
+    }
+    Ok(format!(
         "Defaults!{broker} env_reset,env_keep-=\"HOME\",secure_path={secure_path},umask=0077,always_set_home\n\
          {grants}",
         broker = platform::BROKER_PATH,
         secure_path = SUDOERS_SECURE_PATH,
         grants = operator_grant_lines(operator, service_user, platform::BROKER_PATH),
-    )
+    ))
 }
 
 /// The sudoers policy for the platform this binary was compiled for.
@@ -936,9 +969,9 @@ pub fn linux_sudoers_text(operator: &str, service_user: &str) -> String {
 /// The macOS installer (`install`) calls [`sudoers_text`]; the NixOS module and
 /// the hidden `print-sudoers` subcommand call this so one function is the single
 /// source of truth per platform.
-pub fn sudoers_text_for_platform(operator: &str, service_user: &str) -> String {
+pub fn sudoers_text_for_platform(operator: &str, service_user: &str) -> Result<String, String> {
     if platform::IS_MACOS {
-        sudoers_text(operator, service_user)
+        Ok(sudoers_text(operator, service_user))
     } else {
         linux_sudoers_text(operator, service_user)
     }
@@ -1601,7 +1634,7 @@ mod tests {
         // client line and the macOS-only `doctor` grants, and grants exactly the
         // mediated broker verbs plus the read-only `audit-verify`. The force and
         // destroy verbs stay un-granted for the same reason as on macOS.
-        let text = linux_sudoers_text("dann", "sudo-secretspec");
+        let text = linux_sudoers_text("dann", "sudo-secretspec").unwrap();
         for verb in BROKER_VERBS {
             assert!(
                 text.contains(&format!(
@@ -1632,6 +1665,34 @@ mod tests {
                 "{absent} must have no Linux grant:\n{text}"
             );
         }
+    }
+
+    #[test]
+    fn linux_sudoers_text_refuses_non_principal_identities() {
+        // M1: the operator and service user reach the sudoers text verbatim, so
+        // a config author who writes `ALL`, `root`, a group, a uid, or an
+        // injected rule would emit a policy that `visudo -c` happily accepts.
+        // Refuse anything that is not a single plain principal.
+        for bad in [
+            "ALL",
+            "root",
+            "%wheel",
+            "dann, nginx",
+            "#1000",
+            "dann ALL=(ALL) NOPASSWD: ALL\ndann",
+            "Dann",
+            "-dann",
+        ] {
+            assert!(
+                linux_sudoers_text(bad, "sudo-secretspec").is_err(),
+                "operator {bad:?} must be refused"
+            );
+        }
+        assert!(
+            linux_sudoers_text("dann", "ALL").is_err(),
+            "service user ALL must be refused"
+        );
+        assert!(linux_sudoers_text("dann", "sudo-secretspec").is_ok());
     }
 
     #[test]

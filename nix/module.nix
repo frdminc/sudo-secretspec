@@ -87,8 +87,13 @@ in
 
     operator = mkOption {
       type = types.str;
-      default = "dann";
-      description = "User granted the NOPASSWD rules for the unattended broker verbs.";
+      description = ''
+        User granted the NOPASSWD rules for the unattended broker verbs. No
+        default: the operator must be named explicitly, and it must be a
+        declared, non-root, non-service user (asserted below). The name is
+        formatted verbatim into the sudoers text, so it is constrained to a
+        single plain principal.
+      '';
     };
 
     serviceUser = mkOption {
@@ -143,24 +148,48 @@ in
         message = "sudo-secretspec: the package's config path (${configPath}) must live under /etc.";
       }
       {
-        assertion = builtins.dirOf cfg.vault == "/var/lib" && cfg.vault != "/var/lib";
-        message = "services.sudo-secretspec.vault must be a direct child of /var/lib.";
+        # A direct child of /var/lib, named by a plain lowercase token. The
+        # regex (anchored by `builtins.match`) rules out traversal (`..`),
+        # nested paths, and a `nixos`/`systemd`/`private` collision — those are
+        # system state directories that a re-owning tmpfiles rule must never
+        # touch.
+        assertion =
+          builtins.match "/var/lib/[a-z0-9_][a-z0-9_.-]*" cfg.vault != null
+          && !(builtins.elem (builtins.baseNameOf cfg.vault) [ "nixos" "systemd" "private" ]);
+        message = "services.sudo-secretspec.vault must be a direct child of /var/lib with a plain name (not nixos, systemd, or private).";
       }
       {
         assertion =
           builtins.match identity cfg.serviceUser != null
           && builtins.match identity cfg.serviceGroup != null
           && cfg.serviceUser != "root"
-          && cfg.serviceGroup != "root";
-        message = "services.sudo-secretspec: serviceUser/serviceGroup must match ${identity} and not be root.";
+          && !(builtins.elem cfg.serviceGroup [
+            "root"
+            "wheel"
+            "adm"
+            "keys"
+            "systemd-journal"
+            "nixbld"
+          ]);
+        message = "services.sudo-secretspec: serviceUser/serviceGroup must match ${identity}, not be root, and serviceGroup must not be a privileged system group (wheel, adm, keys, systemd-journal, nixbld).";
       }
       {
         assertion = builtins.match "[A-Za-z][A-Za-z0-9_-]{0,63}" cfg.profile != null;
         message = "services.sudo-secretspec.profile must be a plain profile name (letters, digits, `_`, `-`).";
       }
       {
-        assertion = cfg.operator != "root";
-        message = "services.sudo-secretspec.operator must be a non-root user.";
+        # The operator name is formatted verbatim into the sudoers text, so it
+        # must be a single plain principal — and one that cannot be confused
+        # with a sudoers keyword (`ALL`, `root`) or the service account. It must
+        # also be a declared user so a typo cannot silently grant the verbs to a
+        # name that never exists.
+        assertion =
+          builtins.match identity cfg.operator != null
+          && cfg.operator != "ALL"
+          && cfg.operator != "root"
+          && cfg.operator != cfg.serviceUser
+          && builtins.hasAttr cfg.operator config.users.users;
+        message = "services.sudo-secretspec.operator must be a declared, non-root, non-service user matching ${identity} (and not `ALL`).";
       }
     ];
 
@@ -199,11 +228,20 @@ in
 
     # The whole policy — the `Defaults!` line *and* the operator's NOPASSWD
     # grant lines — comes from `sudoersText`, the IFD derivation that runs the
-    # binary's own `print-sudoers`. `extraConfig` is appended by NixOS after the
-    # stock `%wheel` rule, and sudoers is last-match-wins, so the NOPASSWD
-    # grants take effect over `%wheel`'s password prompt. There is no
-    # `timestamp_timeout=0` line and no `doctor` grant on Linux: the former has
-    # no client path to attach to, the latter refuses on Linux.
+    # binary's own `print-sudoers`. `security.sudo.extraConfig` is
+    # `types.lines`, merged by plain `concatStringsSep "\n"` with no
+    # `sortProperties` pass, so `mkOrder`/`mkAfter` carry no weight here; what
+    # actually orders it is nixpkgs' `sudo.nix`, which appends `extraConfig`
+    # LAST — after the stock `%wheel` `extraRules` block. sudoers is
+    # last-match-wins, so these grants are the final lines and take effect over
+    # `%wheel`'s password prompt. The only residual is ordering against a
+    # *second* module that also sets `extraConfig`: nixpkgs emits both in the
+    # order its `concatStringsSep` sees them, and whichever lands later wins.
+    # That is an availability-only risk (a later rule could re-prompt for a
+    # verb), never an escalation — it cannot add a grant this module did not
+    # already emit. There is no `timestamp_timeout=0` line and no `doctor` grant
+    # on Linux: the former has no client path to attach to, the latter refuses
+    # on Linux.
     security.sudo.extraConfig = builtins.readFile sudoersText;
   };
 }
