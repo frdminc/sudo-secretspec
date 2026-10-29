@@ -4,7 +4,7 @@ set -euo pipefail
 [[ $(id -u) == 0 ]] || { echo 'requires root in a disposable Debian container' >&2; exit 1; }
 [[ -f /.dockerenv || -f /run/.containerenv ]] || { echo 'requires a disposable container' >&2; exit 1; }
 [[ ! -e /etc/sudo-secretspec.toml && ! -e /var/lib/sudo-secretspec ]]
-[[ ! -e /run/current-system && ! -L /run/current-system && ! -e /etc/NIXOS ]]
+[[ ! -e /run/current-system && ! -L /run/current-system && ! -e /etc/NIXOS && ! -L /etc/NIXOS ]]
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 local_before=$(stat -c '%a %U:%G' /usr/local/bin)
 printf 'Debian /usr/local/bin before install: %s\n' "$local_before"

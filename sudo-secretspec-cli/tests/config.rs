@@ -1,24 +1,33 @@
 use std::path::Path;
 
-use sudo_secretspec_cli::config::Config;
+use sudo_secretspec_cli::{config::Config, platform};
 
-fn valid() -> &'static str {
-    r#"
-engine = "/usr/local/libexec/sudo-secretspec-engine"
-audit_helper = "/usr/local/libexec/sudo-secretspec"
-vault = "/var/db/sudo-secretspec"
-vault_realpath = "/private/var/db/sudo-secretspec"
-declarations = "/usr/local/share/sudo-secretspec/secretspec.toml"
-service_user = "_sudo_secretspec"
-service_group = "_sudo_secretspec"
-"#
+fn valid() -> String {
+    let broker = platform::DEFAULT_BROKER_PATH;
+    let vault = platform::DEFAULT_VAULT;
+    let real = Path::new(platform::VAULT_REAL_PARENT).join("sudo-secretspec");
+    let prefix = platform::PREFIX;
+    let user = platform::DEFAULT_USER;
+    let group = platform::DEFAULT_GROUP;
+    format!(
+        r#"
+engine = "{broker}"
+audit_helper = "{broker}"
+vault = "{vault}"
+vault_realpath = "{}"
+declarations = "{prefix}/share/sudo-secretspec/secretspec.toml"
+service_user = "{user}"
+service_group = "{group}"
+"#,
+        real.display()
+    )
 }
 
 #[test]
 fn parses_typed_toml_without_shell_evaluation() {
-    let config = Config::parse(valid()).unwrap();
-    assert_eq!(config.vault(), Path::new("/var/db/sudo-secretspec"));
-    assert_eq!(config.service_user(), "_sudo_secretspec");
+    let config = Config::parse(&valid()).unwrap();
+    assert_eq!(config.vault(), Path::new(platform::DEFAULT_VAULT));
+    assert_eq!(config.service_user(), platform::DEFAULT_USER);
 }
 
 #[test]
@@ -27,12 +36,22 @@ fn rejects_unknown_keys_and_noncanonical_vaults() {
     assert!(Config::parse(&unknown).is_err());
 
     let nested = valid().replace(
-        "vault = \"/var/db/sudo-secretspec\"",
-        "vault = \"/var/db/team/sudo-secretspec\"",
+        &format!("vault = \"{}\"", platform::DEFAULT_VAULT),
+        &format!(
+            "vault = \"{}/team/sudo-secretspec\"",
+            platform::VAULT_PARENT
+        ),
     );
+    assert_ne!(nested, valid());
     assert!(Config::parse(&nested).is_err());
 
-    let mismatched = valid().replace("/private/var/db/sudo-secretspec", "/private/var/db/other");
+    let real = Path::new(platform::VAULT_REAL_PARENT).join("sudo-secretspec");
+    let other = Path::new(platform::VAULT_REAL_PARENT).join("other");
+    let mismatched = valid().replace(
+        &format!("vault_realpath = \"{}\"", real.display()),
+        &format!("vault_realpath = \"{}\"", other.display()),
+    );
+    assert_ne!(mismatched, valid());
     assert!(Config::parse(&mismatched).is_err());
 }
 
@@ -42,7 +61,7 @@ fn a_config_without_a_profile_still_parses_and_pins_the_default() {
     // is what lets an older installer's config be read by a newer broker.
     // Without the default it would be a hard parse failure on upgrade.
     assert!(!valid().contains("profile"));
-    assert_eq!(Config::parse(valid()).unwrap().profile, "default");
+    assert_eq!(Config::parse(&valid()).unwrap().profile, "default");
 }
 
 #[test]
@@ -81,12 +100,9 @@ fn rejects_profile_names_that_are_not_plain_manifest_keys() {
 
 #[test]
 fn rejects_invalid_service_identity_and_relative_paths() {
-    assert!(Config::parse(&valid().replace("_sudo_secretspec", "root")).is_err());
+    assert!(Config::parse(&valid().replace(platform::DEFAULT_USER, "root")).is_err());
     assert!(
-        Config::parse(&valid().replace(
-            "/usr/local/libexec/sudo-secretspec-engine",
-            "./secretspec-engine",
-        ))
-        .is_err()
+        Config::parse(&valid().replace(platform::DEFAULT_BROKER_PATH, "./secretspec-engine",))
+            .is_err()
     );
 }
