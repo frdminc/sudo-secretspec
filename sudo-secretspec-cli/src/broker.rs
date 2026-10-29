@@ -2304,9 +2304,7 @@ BETA = { description = "second", required = false }
         // sudoers verb and not client routing.
         let _guard = EXECUTE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (_vault, cfg) = execute_fixture();
-        fixture_secrets(&cfg)
-            .set("ALPHA", Some("a1".into()))
-            .unwrap();
+        fixture_secrets(&cfg).set_text("ALPHA", "a1").unwrap();
 
         let mut all = broker_op("source-restore");
         all.all = true;
@@ -2332,9 +2330,7 @@ BETA = { description = "second", required = false }
     fn restore_requires_a_target_and_a_selector() {
         let _guard = EXECUTE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (_vault, cfg) = execute_fixture();
-        fixture_secrets(&cfg)
-            .set("ALPHA", Some("a1".into()))
-            .unwrap();
+        fixture_secrets(&cfg).set_text("ALPHA", "a1").unwrap();
 
         // No `--to` at all.
         let mut broker = broker_op("source-restore");
@@ -2358,9 +2354,7 @@ BETA = { description = "second", required = false }
         // address-mismatch defect hide.
         let _guard = EXECUTE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (_vault, cfg) = execute_fixture();
-        fixture_secrets(&cfg)
-            .set("ALPHA", Some("a1".into()))
-            .unwrap(); // sequence 1: ALPHA only
+        fixture_secrets(&cfg).set_text("ALPHA", "a1").unwrap(); // sequence 1: ALPHA only
 
         let mut broker = broker_op("source-restore");
         broker.name = Some("BETA".into());
@@ -2553,9 +2547,7 @@ BETA = { description = "second", required = false }
     fn destroy_requires_a_name_and_refuses_one_with_no_history() {
         let _guard = EXECUTE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (_vault, cfg) = execute_fixture();
-        fixture_secrets(&cfg)
-            .set("ALPHA", Some("a1".into()))
-            .unwrap();
+        fixture_secrets(&cfg).set_text("ALPHA", "a1").unwrap();
 
         // `--all` is not a destroy selector; destroy is one name at a time.
         assert_eq!(
@@ -2587,9 +2579,7 @@ BETA = { description = "second", required = false }
         // entry *`execute` itself* writes.
         let _guard = EXECUTE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (_vault, cfg) = execute_fixture();
-        fixture_secrets(&cfg)
-            .set("ALPHA", Some("a1".into()))
-            .unwrap(); // sequence 1
+        fixture_secrets(&cfg).set_text("ALPHA", "a1").unwrap(); // sequence 1
 
         let count_entries = || -> i64 {
             rusqlite::Connection::open(cfg.vault.join("secrets.db"))
