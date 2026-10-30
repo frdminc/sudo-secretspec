@@ -106,6 +106,19 @@ jobs:
         run: cargo build --release -p sudo-secretspec-cli --locked
       - name: Smoke the Debian installer as root
         run: bash scripts/debian-smoke.sh target/release/sudo-secretspec
+      # The tag job runs this script only on a release tag, so a drift in it
+      # (a version-shape check left on an old upstream base) shipped nothing
+      # and warned no one. Run it here, in the same Debian image, every time.
+      - name: Build the release media the way the tag job does
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          base=$(sed -n 's/^UPSTREAM_VERSION = "\(.*\)"$/\1/p' packaging/release.py)
+          bash packaging/build-linux-artifact.sh target/release/sudo-secretspec "$base-sudo.1" 0 /tmp/media
+          media=$(ls /tmp/media/*.tar.gz)
+          tar -tzf "$media" | grep -E '/libexec/sudo-secretspec$'
+          tar -tzf "$media" | grep -E '/share/sudo-secretspec/AI-GUIDANCE\.md$'
+          (cd /tmp/media && sha256sum -c ./*.sha256)
       - uses: actions/upload-artifact@v4
         with:
           name: sudo-secretspec-linux-x86_64
