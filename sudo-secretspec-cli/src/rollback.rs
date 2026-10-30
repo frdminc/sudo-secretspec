@@ -75,9 +75,27 @@ pub fn run(snapshot: &Path) -> Result<(), RollbackError> {
 
     let pairs = plan_restore(&snapshot)?;
     let host = platform::host();
-    let layout = crate::load_config(Path::new(platform::CONFIG_PATH)).map_err(|e| {
-        RollbackError::Denied(format!("cannot read installed service identity: {e}"))
-    })?;
+    // The service identity that restored files are chowned to comes from the
+    // snapshot's own config (covered by the verified manifest), not from the
+    // live config: that file is service-user-writable, so trusting it would let
+    // the service user pick the account root chowns the broker to, and a broken
+    // live config would make the recovery tool refuse to recover. The live
+    // config is only the fallback for a snapshot that carries none.
+    let snapshot_config = pairs
+        .iter()
+        .find(|(_, dest, _)| dest.as_path() == Path::new(platform::CONFIG_PATH))
+        .map(|(prior, _, _)| prior.clone());
+    let layout = snapshot_config
+        .as_deref()
+        .and_then(|prior| crate::load_config(prior).ok())
+        .map_or_else(
+            || {
+                crate::load_config(Path::new(platform::CONFIG_PATH)).map_err(|e| {
+                    RollbackError::Denied(format!("cannot read installed service identity: {e}"))
+                })
+            },
+            Ok,
+        )?;
 
     for (prior, dest, mode) in pairs.iter().rev() {
         if let Some(parent) = dest.parent() {

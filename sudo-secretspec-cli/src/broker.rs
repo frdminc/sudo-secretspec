@@ -998,6 +998,13 @@ fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>
                 eprintln!("broker: source-add requires --description");
                 return (2, vec![name.into()]);
             };
+            // The engine's builder only rejects the empty string; the broker
+            // path is NOPASSWD, so a whitespace-only description must be
+            // refused here as it was before the engine took over the edit.
+            if description.trim().is_empty() {
+                eprintln!("broker: source-add requires a non-empty --description");
+                return (2, vec![name.into()]);
+            }
             let source = match std::fs::read_to_string(&manifest) {
                 Ok(s) => s,
                 Err(e) => {

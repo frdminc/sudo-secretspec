@@ -44,7 +44,9 @@ on:
       tag:
         description: >-
           Existing release tag to build a bottle and Linux media for
-          without publishing. Empty means the tag the checked-out formula names.
+          without publishing. Empty means the tag the checked-out formula names,
+          which is rejected until the first release of the current upstream base
+          restamps the formula: name the tag explicitly until then.
           A dispatch, even on a tag ref, only uploads a workflow artifact: the
           bottle is attached to a GitHub release only by the push of a release
           tag.

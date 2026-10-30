@@ -5,7 +5,9 @@ binary=$(realpath "${1:?binary}")
 version=${2:?version}
 epoch=${3:?tag commit timestamp}
 out=$(realpath -m "${4:?output directory}")
-[[ $version =~ ^0\.19\.1-sudo\.[1-9][0-9]*$ ]]
+# Shape only: the release workflow already pins the base to release.py's
+# UPSTREAM_VERSION, so a re-base does not have to touch this line.
+[[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+-sudo\.[1-9][0-9]*$ ]]
 [[ $epoch =~ ^[0-9]+$ ]]
 root=$(git rev-parse --show-toplevel)
 name="sudo-secretspec-$version-x86_64-unknown-linux-gnu"

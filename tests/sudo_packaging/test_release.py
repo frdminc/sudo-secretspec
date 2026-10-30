@@ -3385,3 +3385,63 @@ def test_linux_verification_is_required_independently_of_homebrew(
     monkeypatch.setattr(release, "brew_install_and_test", lambda **k: "/prefix")
     release.main(["--version", cut.version, "--dry-run", "--skip-tests", *flags])
     assert seen == ["linux"]
+
+
+def _gnu_tool_dir(tmp_path: Path) -> Path | None:
+    """A PATH directory of GNU tools (tar, realpath, install, sha256sum).
+
+    The artifact script targets Debian's coreutils; macOS ships BSD variants
+    that lack `realpath -m`, `install -D` and `tar --sort`, whose GNU builds are
+    `g`-prefixed under Homebrew.
+    """
+    import shutil
+
+    shim = tmp_path / "gnu-bin"
+    shim.mkdir()
+    for tool in ("tar", "realpath", "install", "sha256sum"):
+        for candidate in (tool, f"g{tool}"):
+            found = shutil.which(candidate)
+            if found and "GNU" in subprocess.run(
+                [found, "--version"], capture_output=True, text=True
+            ).stdout:
+                (shim / tool).symlink_to(found)
+                break
+        else:
+            return None
+    return shim
+
+
+def test_linux_artifact_script_builds_media_for_the_current_upstream_base(tmp_path):
+    # The script runs only inside a tag build, so a version-shape check left on
+    # an old base failed every release of a re-based fork (it pinned 0.19.1
+    # after the base moved to 0.21.1) with nothing exercising it beforehand.
+    shim = _gnu_tool_dir(tmp_path)
+    if shim is None:
+        pytest.skip("needs GNU tar/realpath/install/sha256sum; the debian CI job runs the script itself")
+    base = load_release().UPSTREAM_VERSION
+    binary = tmp_path / "bin"
+    binary.write_bytes(b"\x7fELF fake")
+    env = {**os.environ, "PATH": f"{shim}:{os.environ['PATH']}"}
+    script = ROOT / "packaging" / "build-linux-artifact.sh"
+    out = tmp_path / "out"
+
+    def build(version: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["bash", str(script), str(binary), version, "1700000000", str(out)],
+            cwd=ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+
+    ok = build(f"{base}-sudo.1")
+    assert ok.returncode == 0, ok.stderr
+    tarball = out / f"sudo-secretspec-{base}-sudo.1-x86_64-unknown-linux-gnu.tar.gz"
+    with tarfile.open(tarball) as tar:
+        names = tar.getnames()
+    top = tarball.name.removesuffix(".tar.gz")
+    assert f"{top}/libexec/sudo-secretspec" in names
+    assert f"{top}/share/sudo-secretspec/AI-GUIDANCE.md" in names
+    assert (out / f"{tarball.name}.sha256").is_file()
+    for bad in (f"{base}-sudo.0", f"{base}-sudo.01", f"{base}", "0.21.1-djbclark.1"):
+        assert build(bad).returncode != 0, bad

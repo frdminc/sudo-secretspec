@@ -6,7 +6,8 @@ on:
       - "secretspec-ex/**"
       - ".github/workflows/elixir-package.yml"
   push:
-    tags: ["v**"]
+    # Not this fork's -sudo.N tags (see sudo-release.yml).
+    tags: ["v**", "!v*-sudo.*"]
   workflow_call:
     inputs:
       pre_release:
