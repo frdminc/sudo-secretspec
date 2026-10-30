@@ -3401,9 +3401,13 @@ def _gnu_tool_dir(tmp_path: Path) -> Path | None:
     for tool in ("tar", "realpath", "install", "sha256sum"):
         for candidate in (tool, f"g{tool}"):
             found = shutil.which(candidate)
-            if found and "GNU" in subprocess.run(
-                [found, "--version"], capture_output=True, text=True
-            ).stdout:
+            if (
+                found
+                and "GNU"
+                in subprocess.run(
+                    [found, "--version"], check=False, capture_output=True, text=True
+                ).stdout
+            ):
                 (shim / tool).symlink_to(found)
                 break
         else:
@@ -3417,7 +3421,9 @@ def test_linux_artifact_script_builds_media_for_the_current_upstream_base(tmp_pa
     # after the base moved to 0.21.1) with nothing exercising it beforehand.
     shim = _gnu_tool_dir(tmp_path)
     if shim is None:
-        pytest.skip("needs GNU tar/realpath/install/sha256sum; the debian CI job runs the script itself")
+        pytest.skip(
+            "needs GNU tar/realpath/install/sha256sum; the debian CI job runs the script itself"
+        )
     base = load_release().UPSTREAM_VERSION
     binary = tmp_path / "bin"
     binary.write_bytes(b"\x7fELF fake")
@@ -3428,6 +3434,7 @@ def test_linux_artifact_script_builds_media_for_the_current_upstream_base(tmp_pa
     def build(version: str) -> subprocess.CompletedProcess:
         return subprocess.run(
             ["bash", str(script), str(binary), version, "1700000000", str(out)],
+            check=False,
             cwd=ROOT,
             env=env,
             capture_output=True,
