@@ -589,6 +589,15 @@ def watch_jobs(
         time.sleep(CI_JOB_POLL_SECONDS)
     for name in jobs:
         _require(name in conclusions, f"{failure}: job {name!r} not in the run: {url}")
+
+    def severity(name: str) -> int:
+        # A job that actually failed is the cause; one still running only
+        # looks wrong because we stopped waiting for it.
+        if conclusions[name] == "success":
+            return 2
+        return 1 if not conclusions[name] else 0
+
+    for name in sorted(jobs, key=severity):
         _require(
             conclusions[name] == "success",
             f"{failure}: job {name!r} concluded {conclusions[name]!r}: {url}",

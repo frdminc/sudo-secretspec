@@ -1521,11 +1521,15 @@ def test_watch_jobs_keeps_polling_until_its_own_jobs_conclude(monkeypatch, relea
 
 
 def test_watch_jobs_stops_at_the_first_red_job_it_needs(monkeypatch, release):
+    # `packaging` is listed first and still running; the error must name the
+    # job that failed, not the one we merely stopped waiting for (the first
+    # live run named 'packaging' concluded '' when linux-artifact was red).
     seen, _ = fake_jobs_run(
         monkeypatch,
         release,
         run_view_json(
-            {"linux-artifact": "failure", "publish-linux": None}, status="in_progress"
+            {"packaging": None, "linux-artifact": "failure", "publish-linux": None},
+            status="in_progress",
         ),
     )
     with pytest.raises(release.ReleaseError, match="'linux-artifact' concluded"):

@@ -392,6 +392,9 @@ jobs:
           set -euo pipefail
           test "${RUNNER_ENVIRONMENT:-}" = github-hosted
           test "$(uname -m)" = x86_64
+          # The container runs as root over a runner-owned checkout; without
+          # this every git command below dies with "dubious ownership".
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           if [ "$GITHUB_REF_TYPE" = tag ]; then
             test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           fi
