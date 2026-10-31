@@ -119,6 +119,13 @@ jobs:
           tar -tzf "$media" | grep -E '/libexec/sudo-secretspec$'
           tar -tzf "$media" | grep -E '/share/sudo-secretspec/AI-GUIDANCE\.md$'
           (cd /tmp/media && sha256sum -c ./*.sha256)
+          # The shape check must refuse everything that is not <x.y.z>-sudo.<N>, N >= 1, no leading zero.
+          for bad in "$base-sudo.0" "$base-sudo.01" "$base" "$base-djbclark.1"; do
+            if bash packaging/build-linux-artifact.sh target/release/sudo-secretspec "$bad" 0 /tmp/media-bad 2>/dev/null; then
+              echo "artifact script accepted bad version $bad" >&2
+              exit 1
+            fi
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: sudo-secretspec-linux-x86_64
