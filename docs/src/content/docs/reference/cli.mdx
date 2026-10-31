@@ -702,13 +702,21 @@ for how to associate the generated schemas with TOML files.
 
 Add a secret declaration to an existing `secretspec.toml`. This edits only the
 selected profile and preserves the manifest's comments, formatting, and
-unrelated tables. By default the declaration carries no `required` key at all,
-so it inherits the profile's `[defaults] required` — which is itself required
-unless the profile says otherwise.
+unrelated tables. Unless overridden, the new declaration follows the profile's
+defaults; without a `required` profile default, it is required like any other
+declaration.
+
+<VersionCompatibility version="0.22" kind="changed">
+
+Use `--optional` or `--required` to override the profile's requiredness default
+for the new declaration. These flags are mutually exclusive. Omitting both
+leaves the `required` key absent, preserving the profile's defaults.
+
+</VersionCompatibility>
 
 ```bash
 $ secretspec add <NAME> [--description <DESCRIPTION>] [--profile <PROFILE>] # 0.18+
-$ secretspec add <NAME> [--description <DESCRIPTION>] [--optional | --required] # 0.22+
+$ secretspec add <NAME> [--description <DESCRIPTION>] [--profile <PROFILE>] [--optional | --required] # 0.22+
 ```
 
 **Arguments and options:**
@@ -720,17 +728,9 @@ $ secretspec add <NAME> [--description <DESCRIPTION>] [--optional | --required] 
 - `-P, --profile <PROFILE>` - Profile to edit. When omitted, SecretSpec uses the
   normal active-profile resolution, including `SECRETSPEC_PROFILE` and the
   user-global default.
-- `--optional` (0.22+) - Write `required = false`, overriding a profile default
-  of `required = true`. `check` then does not fail *because this secret is
-  unset* — it can still fail for another secret.
-- `--required` (0.22+) - Write `required = true`. Only needed in a profile
-  whose `[defaults]` set `required = false`, where omitting both flags would
-  otherwise inherit optional. Cannot be combined with `--optional`.
-
-Omitting both flags writes exactly what `add` wrote before 0.22. There is no
-flag for the `at_least_one`/`exactly_one` presence-group form of `required`:
-that spans several secrets at once and doesn't fit a single-secret `add`, so
-edit the manifest directly for it.
+- `--optional` - Write `required = false` (0.22+).
+- `--required` - Write `required = true`, even when the profile defaults to
+  optional (0.22+). Cannot be combined with `--optional` (0.22+).
 
 ```bash
 $ secretspec add API_KEY --description "API access token" # 0.18+

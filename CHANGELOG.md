@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `secretspec add` accepts `--optional` and `--required` (0.22+) to override
+  profile defaults when declaring a secret. Omitting both keeps the defaults.
+
 - `secretspec config show` displays computed project and global configuration,
   including CLI and environment overrides, each setting's source, and merged
   provider aliases. Use `--json` for structured output. No secrets are fetched;
@@ -324,8 +327,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the install would do nothing. The privileged installer still repeats every
   check as root; that copy remains the authoritative one.
 
-- `add` (both `secretspec add` and `sudo-secretspec add`) takes new
-  `--optional` and `--required` flags, writing `required = false` or
+- `sudo-secretspec add` takes the same new `--optional` and `--required` flags
+  as `secretspec add` (0.22+), writing `required = false` or
   `required = true` on the new declaration. Omitting both writes no `required`
   key, exactly as before, leaving the secret to inherit `[defaults] required`
   from its profile. Previously there was no flag at all, so a secret only some
@@ -453,6 +456,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is explicitly adopted. Linux uninstall refuses destructive cleanup of
   non-default service identities and vault paths.
 
+
+- Undeclared secrets in `set`, `delete`, and `cache clear NAME` now report the
+  profile and available secrets without a duplicated "Secret ... not found"
+  wrapper. Rust callers receive `SecretSpecError::SecretNotDefined` for these
+  errors; their `kind()` remains `secret_not_found`.
 - Scaleway: `secretspec set` on a secret that already exists adds a new version
   instead of failing with HTTP 400 "cannot have same secret name in same path".
 
@@ -518,12 +526,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transaction so a concurrent opener waits on the busy timeout and sees the
   finished triggers, and a failed finish rolls back rather than leaving a
   partial trigger set.
-
-- `set`, `get`, and `delete` on a name that is not declared in the active
-  profile no longer print a garbled, doubly-quoted error such as
-  `Secret 'Secret 'NAME' is not defined in profile 'default' ...' not found`.
-  The message now reads once, still naming the available secrets. The
-  non-zero exit status this already returned is unchanged.
 
 - `install --adopt-existing` no longer refuses a vault that has already
   migrated to the sqlite-only secret store. It required a legacy `.env` file

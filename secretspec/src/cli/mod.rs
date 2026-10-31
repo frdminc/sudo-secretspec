@@ -264,16 +264,15 @@ enum Commands {
         /// Human-readable description (prompts when omitted)
         #[arg(short, long)]
         description: Option<String>,
+        /// Declare the secret optional, overriding profile defaults (0.22+)
+        #[arg(long, conflicts_with = "required")]
+        optional: bool,
+        /// Declare the secret required, overriding profile defaults (0.22+)
+        #[arg(long, conflicts_with = "optional")]
+        required: bool,
         /// Profile to add the secret to
         #[arg(short = 'P', long, env = "SECRETSPEC_PROFILE", add = clap_complete::ArgValueCompleter::new(completion::profiles))]
         profile: Option<String>,
-        /// Declare the secret optional, writing `required = false` (0.22+)
-        #[arg(long, conflicts_with = "required")]
-        optional: bool,
-        /// Declare the secret required, writing `required = true`. Only needed
-        /// in a profile whose `[defaults]` set `required = false` (0.22+)
-        #[arg(long)]
-        required: bool,
     },
     /// Set a secret value
     Set {
@@ -1287,14 +1286,7 @@ pub fn main() -> Result<()> {
             optional,
             required,
         } => {
-            // Tri-state: neither flag omits the key entirely, which leaves the
-            // secret inheriting `[defaults] required` from its profile. clap
-            // guarantees the two are not both set.
-            let requiredness = match (optional, required) {
-                (true, _) => Some(false),
-                (_, true) => Some(true),
-                _ => None,
-            };
+            let required = required.then_some(true).or(optional.then_some(false));
             let app = load_secrets(&cli.file, &cli.reason, &caller)?;
             let profile = app.resolve_profile_name(profile.as_deref());
             validate_add_target(&app, &profile, &name)?;
@@ -1317,7 +1309,8 @@ pub fn main() -> Result<()> {
             let source = fs::read_to_string(&manifest_path)
                 .into_diagnostic()
                 .wrap_err_with(|| format!("Failed to read {}", manifest_path.display()))?;
-            let updated = add_secret_to_spec(&source, &profile, &name, description, requiredness)?;
+            let required = required.then_some(true).or(optional.then_some(false));
+            let updated = add_secret_to_spec(&source, &profile, &name, description, required)?;
             write_manifest_atomically(&manifest_path, &updated)?;
 
             println!(
@@ -2655,57 +2648,27 @@ mod tests {
     }
 
     #[test]
-    fn add_parses_each_requiredness_flag() {
-        let parse = |flag: &str| {
-            Cli::try_parse_from([
-                "secretspec",
-                "add",
-                "API_KEY",
-                "--description",
-                "API access token",
-                flag,
-            ])
-            .unwrap()
-            .command
-        };
-
-        match parse("--optional") {
-            Commands::Add {
-                optional, required, ..
-            } => {
-                assert!(optional);
-                assert!(!required);
+    fn add_parses_requiredness_flags_and_rejects_conflicts() {
+        for (flag, expected_optional, expected_required) in
+            [("--optional", true, false), ("--required", false, true)]
+        {
+            let cli = Cli::try_parse_from(["secretspec", "add", "API_KEY", flag]).unwrap();
+            match cli.command {
+                Commands::Add {
+                    optional, required, ..
+                } => {
+                    assert_eq!(optional, expected_optional);
+                    assert_eq!(required, expected_required);
+                }
+                _ => panic!("expected Add command"),
             }
-            _ => panic!("expected Add command"),
         }
 
-        match parse("--required") {
-            Commands::Add {
-                optional, required, ..
-            } => {
-                assert!(!optional);
-                assert!(required);
-            }
-            _ => panic!("expected Add command"),
-        }
-    }
-
-    #[test]
-    fn add_rejects_both_requiredness_flags_at_once() {
-        // They map to one tri-state, so accepting both would force the handler
-        // to silently pick a winner.
-        assert!(
-            Cli::try_parse_from([
-                "secretspec",
-                "add",
-                "API_KEY",
-                "--description",
-                "API access token",
-                "--optional",
-                "--required",
-            ])
-            .is_err()
-        );
+        let error =
+            Cli::try_parse_from(["secretspec", "add", "API_KEY", "--optional", "--required"])
+                .err()
+                .expect("requiredness flags must conflict");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]

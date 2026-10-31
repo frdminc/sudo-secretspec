@@ -2894,85 +2894,105 @@ fn test_set_with_undefined_secret() {
     let spec = Secrets::new(project_config, Some(global_config), None, None);
 
     // Test setting an undefined secret - env provider is read-only,
-    // but we should get the SecretNotFound error before the provider error
+    // but we should get the SecretNotDefined error before the provider error
     let result = spec.set_text("UNDEFINED_SECRET", "test_value");
 
     assert!(result.is_err());
     match result {
-        Err(SecretSpecError::SecretNotFound(msg)) => {
-            assert!(msg.contains("UNDEFINED_SECRET"));
-            assert!(msg.contains("not defined in profile"));
-            assert!(msg.contains("DEFINED_SECRET"));
+        Err(error @ SecretSpecError::SecretNotDefined { .. }) => {
+            assert_eq!(
+                error.to_string(),
+                "Secret 'UNDEFINED_SECRET' is not defined in profile 'default'. Available secrets: DEFINED_SECRET"
+            );
         }
-        _ => panic!("Expected SecretNotFound error"),
+        _ => panic!("Expected SecretNotDefined error"),
     }
 }
 
-/// Regression for a `SecretSpecError::SecretNotFound` built from an
-/// already-complete sentence getting wrapped a second time by the variant's
-/// own `"Secret '{0}' not found"` `Display` template, rendering as
-/// `Secret 'Secret 'X' is not defined in profile 'Y' ...' not found`. Pinned
-/// on `Display`, not just the inner `msg` field like the test above, because
-/// that double-wrap is invisible when matching on the field directly.
 #[test]
-fn test_set_with_undefined_secret_error_display_is_not_double_wrapped() {
-    let project_config = Config {
-        defaults: None,
-        project: Project {
-            name: "test_project".to_string(),
-            ..Default::default()
-        },
-        profiles: {
-            let mut profiles = HashMap::new();
-            let mut secrets = HashMap::new();
-            secrets.insert(
-                "DEFINED_SECRET".to_string(),
-                Secret {
-                    description: Some("A defined secret".to_string()),
-                    required: Some(true),
-                    default: None,
-                    providers: None,
-                    as_path: None,
-                    ..Default::default()
-                },
+fn undeclared_mutations_report_profile_and_inherited_names_without_scope_filtering() {
+    let _env = scrub_resolution_env();
+    let config: Config = toml::from_str(
+        r#"
+[project]
+name = "undeclared-test"
+revision = "1.0"
+require_reason = false
+
+[profiles.default]
+Z_INHERITED = { description = "Inherited secret" }
+
+[profiles.production]
+A_LOCAL = { description = "Local secret" }
+
+[scopes.local]
+secrets = ["A_LOCAL"]
+"#,
+    )
+    .unwrap();
+
+    for scope in [None, Some("local"), Some("undefined-scope")] {
+        // A broken provider also proves name validation happens before access.
+        let mut spec = Secrets::new(
+            config.clone(),
+            None,
+            Some("undefined-provider://".into()),
+            Some("production".into()),
+        );
+        if let Some(scope) = scope {
+            spec.set_scope(scope);
+        }
+        let (logger, lines) = crate::audit::test_support::collecting_logger();
+        spec.set_audit_for_test(logger);
+
+        for error in [
+            spec.set_text("UNDECLARED", "value").unwrap_err(),
+            spec.set_with_input("UNDECLARED", |_| panic!("input read before validation"))
+                .unwrap_err(),
+            spec.delete("UNDECLARED").unwrap_err(),
+            spec.clear_cache(Some("UNDECLARED")).unwrap_err(),
+        ] {
+            assert_eq!(
+                error.to_string(),
+                "Secret 'UNDECLARED' is not defined in profile 'production'. Available secrets: A_LOCAL, Z_INHERITED"
             );
-            profiles.insert(
-                "default".to_string(),
-                Profile {
-                    defaults: None,
-                    secrets,
-                },
-            );
-            profiles
-        },
-        providers: None,
-        scopes: None,
-    };
+            assert_eq!(error.kind(), "secret_not_found");
+            let SecretSpecError::SecretNotDefined {
+                name,
+                profile,
+                available,
+            } = error
+            else {
+                panic!("expected SecretNotDefined, got {error:?}");
+            };
+            assert_eq!(name, "UNDECLARED");
+            assert_eq!(profile, "production");
+            assert_eq!(available, ["A_LOCAL", "Z_INHERITED"]);
+        }
 
-    let global_config = GlobalConfig {
-        defaults: GlobalDefaults {
-            retry: None,
-            provider: Some("env".to_string()),
-            profile: None,
-            providers: None,
-        },
-        audit: None,
-    };
+        let events = audit_events(&lines);
+        for action in ["set", "delete"] {
+            let attempts: Vec<_> = events
+                .iter()
+                .filter(|event| event["action"] == action)
+                .collect();
+            assert_eq!(attempts.len(), if action == "set" { 2 } else { 1 });
+            for event in attempts {
+                assert_eq!(event["outcome"], "error");
+                assert_eq!(event["error_kind"], "secret_not_found");
+                assert!(event.get("provider").is_none());
+            }
+        }
 
-    let spec = Secrets::new(project_config, Some(global_config), None, None);
-    let result = spec.set_text("UNDEFINED_SECRET", "test_value");
-
-    let rendered = result.unwrap_err().to_string();
-    assert!(
-        !rendered.contains("Secret 'Secret '"),
-        "error message must read once, not nest itself: {rendered}"
-    );
-    assert!(
-        !rendered.ends_with("not found"),
-        "a fully-formed sentence must not get a redundant 'not found' appended: {rendered}"
-    );
-    assert!(rendered.contains("UNDEFINED_SECRET"));
-    assert!(rendered.contains("not defined in profile"));
+        spec.set_profile("undefined-profile");
+        for error in [
+            spec.set_text("UNDECLARED", "value").unwrap_err(),
+            spec.delete("UNDECLARED").unwrap_err(),
+            spec.clear_cache(Some("UNDECLARED")).unwrap_err(),
+        ] {
+            assert!(matches!(error, SecretSpecError::InvalidProfile(_)));
+        }
+    }
 }
 
 #[test]
@@ -8023,48 +8043,6 @@ fn test_import_source_literal_uri_still_works() {
     );
 }
 
-/// Regression sibling of
-/// `test_set_with_undefined_secret_error_display_is_not_double_wrapped`:
-/// `delete` builds the exact same already-complete "is not defined in
-/// profile ... Available secrets: ..." sentence as `set` and must not have it
-/// wrapped a second time by `SecretNotFound`'s `Display` impl either.
-#[test]
-fn delete_on_an_undeclared_name_is_not_double_wrapped_and_writes_nothing() {
-    let _env = scrub_resolution_env();
-    let temp = TempDir::new().unwrap();
-    let store = temp.path().join("store.env");
-    fs::write(&store, "API_KEY=secret\n").unwrap();
-    let config: Config = toml::from_str(
-        r#"
-[project]
-name = "delete-test"
-revision = "1.0"
-
-[profiles.default]
-API_KEY = { description = "API key" }
-"#,
-    )
-    .unwrap();
-    let spec = Secrets::new(
-        config,
-        None,
-        Some(format!("dotenv://{}", store.display())),
-        None,
-    );
-
-    let err = spec.delete("UNDECLARED").unwrap_err();
-    assert!(matches!(err, SecretSpecError::SecretNotFound(_)));
-    let rendered = err.to_string();
-    assert!(
-        !rendered.contains("Secret 'Secret '"),
-        "error message must read once, not nest itself: {rendered}"
-    );
-    assert!(rendered.contains("UNDECLARED"));
-    assert!(rendered.contains("not defined in profile"));
-    // Nothing was touched: the declared secret is still exactly as it was.
-    assert_eq!(read_env_var(&store, "API_KEY").as_deref(), Some("secret"));
-}
-
 #[test]
 fn delete_removes_one_provider_value_and_is_idempotent() {
     let _env = scrub_resolution_env();
@@ -8774,7 +8752,7 @@ fn set_input_is_not_read_when_write_preflight_fails() {
     let error = spec
         .set_with_input("UNDEFINED", |_| panic!("input read before name validation"))
         .unwrap_err();
-    assert!(matches!(error, SecretSpecError::SecretNotFound(_)));
+    assert!(matches!(error, SecretSpecError::SecretNotDefined { .. }));
 
     let error = spec
         .set_with_input("REQUIRED", |_| {
@@ -9246,7 +9224,7 @@ fn audit_set_undefined_records_error() {
 
     assert!(matches!(
         spec.set_text("UNDEFINED", "v"),
-        Err(SecretSpecError::SecretNotFound(_))
+        Err(SecretSpecError::SecretNotDefined { .. })
     ));
 
     let events = audit_events(&lines);
@@ -10407,12 +10385,12 @@ secrets = ["DATABASE_URL", "SENTRY_DSN"]
         let err = spec
             .set_text("UNDEFINED", "v")
             .expect_err("an undeclared secret cannot be written");
-        let SecretSpecError::SecretNotFound(msg) = err else {
-            panic!("expected SecretNotFound, got {err:?}");
+        let SecretSpecError::SecretNotDefined { available, .. } = err else {
+            panic!("expected SecretNotDefined, got {err:?}");
         };
         assert!(
-            msg.contains("QUEUE_TOKEN"),
-            "the listing must not hide the out-of-scope QUEUE_TOKEN: {msg}"
+            available.iter().any(|name| name == "QUEUE_TOKEN"),
+            "the listing must not hide the out-of-scope QUEUE_TOKEN: {available:?}"
         );
     }
 
@@ -10434,7 +10412,7 @@ secrets = ["DATABASE_URL", "SENTRY_DSN"]
         assert!(
             matches!(
                 spec.set_text("UNDEFINED", "v"),
-                Err(SecretSpecError::SecretNotFound(_))
+                Err(SecretSpecError::SecretNotDefined { .. })
             ),
             "the undefined scope must not mask the real error"
         );

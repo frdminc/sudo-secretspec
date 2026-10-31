@@ -20,16 +20,7 @@ pub(crate) fn validate_secret_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Add the declaration written by `secretspec add`: a description and,
-/// optionally, an explicit requiredness.
-///
-/// `required` is tri-state, and the third state is the reason it is not a
-/// plain `bool`. `None` writes no `required` key, which leaves the secret
-/// inheriting `[defaults] required` from its profile. `Some(v)` writes
-/// `required = v` explicitly. Collapsing this to "omitted means required"
-/// would be wrong: a profile carrying `defaults = { required = false }` makes
-/// an omitted key resolve to *optional*, so without an explicit `Some(true)`
-/// there would be no way to declare a required secret in such a profile.
+/// Add a declaration with an optional requiredness override for `secretspec add`.
 #[cfg(feature = "cli")]
 pub(crate) fn add_description(
     source: &str,
@@ -214,6 +205,34 @@ required = false
             description: Some(description.to_string()),
             required: Some(true),
             ..Secret::default()
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "cli")]
+    fn add_description_preserves_requiredness_and_round_trips() {
+        for (required, declaration) in [
+            (None, "SCRATCH = { description = \"temporary\" }\n"),
+            (
+                Some(false),
+                "SCRATCH = { description = \"temporary\", required = false }\n",
+            ),
+            (
+                Some(true),
+                "SCRATCH = { description = \"temporary\", required = true }\n",
+            ),
+        ] {
+            let updated =
+                add_description(SPEC_TEXT, "default", "SCRATCH", "temporary", required).unwrap();
+            let expected = SPEC_TEXT.replace(
+                "LAST = { description = \"last\" }\n",
+                &format!("LAST = {{ description = \"last\" }}\n{declaration}"),
+            );
+            assert_eq!(updated, expected);
+            assert_eq!(
+                remove_secret(&updated, "default", "SCRATCH", false).unwrap(),
+                SPEC_TEXT
+            );
         }
     }
 
