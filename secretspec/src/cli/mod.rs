@@ -1286,7 +1286,6 @@ pub fn main() -> Result<()> {
             optional,
             required,
         } => {
-            let required = required.then_some(true).or(optional.then_some(false));
             let app = load_secrets(&cli.file, &cli.reason, &caller)?;
             let profile = app.resolve_profile_name(profile.as_deref());
             validate_add_target(&app, &profile, &name)?;
