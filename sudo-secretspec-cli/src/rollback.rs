@@ -75,27 +75,11 @@ pub fn run(snapshot: &Path) -> Result<(), RollbackError> {
 
     let pairs = plan_restore(&snapshot)?;
     let host = platform::host();
-    // The service identity that restored files are chowned to comes from the
-    // snapshot's own config (covered by the verified manifest), not from the
-    // live config: that file is service-user-writable, so trusting it would let
-    // the service user pick the account root chowns the broker to, and a broken
-    // live config would make the recovery tool refuse to recover. The live
-    // config is only the fallback for a snapshot that carries none.
     let snapshot_config = pairs
         .iter()
         .find(|(_, dest, _)| dest.as_path() == Path::new(platform::CONFIG_PATH))
-        .map(|(prior, _, _)| prior.clone());
-    let layout = snapshot_config
-        .as_deref()
-        .and_then(|prior| crate::load_config(prior).ok())
-        .map_or_else(
-            || {
-                crate::load_config(Path::new(platform::CONFIG_PATH)).map_err(|e| {
-                    RollbackError::Denied(format!("cannot read installed service identity: {e}"))
-                })
-            },
-            Ok,
-        )?;
+        .map(|(prior, _, _)| prior.as_path());
+    let layout = restore_identity(snapshot_config, Path::new(platform::CONFIG_PATH))?;
 
     for (prior, dest, mode) in pairs.iter().rev() {
         if let Some(parent) = dest.parent() {
@@ -180,6 +164,32 @@ fn in_snapshot_namespace(snapshot: &Path, prefix: &Path) -> bool {
         .file_name()
         .is_some_and(|name| name.to_string_lossy().starts_with(SNAPSHOT_PREFIX));
     named && snapshot.parent() == Some(libexec.as_path())
+}
+
+/// The service identity restored files are chowned to.
+///
+/// It comes from the snapshot's own config entry, whose bytes `plan_restore`
+/// has already matched to the manifest, never from the live config: that file
+/// is service-user-writable, so trusting it would let the service user choose
+/// the account root chowns the broker to. A snapshot config that does not parse
+/// is an error, not a reason to fall back to the live file, because the same
+/// service user could have made the snapshot's copy unparseable first. The live
+/// config is used only for a snapshot that carries no config entry at all.
+fn restore_identity(
+    snapshot_config: Option<&Path>,
+    live_config: &Path,
+) -> Result<crate::drift::Layout, RollbackError> {
+    match snapshot_config {
+        Some(prior) => crate::load_config(prior).map_err(|e| {
+            RollbackError::Denied(format!(
+                "snapshot config is not a valid installed config, refusing to guess the \
+                 service identity: {e}"
+            ))
+        }),
+        None => crate::load_config(live_config).map_err(|e| {
+            RollbackError::Denied(format!("cannot read installed service identity: {e}"))
+        }),
+    }
 }
 
 /// [`plan_restore`] against an explicit table of owned artifacts, so the
@@ -272,6 +282,35 @@ mod tests {
             manifest.push_str(&format!("{:x}  {dest}\n", Sha256::digest(content)));
         }
         fs::write(dir.join("MANIFEST.sha256"), manifest).unwrap();
+    }
+
+    #[test]
+    fn an_unparseable_snapshot_config_does_not_fall_back_to_the_live_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let garbage = tmp.path().join("0.prior");
+        fs::write(&garbage, "not = [valid").unwrap();
+        // The live path does not exist: reaching it would produce the other
+        // message, so this proves the snapshot error is final.
+        let err = restore_identity(Some(&garbage), &tmp.path().join("live.toml"))
+            .expect_err("a snapshot config that does not parse must be refused");
+        let text = err.to_string();
+        assert!(text.contains("snapshot config"), "{text}");
+        assert!(
+            !text.contains("cannot read installed service identity"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_without_a_config_entry_reads_the_live_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = restore_identity(None, &tmp.path().join("live.toml"))
+            .expect_err("a missing live config is an error");
+        assert!(
+            err.to_string()
+                .contains("cannot read installed service identity"),
+            "{err}"
+        );
     }
 
     /// Snapshots live under the install prefix, which differs per platform: a

@@ -298,7 +298,10 @@ the deliverable needs, not the whole run: `packaging`, `linux-artifact` and
 `publish-linux` for Linux; `packaging`, `bottle` and `publish-bottle` for the
 bottle. A red job of the other platform never blocks verifying this one, a job
 the run does not report is an error, and the error names the job and the run
-URL. The CI gate still uses `gh run watch --exit-status`. `release.py` then
+URL. This removes the red-versus-green coupling only: `release.py` still waits
+for the whole run to reach a terminal state, so a macOS job stuck queued (a `runs-on`
+label that matches no runner) delays Linux verification until the watch times out.
+The CI gate still uses `gh run watch --exit-status`. `release.py` then
 downloads the Linux workflow
 artifact, verifies both attestations against this workflow at the exact tag
 and commit, requires a single checksum record naming the expected bare
