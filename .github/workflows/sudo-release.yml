@@ -406,11 +406,15 @@ jobs:
           grep -F 'libsqlite3.so.0' "$RUNNER_TEMP/dynamic.txt"
           epoch=$(git show -s --format=%ct HEAD)
           bash packaging/build-linux-artifact.sh "$binary" "${TAG#v}" "$epoch" "$RUNNER_TEMP/linux"
+      # One step per file: with both globs in one `subject-path`, the run for
+      # v0.21.1-sudo.2 attested only the tarball and left the checksum with no
+      # attestation, which release.py then refused.
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: |
-            ${{ runner.temp }}/linux/*.tar.gz
-            ${{ runner.temp }}/linux/*.sha256
+          subject-path: ${{ runner.temp }}/linux/*.tar.gz
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/linux/*.sha256
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sudo-secretspec-linux-x86_64
