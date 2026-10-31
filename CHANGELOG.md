@@ -527,6 +527,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   finished triggers, and a failed finish rolls back rather than leaving a
   partial trigger set.
 
+- Concurrent `set` calls on a sqlite vault no longer fail intermittently with
+  "database is locked". `set` read the schema before writing inside a deferred
+  transaction, so the second writer was refused at once instead of waiting out
+  the busy timeout; the transaction now takes the write lock up front.
+
 - `install --adopt-existing` no longer refuses a vault that has already
   migrated to the sqlite-only secret store. It required a legacy `.env` file
   to exist even though `.env` has been vestigial since values moved into

@@ -298,9 +298,15 @@ impl Provider for SqliteProvider {
         self.check_writable(addr)?;
         let item = super::flat_item(self, addr)?;
         let mut conn = self.connection()?;
-        let tx = conn.transaction().map_err(|error| {
-            operation_error(format!("failed to start sqlite transaction: {error}"))
-        })?;
+        // IMMEDIATE, not deferred: `set` reads the schema before it writes, and
+        // a deferred transaction that upgrades a read lock to a write lock
+        // fails at once with "database is locked" instead of waiting out
+        // `busy_timeout` when another connection holds the write lock.
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                operation_error(format!("failed to start sqlite transaction: {error}"))
+            })?;
         let text_column = stores_values_as_text(&tx).map_err(|error| {
             operation_error(format!(
                 "failed to inspect sqlite provider schema on '{}': {error}",
