@@ -293,15 +293,17 @@ repository, and `release.py` verifies provenance against the exact tag and
 commit, so a forged artifact must still come from this workflow at that ref.
 Splitting attestation into a no-cargo job is possible but is not done.
 
-After the push run reaches a terminal state, `release.py` judges only the jobs
-the deliverable needs, not the whole run: `packaging`, `linux-artifact` and
-`publish-linux` for Linux; `packaging`, `bottle` and `publish-bottle` for the
-bottle. A red job of the other platform never blocks verifying this one, a job
-the run does not report is an error, and the error names the job and the run
-URL. This removes the red-versus-green coupling only: `release.py` still waits
-for the whole run to reach a terminal state, so a macOS job stuck queued (a `runs-on`
-label that matches no runner) delays Linux verification until the watch times out.
-The CI gate still uses `gh run watch --exit-status`. `release.py` then
+After the push run starts, `release.py` polls the per-job conclusions every 30
+seconds and judges only the jobs the deliverable needs, not the whole run:
+`packaging`, `linux-artifact` and `publish-linux` for Linux; `packaging`,
+`bottle` and `publish-bottle` for the bottle. It returns as soon as those jobs
+have concluded, or as soon as one of them is not green. A red or stuck job of
+the other platform never blocks verifying this one (a macOS job stuck queued,
+from a `runs-on` label that matches no runner, does not delay Linux
+verification). A job the finished run does not report is an error, a deadline
+with the needed jobs still unconcluded is an error, and each error names the
+job and the run URL. The CI gate still uses `gh run watch --exit-status`.
+`release.py` then
 downloads the Linux workflow
 artifact, verifies both attestations against this workflow at the exact tag
 and commit, requires a single checksum record naming the expected bare

@@ -130,6 +130,8 @@ CI_RUN_LOOKUP_SECONDS = 5
 # gate's jobs cap at 60 minutes, the bottle job at 90 (sudo-release.yml).
 CI_WATCH_SECONDS = 75 * 60
 BOTTLE_WATCH_SECONDS = 110 * 60
+# How often `watch_jobs` re-reads the per-job conclusions.
+CI_JOB_POLL_SECONDS = 30
 # The macOS bottle is built by `sudo-release.yml` on the tag push (2026-10-18),
 # so `brew reinstall` pours it instead of compiling the crate graph on this Mac.
 # The workflow uploads the bottle and its JSON as this artifact on every run.
@@ -546,46 +548,45 @@ def watch_jobs(
     *,
     timeout_s: float = CI_WATCH_SECONDS,
 ) -> str:
-    """Block until the run finishes; require only the named `jobs` to be green.
+    """Poll until the named `jobs` have all concluded; require each to be green.
 
     ``sudo-release.yml`` carries independent deliverables (``bottle`` ->
     ``publish-bottle``; ``linux-artifact`` -> ``publish-linux``). `watch_run`'s
-    ``--exit-status`` fails when *any* job is red, so a bottle failure would
-    block verifying a Linux artifact that built, attested and published fine,
-    and the reverse. Here the watch only waits for the terminal state, and the
-    verdict comes from the per-job conclusions of the jobs this caller needs.
-    A name the run does not report is an error, never a pass: a renamed job
-    must not silently stop being checked.
+    ``--exit-status`` waits for the whole run and fails when *any* job is red,
+    so a bottle failure would block verifying a Linux artifact that built,
+    attested and published fine, and the reverse; and a macOS job stuck queued
+    would hold the Linux verdict hostage for the whole deadline. So this polls
+    the per-job conclusions and returns as soon as the jobs this caller needs
+    have concluded, or as soon as one of them is not green.
+    A name the run does not report is an error once the run has completed,
+    never a pass: a renamed job must not silently stop being checked.
     """
     url = f"https://github.com/{FORK_REPO}/actions/runs/{run_id}"
     log(f"CI: {url}")
-    try:
-        run(
-            ["gh", "run", "watch", str(run_id), "-R", FORK_REPO],
-            capture=False,
-            check=False,
-            timeout=timeout_s,
+    deadline = time.monotonic() + timeout_s
+    while True:
+        view = json.loads(
+            output(
+                ["gh", "run", "view", str(run_id), "-R", FORK_REPO]
+                + ["--json", "status,jobs"]
+            )
+            or "{}"
         )
-    except subprocess.TimeoutExpired:
-        raise ReleaseError(
-            f"{failure}: no verdict after {timeout_s / 60:.0f} minutes, so the "
-            "run is queued or stuck rather than red (a runs-on label that "
-            f"matches no runner looks exactly like this): {url}"
-        ) from None
-    view = json.loads(
-        output(
-            ["gh", "run", "view", str(run_id), "-R", FORK_REPO]
-            + ["--json", "status,jobs"]
-        )
-        or "{}"
-    )
-    _require(
-        view.get("status") == "completed",
-        f"{failure}: the run has not finished (status {view.get('status')!r}): {url}",
-    )
-    conclusions: dict[str, str | None] = {}
-    for job in view.get("jobs") or []:
-        conclusions[job.get("name")] = job.get("conclusion")
+        conclusions: dict[str, str | None] = {}
+        for job in view.get("jobs") or []:
+            conclusions[job.get("name")] = job.get("conclusion")
+        completed = view.get("status") == "completed"
+        settled = all(conclusions.get(name) for name in jobs)
+        red = any(conclusions.get(name) not in (None, "", "success") for name in jobs)
+        if completed or settled or red:
+            break
+        if time.monotonic() >= deadline:
+            raise ReleaseError(
+                f"{failure}: no verdict after {timeout_s / 60:.0f} minutes, so "
+                "the jobs are queued or stuck rather than red (a runs-on label "
+                f"that matches no runner looks exactly like this): {url}"
+            )
+        time.sleep(CI_JOB_POLL_SECONDS)
     for name in jobs:
         _require(name in conclusions, f"{failure}: job {name!r} not in the run: {url}")
         _require(

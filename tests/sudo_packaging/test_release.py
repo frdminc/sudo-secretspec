@@ -1440,46 +1440,97 @@ def test_watch_run_gives_up_on_a_run_that_never_finishes(monkeypatch, release):
     assert seen["timeout"] == release.CI_WATCH_SECONDS
 
 
-def fake_jobs_run(monkeypatch, release, view, *, watch_timeout=False):
+def fake_jobs_run(monkeypatch, release, *views):
+    """Script `gh run view` (one reply per poll, the last one repeating).
+
+    Returns the argv list and the sleeps the poll loop asked for; the clock is
+    advanced by each sleep so deadlines are exercised without waiting.
+    """
     seen = []
+    sleeps = []
+    clock = [0.0]
+    replies = list(views)
 
     def fake_run(argv, **kwargs):
-        seen.append((argv, kwargs))
-        if argv[:3] == ["gh", "run", "watch"]:
-            if watch_timeout:
-                raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
-            return completed(argv)
+        seen.append(argv)
         assert argv[:3] == ["gh", "run", "view"]
-        return completed(argv, view)
+        return completed(argv, replies.pop(0) if len(replies) > 1 else replies[0])
+
+    def fake_sleep(seconds):
+        sleeps.append(seconds)
+        clock[0] += seconds
 
     monkeypatch.setattr(release, "run", fake_run)
-    return seen
+    monkeypatch.setattr(
+        release,
+        "time",
+        types.SimpleNamespace(sleep=fake_sleep, monotonic=lambda: clock[0]),
+    )
+    return seen, sleeps
 
 
-def test_watch_jobs_waits_without_exit_status_and_ignores_other_jobs(
-    monkeypatch, release
-):
-    seen = fake_jobs_run(
+def test_watch_jobs_polls_per_job_and_ignores_other_jobs(monkeypatch, release):
+    seen, sleeps = fake_jobs_run(
         monkeypatch,
         release,
         run_view_json({"bottle": "failure", "publish-bottle": "skipped"}),
     )
     url = release.watch_jobs(5, release.LINUX_JOBS, "Linux did not pass")
     assert url == f"https://github.com/{release.FORK_REPO}/actions/runs/5"
-    watch, kwargs = seen[0]
-    assert watch[:4] == ["gh", "run", "watch", "5"]
-    assert "--exit-status" not in watch
-    assert kwargs["timeout"] == release.CI_WATCH_SECONDS
-    assert seen[1][0] == [
-        "gh",
-        "run",
-        "view",
-        "5",
-        "-R",
-        release.FORK_REPO,
-        "--json",
-        "status,jobs",
+    assert seen == [
+        [
+            "gh",
+            "run",
+            "view",
+            "5",
+            "-R",
+            release.FORK_REPO,
+            "--json",
+            "status,jobs",
+        ]
     ]
+    assert sleeps == []
+
+
+def test_watch_jobs_does_not_wait_for_a_queued_job_it_does_not_need(
+    monkeypatch, release
+):
+    # The point of polling per job: a macOS job stuck queued (conclusion null,
+    # run still in progress) must not hold the Linux verdict.
+    seen, sleeps = fake_jobs_run(
+        monkeypatch,
+        release,
+        run_view_json({"bottle": None, "publish-bottle": None}, status="in_progress"),
+    )
+    release.watch_jobs(5, release.LINUX_JOBS, "Linux did not pass")
+    assert len(seen) == 1
+    assert sleeps == []
+
+
+def test_watch_jobs_keeps_polling_until_its_own_jobs_conclude(monkeypatch, release):
+    seen, sleeps = fake_jobs_run(
+        monkeypatch,
+        release,
+        run_view_json({"publish-linux": None}, status="in_progress"),
+        run_view_json({"publish-linux": None}, status="in_progress"),
+        run_view_json({"bottle": None}, status="in_progress"),
+    )
+    release.watch_jobs(5, release.LINUX_JOBS, "Linux did not pass")
+    assert len(seen) == 3
+    assert sleeps == [release.CI_JOB_POLL_SECONDS] * 2
+
+
+def test_watch_jobs_stops_at_the_first_red_job_it_needs(monkeypatch, release):
+    seen, _ = fake_jobs_run(
+        monkeypatch,
+        release,
+        run_view_json(
+            {"linux-artifact": "failure", "publish-linux": None}, status="in_progress"
+        ),
+    )
+    with pytest.raises(release.ReleaseError, match="'linux-artifact' concluded"):
+        release.watch_jobs(5, release.LINUX_JOBS, "no good")
+    assert len(seen) == 1
 
 
 def test_watch_jobs_names_every_job_a_deliverable_needs(release):
@@ -1506,23 +1557,35 @@ def test_watch_jobs_treats_a_skipped_job_as_not_green(monkeypatch, release):
         release.watch_jobs(5, release.LINUX_JOBS, "no good")
 
 
-def test_watch_jobs_refuses_a_job_the_run_does_not_report(monkeypatch, release):
+def test_watch_jobs_refuses_a_job_a_finished_run_does_not_report(monkeypatch, release):
     fake_jobs_run(monkeypatch, release, run_view_json(omit=("publish-linux",)))
     with pytest.raises(release.ReleaseError, match="'publish-linux' not in the run"):
         release.watch_jobs(5, release.LINUX_JOBS, "no good")
 
 
-def test_watch_jobs_refuses_a_run_that_has_not_finished(monkeypatch, release):
-    fake_jobs_run(monkeypatch, release, run_view_json(status="in_progress"))
-    with pytest.raises(release.ReleaseError, match="has not finished"):
-        release.watch_jobs(5, release.LINUX_JOBS, "no good")
+def test_watch_jobs_waits_for_a_job_an_unfinished_run_has_not_listed_yet(
+    monkeypatch, release
+):
+    _, sleeps = fake_jobs_run(
+        monkeypatch,
+        release,
+        run_view_json(omit=("publish-linux",), status="in_progress"),
+        run_view_json(),
+    )
+    release.watch_jobs(5, release.LINUX_JOBS, "no good")
+    assert sleeps == [release.CI_JOB_POLL_SECONDS]
 
 
-def test_watch_jobs_gives_up_on_a_run_that_never_finishes(monkeypatch, release):
-    seen = fake_jobs_run(monkeypatch, release, "{}", watch_timeout=True)
+def test_watch_jobs_gives_up_on_jobs_that_never_conclude(monkeypatch, release):
+    seen, sleeps = fake_jobs_run(
+        monkeypatch,
+        release,
+        run_view_json({"packaging": None}, status="queued"),
+    )
     with pytest.raises(release.ReleaseError, match="queued or stuck"):
-        release.watch_jobs(5, release.LINUX_JOBS, "no good")
-    assert len(seen) == 1
+        release.watch_jobs(5, release.LINUX_JOBS, "no good", timeout_s=100)
+    assert sum(sleeps) >= 100
+    assert len(seen) == len(sleeps) + 1
 
 
 def test_the_bottle_watch_waits_longer_and_names_its_deadline(monkeypatch, release):
@@ -1744,9 +1807,9 @@ def test_fetch_bottle_finds_the_tag_run_by_head_sha_and_downloads_its_json(
         "--event",
         "push",
     ]
-    watch = next(argv for argv in calls if argv[:3] == ["gh", "run", "watch"])
-    assert watch[3] == "8"
-    assert "--exit-status" not in watch
+    assert not any(argv[:3] == ["gh", "run", "watch"] for argv in calls)
+    view = next(argv for argv in calls if argv[:3] == ["gh", "run", "view"])
+    assert view[3] == "8"
     download = next(argv for argv in calls if argv[:3] == ["gh", "run", "download"])
     assert download[:4] == ["gh", "run", "download", "8"]
     assert download[download.index("-n") + 1] == "sudo-secretspec-bottle"
@@ -3467,8 +3530,7 @@ def test_linux_fetch_ignores_a_red_bottle_job(monkeypatch, release, cut, tmp_pat
         view=run_view_json({"bottle": "failure", "publish-bottle": "skipped"}),
     )
     assert release.fetch_linux(cut, tmp_path, dry_run=False) == [tarball, checksum]
-    watch = next(argv for argv in calls if argv[:3] == ["gh", "run", "watch"])
-    assert "--exit-status" not in watch
+    assert not any(argv[:3] == ["gh", "run", "watch"] for argv in calls)
 
 
 @pytest.mark.parametrize("job", ["linux-artifact", "publish-linux", "packaging"])
@@ -3604,3 +3666,68 @@ def test_linux_artifact_script_builds_media_for_the_current_upstream_base(tmp_pa
     assert (out / f"{tarball.name}.sha256").is_file()
     for bad in (f"{base}-sudo.0", f"{base}-sudo.01", f"{base}", "0.21.1-djbclark.1"):
         assert build(bad).returncode != 0, bad
+
+
+def push_tag_blocks(text):
+    """The `tags:` blocks under a workflow's `push:` trigger, as raw text.
+
+    PyYAML is not installed in the `packaging` job (it installs pytest and ruff
+    only), so this reads indentation instead of parsing. It only has to find
+    `push:` -> `tags:` and the lines nested under it.
+    """
+    lines = text.splitlines()
+    blocks = []
+
+    def indent(line):
+        return len(line) - len(line.lstrip())
+
+    for i, line in enumerate(lines):
+        if line.strip() != "push:":
+            continue
+        push_indent = indent(line)
+        j = i + 1
+        while j < len(lines) and (
+            not lines[j].strip() or indent(lines[j]) > push_indent
+        ):
+            if lines[j].strip().startswith("tags:"):
+                tags_indent = indent(lines[j])
+                block = [lines[j]]
+                j += 1
+                while j < len(lines) and (
+                    not lines[j].strip() or indent(lines[j]) > tags_indent
+                ):
+                    block.append(lines[j])
+                    j += 1
+                blocks.append("\n".join(block))
+                continue
+            j += 1
+    return blocks
+
+
+def test_every_other_workflow_with_a_tag_trigger_excludes_sudo_tags():
+    # A `v*-sudo.N` tag matches `v**`. Review 2 (2026-10-30) found upstream's
+    # jvm-package.yml (publishes to Maven) and elixir-package.yml would have
+    # fired on this fork's tags; only sudo-release.yml may run on them.
+    workflows = sorted((ROOT / ".github" / "workflows").glob("*.yml"))
+    tagged = {}
+    for path in workflows:
+        if path.name == "sudo-release.yml":
+            continue
+        blocks = push_tag_blocks(path.read_text(encoding="utf-8"))
+        if blocks:
+            tagged[path.name] = blocks
+    assert tagged, "found no tag-triggered workflow; the parser is broken"
+    missing = [
+        name
+        for name, blocks in tagged.items()
+        if not all(re.search(r"""['"]!v\*-sudo\.\*['"]""", block) for block in blocks)
+    ]
+    assert not missing, f"tag trigger without '!v*-sudo.*': {missing}"
+
+
+def test_the_sudo_tag_exclusion_check_sees_a_workflow_that_lacks_it():
+    bad = "on:\n  push:\n    tags:\n      - v**\njobs: {}\n"
+    good = 'on:\n  push:\n    tags: ["v**", "!v*-sudo.*"]\n    branches: [main]\n'
+    assert push_tag_blocks(bad) == ["    tags:\n      - v**"]
+    assert "!v*-sudo.*" in push_tag_blocks(good)[0]
+    assert push_tag_blocks("on:\n  push:\n    branches: [main]\n") == []
