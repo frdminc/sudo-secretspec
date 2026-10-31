@@ -3709,9 +3709,15 @@ def test_every_other_workflow_with_a_tag_trigger_excludes_sudo_tags():
     # jvm-package.yml (publishes to Maven) and elixir-package.yml would have
     # fired on this fork's tags; only sudo-release.yml may run on them.
     workflows = sorted((ROOT / ".github" / "workflows").glob("*.yml"))
+    own = {"sudo-release.yml", "linux-ci.yml", "agent-ci.yml"}
+    if all(path.name in own for path in workflows):
+        # `scripts/github-ci-run` deletes every other workflow from a
+        # `ci/run/*` overlay when PyYAML is absent (it is under `bg`), so there
+        # is nothing to check there; a push to `sudo-main` runs the real tree.
+        pytest.skip("workflows were stripped by the CI overlay")
     tagged = {}
     for path in workflows:
-        if path.name == "sudo-release.yml":
+        if path.name in own:
             continue
         blocks = push_tag_blocks(path.read_text(encoding="utf-8"))
         if blocks:
