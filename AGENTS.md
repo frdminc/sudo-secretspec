@@ -354,8 +354,14 @@ sufficient.
 Linux CI runs on free GitHub runners, not Forgejo: `scripts/github-ci-run --no-wait origin/sudo-main` overlays the
 `ci/base` branch (workflow + wrapper + `docs/ci-github.md`) onto the commit and pushes `ci/run/<slug>`.
 Needs `origin/ci/base` fetched. `.forgejo/` is the retired Hyades flow; `load-watch ci` knows this repo.
-The run has a macOS job too (the companion crate, `tests/sudo_packaging`, the formula), and
+The run has more jobs than Linux: `macos` (the companion crate, `tests/sudo_packaging`, the formula), `debian`
+(the companion on `debian:12`: tests, clippy, release build, `scripts/debian-smoke.sh` as root, and the Linux release
+media built the way the tag job builds it) and `nix` (flake check and the NixOS VM test).
 `packaging/release.py` gates a release on that run for HEAD (`--local-tests` to run it here).
+
+Linux artifact (2026-10-30): `sudo-release.yml`'s `linux-artifact` job (read-only token, `debian:12`) builds
+`sudo-secretspec-<version>-x86_64-unknown-linux-gnu.tar.gz` on every release tag; `publish-linux` (write token, no cargo)
+attaches it, and `release.py` verifies it. Not yet run on a real tag as of 2026-10-30.
 
 macOS bottle (2026-10-18): `sudo-release.yml`'s `bottle` job (read-only token) builds the Homebrew bottle on a GitHub
 macOS runner on every release tag and uploads an artifact; `publish-bottle` (write token, no cargo) attaches it to the

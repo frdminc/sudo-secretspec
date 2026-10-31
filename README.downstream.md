@@ -2,7 +2,8 @@
 
 Downstream fork of [cachix/secretspec](https://github.com/cachix/secretspec)
 with an optional privilege-separated companion for autonomous local AI/operator
-use on macOS.
+use on macOS and Linux (Debian and other non-NixOS systems through the
+imperative installer, NixOS through the `services.sudo-secretspec` module).
 
 ## Upstream SecretSpec
 

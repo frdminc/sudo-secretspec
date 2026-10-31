@@ -4,8 +4,8 @@ description: Use managed credentials through the privilege-separated sudo-secret
 version: 0.8.1
 author: Dan Clark (djbclark), Hermes Agent
 license: Apache-2.0
-platforms: macos
-tags: secrets, privilege-separation, audit, macos
+platforms: macos, linux
+tags: secrets, privilege-separation, audit, macos, linux
 ---
 
 # sudo-secretspec Skill
@@ -14,6 +14,13 @@ Use the installed privilege-separated client for autonomous credential CRUD and
 consumer execution. Do not access SecretSpec's provider, manifest, or protected
 backing files directly, and never invoke `secretspec` itself for a managed
 deployment.
+
+Platforms: macOS and Linux. The client commands are the same on both; only the
+install layout differs (Linux client `/usr/bin/sudo-secretspec`, broker
+`/usr/libexec/sudo-secretspec`; NixOS declares the boundary with
+`services.sudo-secretspec` and refuses `install`/`uninstall`/`rollback`/
+`doctor`). Where this file says Touch ID or macOS paths, read "the operator's
+sudo password" and the Linux paths on a Linux host.
 
 Verified against client **0.19.1-sudo.15**. `sudo-secretspec --version` is the
 authority; if it reports something newer, re-read
