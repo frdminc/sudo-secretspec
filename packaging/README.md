@@ -285,7 +285,21 @@ being overwritten. Dispatches validate the same tag grammar as the bottle,
 check out that tag's sources, and only upload workflow artifacts. Neither
 platform's publish job depends on the other platform's build.
 
-After the push run completes, `release.py` downloads the Linux workflow
+Known and accepted (adversary review 2, 2026-10-30): like the bottle job,
+`linux-artifact` holds `id-token: write` and `attestations: write` while it
+compiles the crate graph, so a hostile build script could request an
+attestation for the artifact it builds. Neither permission writes to the
+repository, and `release.py` verifies provenance against the exact tag and
+commit, so a forged artifact must still come from this workflow at that ref.
+Splitting attestation into a no-cargo job is possible but is not done.
+
+After the push run reaches a terminal state, `release.py` judges only the jobs
+the deliverable needs, not the whole run: `packaging`, `linux-artifact` and
+`publish-linux` for Linux; `packaging`, `bottle` and `publish-bottle` for the
+bottle. A red job of the other platform never blocks verifying this one, a job
+the run does not report is an error, and the error names the job and the run
+URL. The CI gate still uses `gh run watch --exit-status`. `release.py` then
+downloads the Linux workflow
 artifact, verifies both attestations against this workflow at the exact tag
 and commit, requires a single checksum record naming the expected bare
 filename, compares its hash, and rejects unexpected members, traversal,

@@ -136,6 +136,11 @@ BOTTLE_WATCH_SECONDS = 110 * 60
 BOTTLE_WORKFLOW = "sudo-release.yml"
 BOTTLE_ARTIFACT = "sudo-secretspec-bottle"
 LINUX_ARTIFACT = "sudo-secretspec-linux-x86_64"
+# Job ids in `sudo-release.yml` (none sets `name:`, so `gh` reports the ids).
+# Each deliverable needs its own build, its publish job and the `packaging`
+# job both depend on, and nothing from the other deliverable.
+BOTTLE_JOBS = ("packaging", "bottle", "publish-bottle")
+LINUX_JOBS = ("packaging", "linux-artifact", "publish-linux")
 LINUX_TARGET = "x86_64-unknown-linux-gnu"
 LINUX_MEDIA_FILES = {
     "libexec/sudo-secretspec",
@@ -531,6 +536,62 @@ def watch_run(run_id: int, failure: str, *, timeout_s: float = CI_WATCH_SECONDS)
             f"matches no runner looks exactly like this): {url}"
         ) from None
     _require(watched.returncode == 0, f"{failure}: {url}")
+    return url
+
+
+def watch_jobs(
+    run_id: int,
+    jobs: tuple[str, ...],
+    failure: str,
+    *,
+    timeout_s: float = CI_WATCH_SECONDS,
+) -> str:
+    """Block until the run finishes; require only the named `jobs` to be green.
+
+    ``sudo-release.yml`` carries independent deliverables (``bottle`` ->
+    ``publish-bottle``; ``linux-artifact`` -> ``publish-linux``). `watch_run`'s
+    ``--exit-status`` fails when *any* job is red, so a bottle failure would
+    block verifying a Linux artifact that built, attested and published fine,
+    and the reverse. Here the watch only waits for the terminal state, and the
+    verdict comes from the per-job conclusions of the jobs this caller needs.
+    A name the run does not report is an error, never a pass: a renamed job
+    must not silently stop being checked.
+    """
+    url = f"https://github.com/{FORK_REPO}/actions/runs/{run_id}"
+    log(f"CI: {url}")
+    try:
+        run(
+            ["gh", "run", "watch", str(run_id), "-R", FORK_REPO],
+            capture=False,
+            check=False,
+            timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired:
+        raise ReleaseError(
+            f"{failure}: no verdict after {timeout_s / 60:.0f} minutes, so the "
+            "run is queued or stuck rather than red (a runs-on label that "
+            f"matches no runner looks exactly like this): {url}"
+        ) from None
+    view = json.loads(
+        output(
+            ["gh", "run", "view", str(run_id), "-R", FORK_REPO]
+            + ["--json", "status,jobs"]
+        )
+        or "{}"
+    )
+    _require(
+        view.get("status") == "completed",
+        f"{failure}: the run has not finished (status {view.get('status')!r}): {url}",
+    )
+    conclusions: dict[str, str | None] = {}
+    for job in view.get("jobs") or []:
+        conclusions[job.get("name")] = job.get("conclusion")
+    for name in jobs:
+        _require(name in conclusions, f"{failure}: job {name!r} not in the run: {url}")
+        _require(
+            conclusions[name] == "success",
+            f"{failure}: job {name!r} concluded {conclusions[name]!r}: {url}",
+        )
     return url
 
 
@@ -1337,8 +1398,11 @@ def fetch_linux(release: Release, dest: Path, *, dry_run: bool) -> list[Path]:
         return []
     sha = output(["git", "rev-parse", f"{release.tag}^{{commit}}"])
     run_id = find_run(release.tag, sha, workflow=BOTTLE_WORKFLOW)
-    watch_run(
-        run_id, "the Linux release run did not pass", timeout_s=BOTTLE_WATCH_SECONDS
+    watch_jobs(
+        run_id,
+        LINUX_JOBS,
+        "the Linux release run did not pass",
+        timeout_s=BOTTLE_WATCH_SECONDS,
     )
     run(
         ["gh", "run", "download", str(run_id), "-R", FORK_REPO]
@@ -1422,8 +1486,9 @@ def fetch_bottle(release: Release, dest: Path, *, dry_run: bool) -> list[Path]:
     sha = output(["git", "rev-parse", f"{release.tag}^{{commit}}"])
     try:
         run_id = find_run(release.tag, sha, workflow=BOTTLE_WORKFLOW)
-        watch_run(
+        watch_jobs(
             run_id,
+            BOTTLE_JOBS,
             "the bottle run did not pass",
             timeout_s=BOTTLE_WATCH_SECONDS,
         )

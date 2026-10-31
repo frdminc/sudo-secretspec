@@ -1440,6 +1440,91 @@ def test_watch_run_gives_up_on_a_run_that_never_finishes(monkeypatch, release):
     assert seen["timeout"] == release.CI_WATCH_SECONDS
 
 
+def fake_jobs_run(monkeypatch, release, view, *, watch_timeout=False):
+    seen = []
+
+    def fake_run(argv, **kwargs):
+        seen.append((argv, kwargs))
+        if argv[:3] == ["gh", "run", "watch"]:
+            if watch_timeout:
+                raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
+            return completed(argv)
+        assert argv[:3] == ["gh", "run", "view"]
+        return completed(argv, view)
+
+    monkeypatch.setattr(release, "run", fake_run)
+    return seen
+
+
+def test_watch_jobs_waits_without_exit_status_and_ignores_other_jobs(
+    monkeypatch, release
+):
+    seen = fake_jobs_run(
+        monkeypatch,
+        release,
+        run_view_json({"bottle": "failure", "publish-bottle": "skipped"}),
+    )
+    url = release.watch_jobs(5, release.LINUX_JOBS, "Linux did not pass")
+    assert url == f"https://github.com/{release.FORK_REPO}/actions/runs/5"
+    watch, kwargs = seen[0]
+    assert watch[:4] == ["gh", "run", "watch", "5"]
+    assert "--exit-status" not in watch
+    assert kwargs["timeout"] == release.CI_WATCH_SECONDS
+    assert seen[1][0] == [
+        "gh",
+        "run",
+        "view",
+        "5",
+        "-R",
+        release.FORK_REPO,
+        "--json",
+        "status,jobs",
+    ]
+
+
+def test_watch_jobs_names_every_job_a_deliverable_needs(release):
+    assert release.LINUX_JOBS == ("packaging", "linux-artifact", "publish-linux")
+    assert release.BOTTLE_JOBS == ("packaging", "bottle", "publish-bottle")
+
+
+def test_watch_jobs_names_the_red_job_and_the_run(monkeypatch, release):
+    fake_jobs_run(
+        monkeypatch,
+        release,
+        run_view_json({"bottle": "failure", "linux-artifact": "cancelled"}),
+    )
+    with pytest.raises(release.ReleaseError) as raised:
+        release.watch_jobs(5, ("packaging", "linux-artifact", "bottle"), "no good")
+    message = str(raised.value)
+    assert "'linux-artifact' concluded 'cancelled'" in message
+    assert f"https://github.com/{release.FORK_REPO}/actions/runs/5" in message
+
+
+def test_watch_jobs_treats_a_skipped_job_as_not_green(monkeypatch, release):
+    fake_jobs_run(monkeypatch, release, run_view_json({"publish-linux": "skipped"}))
+    with pytest.raises(release.ReleaseError, match="'publish-linux' concluded"):
+        release.watch_jobs(5, release.LINUX_JOBS, "no good")
+
+
+def test_watch_jobs_refuses_a_job_the_run_does_not_report(monkeypatch, release):
+    fake_jobs_run(monkeypatch, release, run_view_json(omit=("publish-linux",)))
+    with pytest.raises(release.ReleaseError, match="'publish-linux' not in the run"):
+        release.watch_jobs(5, release.LINUX_JOBS, "no good")
+
+
+def test_watch_jobs_refuses_a_run_that_has_not_finished(monkeypatch, release):
+    fake_jobs_run(monkeypatch, release, run_view_json(status="in_progress"))
+    with pytest.raises(release.ReleaseError, match="has not finished"):
+        release.watch_jobs(5, release.LINUX_JOBS, "no good")
+
+
+def test_watch_jobs_gives_up_on_a_run_that_never_finishes(monkeypatch, release):
+    seen = fake_jobs_run(monkeypatch, release, "{}", watch_timeout=True)
+    with pytest.raises(release.ReleaseError, match="queued or stuck"):
+        release.watch_jobs(5, release.LINUX_JOBS, "no good")
+    assert len(seen) == 1
+
+
 def test_the_bottle_watch_waits_longer_and_names_its_deadline(monkeypatch, release):
     # The bottle job's own cap is 90 minutes against the gate jobs' 60, so its
     # watch has to outlast the gate's or a legitimate build would be cut off.
@@ -1547,13 +1632,37 @@ def bottle_json(release, cut, *, root_url=None, sha=BOTTLE_SHA, **overrides):
     return {name: entry}
 
 
+ALL_RELEASE_JOBS = (
+    "packaging",
+    "bottle",
+    "publish-bottle",
+    "linux-artifact",
+    "publish-linux",
+)
+
+
+def run_view_json(conclusions=None, *, status="completed", omit=()):
+    """What `gh run view --json status,jobs` reports for sudo-release.yml."""
+    conclusions = conclusions or {}
+    return json.dumps(
+        {
+            "status": status,
+            "jobs": [
+                {"name": name, "conclusion": conclusions.get(name, "success")}
+                for name in ALL_RELEASE_JOBS
+                if name not in omit
+            ],
+        }
+    )
+
+
 def fake_bottle_run(
     monkeypatch,
     release,
     cut,
     *,
     runs,
-    watch_rc=0,
+    view=None,
     doc=None,
     tarball=BOTTLE_BYTES,
     source=SOURCE_SHA,
@@ -1572,7 +1681,9 @@ def fake_bottle_run(
         if argv[:3] == ["gh", "run", "list"]:
             return completed(argv, json.dumps(runs))
         if argv[:3] == ["gh", "run", "watch"]:
-            return completed(argv, returncode=watch_rc)
+            return completed(argv)
+        if argv[:3] == ["gh", "run", "view"]:
+            return completed(argv, view or run_view_json())
         if argv[:3] == ["gh", "run", "download"]:
             dest = Path(argv[argv.index("-D") + 1])
             document = doc or bottle_json(release, cut)
@@ -1635,7 +1746,7 @@ def test_fetch_bottle_finds_the_tag_run_by_head_sha_and_downloads_its_json(
     ]
     watch = next(argv for argv in calls if argv[:3] == ["gh", "run", "watch"])
     assert watch[3] == "8"
-    assert "--exit-status" in watch
+    assert "--exit-status" not in watch
     download = next(argv for argv in calls if argv[:3] == ["gh", "run", "download"])
     assert download[:4] == ["gh", "run", "download", "8"]
     assert download[download.index("-n") + 1] == "sudo-secretspec-bottle"
@@ -1768,11 +1879,25 @@ def test_fetch_bottle_names_the_fallback_when_the_run_is_red(
         release,
         cut,
         runs=[{"databaseId": 8, "headSha": TAG_SHA}],
-        watch_rc=1,
+        view=run_view_json({"bottle": "failure"}),
     )
     with pytest.raises(release.ReleaseError, match="--build-from-source") as raised:
         release.fetch_bottle(cut, tmp_path, dry_run=False)
     assert "actions/runs/8" in str(raised.value)
+    assert "'bottle' concluded 'failure'" in str(raised.value)
+
+
+def test_fetch_bottle_ignores_a_red_linux_job(monkeypatch, release, cut, tmp_path):
+    # The two deliverables are independent: a Linux artifact failure must not
+    # stop a bottle that built, attested and published from being verified.
+    fake_bottle_run(
+        monkeypatch,
+        release,
+        cut,
+        runs=[{"databaseId": 8, "headSha": TAG_SHA}],
+        view=run_view_json({"linux-artifact": "failure", "publish-linux": "skipped"}),
+    )
+    assert release.fetch_bottle(cut, tmp_path, dry_run=False)
 
 
 def test_fetch_bottle_names_the_fallback_when_no_run_appears(
@@ -3268,6 +3393,7 @@ def fake_linux_run(
     published=None,
     corrupt_published=False,
     fail_attestation=False,
+    view=None,
 ):
     tarball, checksum = linux_media(release, cut, dest)
     names = [tarball.name, checksum.name]
@@ -3277,6 +3403,8 @@ def fake_linux_run(
     def output(argv, **kwargs):
         if argv[:2] == ["git", "rev-parse"]:
             return "a" * 40
+        if argv[:3] == ["gh", "run", "view"]:
+            return view or run_view_json()
         assert argv[:3] == ["gh", "release", "view"]
         return json.dumps(
             {
@@ -3305,7 +3433,6 @@ def fake_linux_run(
     monkeypatch.setattr(release, "output", output)
     monkeypatch.setattr(release, "run", run)
     monkeypatch.setattr(release, "find_run", lambda *a, **k: 123)
-    monkeypatch.setattr(release, "watch_run", lambda *a, **k: None)
     monkeypatch.setattr(release, "verify_attestation", attest)
     return tarball, checksum, attestations, calls
 
@@ -3327,6 +3454,31 @@ def test_linux_fetch_verifies_hash_provenance_layout_and_published_bytes(
         checksum.name,
     ]
     assert all(release.FORK_REPO in a for a in calls)
+
+
+def test_linux_fetch_ignores_a_red_bottle_job(monkeypatch, release, cut, tmp_path):
+    # Independent deliverables: the bottle failing must not block verifying a
+    # Linux artifact that built, attested and published.
+    tarball, checksum, _, calls = fake_linux_run(
+        monkeypatch,
+        release,
+        cut,
+        tmp_path,
+        view=run_view_json({"bottle": "failure", "publish-bottle": "skipped"}),
+    )
+    assert release.fetch_linux(cut, tmp_path, dry_run=False) == [tarball, checksum]
+    watch = next(argv for argv in calls if argv[:3] == ["gh", "run", "watch"])
+    assert "--exit-status" not in watch
+
+
+@pytest.mark.parametrize("job", ["linux-artifact", "publish-linux", "packaging"])
+def test_linux_fetch_names_the_red_linux_job(monkeypatch, release, cut, tmp_path, job):
+    fake_linux_run(
+        monkeypatch, release, cut, tmp_path, view=run_view_json({job: "failure"})
+    )
+    with pytest.raises(release.ReleaseError, match=f"'{job}' concluded") as raised:
+        release.fetch_linux(cut, tmp_path, dry_run=False)
+    assert "actions/runs/123" in str(raised.value)
 
 
 @pytest.mark.parametrize(
