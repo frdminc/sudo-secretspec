@@ -361,7 +361,15 @@ media built the way the tag job builds it) and `nix` (flake check and the NixOS 
 
 Linux artifact (2026-10-30): `sudo-release.yml`'s `linux-artifact` job (read-only token, `debian:12`) builds
 `sudo-secretspec-<version>-x86_64-unknown-linux-gnu.tar.gz` on every release tag; `publish-linux` (write token, no cargo)
-attaches it, and `release.py` verifies it. Not yet run on a real tag as of 2026-10-30.
+attaches it, and `release.py` verifies it. First real tag `v0.21.1-sudo.3` (2026-10-31). `.1` and `.2` are orphan tags
+whose Linux job failed (git "dubious ownership" in the `debian:12` container; then one multi-glob `attest` step that
+attested only the tarball, not the `.sha256`): each attested file needs its own `attest-build-provenance` step, and
+a `workflow_dispatch` with `-f tag=<existing tag>` proves the build and attestations without publishing. Once a tag is
+pushed, a fix needs a NEW serial; `release.py` refuses the published one.
+
+`scripts/github-ci-run` deletes every workflow but the CI one from an overlay when PyYAML is missing (it is, under
+`bg`), so a release-gate overlay and a hand-run overlay can differ; a test reading `.github/workflows/` must skip
+when they are gone. `just release` refuses under 25 GiB free (`~/.cargo/target-shared` is the usual regenerable win).
 
 macOS bottle (2026-10-18): `sudo-release.yml`'s `bottle` job (read-only token) builds the Homebrew bottle on a GitHub
 macOS runner on every release tag and uploads an artifact; `publish-bottle` (write token, no cargo) attaches it to the
