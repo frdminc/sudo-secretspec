@@ -69,7 +69,16 @@ fi
 mkdir -p "$GIT_WORK_TREE/.github/workflows"
 (
   cd "$GIT_WORK_TREE"
-  python3 - <<'PYN'
+  # PyYAML decides which workflows would fire on a ci/run push; without it every
+  # non-CI workflow is deleted. Borrow it through uv when the interpreter lacks it.
+  if python3 -c 'import yaml' 2>/dev/null; then
+    py=(python3)
+  elif command -v uv >/dev/null 2>&1; then
+    py=(uv run --quiet --no-project --with pyyaml python3)
+  else
+    py=(python3)
+  fi
+  "${py[@]}" - <<'PYN'
 import pathlib, sys
 try:
     import yaml
