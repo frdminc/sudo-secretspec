@@ -1718,10 +1718,9 @@ fn run_for_host(host: platform::Host, req: InstallRequest) -> Result<(), Install
         // Bytes only; no values are opened. Install runs as root, so the 0600
         // service-owned manifest is readable.
         if let (Ok(adopted), Ok(shipped)) = (fs::read(&manifest_path), fs::read(&declarations_dst))
+            && let Some(warning) = adopted_manifest_drift_warning(&adopted, &shipped)
         {
-            if let Some(warning) = adopted_manifest_drift_warning(&adopted, &shipped) {
-                eprintln!("{warning}");
-            }
+            eprintln!("{warning}");
         }
     }
 
