@@ -21,6 +21,7 @@ This repository is a fork. In addition to upstream SecretSpec:
 
 - Companion crate: `sudo-secretspec-cli` (binary `sudo-secretspec`)
 - Downstream docs: `sudo-secretspec/README.md`, `README.downstream.md`
+- The root `README.md` states the upstream base (version, commit, links to upstream's README at that commit and at `main`). On every upstream merge or rebase, update its "Upstream base" table in the same change
 - AI automation contract: `sudo-secretspec/AI-GUIDANCE.md`
 - Fork-only agent notes/tricks: `FORK-AI.md` (do not upstream)
 - All downstream work goes on `sudo-main`. Commit and push directly to it — no
@@ -108,7 +109,7 @@ When adding a new provider, update **every** location below — provider names a
 4. `docs/src/content/docs/reference/providers.mdx` - Add a provider section **and** a row in the "Security Considerations" table
 5. `docs/src/pages/index.astro` - Add to the `providerMetadata` array (top of file) **and** to the `secretspec config init` mini-terminal in the hero
 6. `docs/src/content/docs/quick-start.mdx` - Update the `secretspec config init` example output to include the new provider
-7. `README.md` (symlink to `secretspec/README.md`) - Add to the "Providers" bullet list **and** to the `secretspec config init` example output
+7. `secretspec/README.md` - Add to the "Providers" bullet list **and** to the `secretspec config init` example output. It is upstream's product README; the root `README.md` is the downstream sudo-secretspec README and lists no providers
 
 Provider credential names, environment fallbacks, and minimum versions are
 maintained in `docs/src/data/provider-credentials.json`. For a provider with a
