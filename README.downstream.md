@@ -13,7 +13,7 @@ providers, and quick start.
 ## Downstream companion: `sudo-secretspec`
 
 This fork adds **`sudo-secretspec`**: a single Rust binary that mediates all
-credential CRUD/use through a root-owned broker, fail-closed value-free audit,
+credential CRUD/use through a privilege-separated broker, fail-closed value-free audit,
 and metadata-only doctor checks.
 
 ```bash

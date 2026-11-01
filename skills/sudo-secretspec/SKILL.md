@@ -480,7 +480,7 @@ explicit `unknown` terminal state if restoration cannot be proven.
   when missing. On a host still running an older boundary, treat plain
   `install` as destructive.
   Since 0.19.1-sudo.17 the flag is no longer needed for an upgrade: `install`
-  adopts the vault the installed root-owned config names, and announces it on
+  adopts the vault the installed config names, and announces it on
   stderr. It is still required for a vault found only by path scan — including
   the retired wrapper's store, which migration leaves on disk on purpose.
   A vault that has been truncated shows as `.env` at 0 bytes with `check`

@@ -5,7 +5,7 @@
 
 `sudo-secretspec` is a privilege-separated companion to
 [SecretSpec](https://secretspec.dev) for autonomous local AI and operator use on
-macOS and Linux. One root-owned broker mediates every credential read, write and
+macOS and Linux. One privilege-separated broker mediates every credential read, write and
 use, so an agent running as your user can use secrets without being able to read
 the store, pick another provider, or skip the audit log.
 
@@ -82,7 +82,7 @@ caller choose which store answers or copy secrets out of the boundary.
 - Fail-closed, value-free SQLite audit (`broker-audit.sqlite3`); an audit failure
   stops the operation.
 - No caller-selected manifest, provider or profile; those come from the
-  root-owned config.
+  installed config.
 - Ownership, mode and the resolved vault path are enforced before every
   operation, not only by `doctor`.
 - `doctor` is metadata-only and never repairs.

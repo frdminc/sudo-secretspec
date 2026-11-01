@@ -65,7 +65,8 @@ pub struct InstallRequest {
     pub service_group: String,
     pub operator: String,
     /// Manifest profile the broker will resolve from. Written into the
-    /// root-owned config so it is not left to the caller's environment.
+    /// installed config (owned by the service user, not root) so it is not
+    /// left to the caller's environment.
     pub profile: String,
     pub source_root: Option<PathBuf>,
 }
@@ -847,6 +848,22 @@ fn validate_adopted_vault(
 /// since values moved into `secrets.db`, so a vault already migrated to the
 /// sqlite-only store legitimately has none. When it *is* present, though, it
 /// still must be a real file, never a symlink.
+/// Warning for an adopted vault whose runtime manifest differs from the
+/// declarations being installed; `None` when the bytes are equal.
+fn adopted_manifest_drift_warning(adopted: &[u8], shipped: &[u8]) -> Option<String> {
+    if adopted == shipped {
+        return None;
+    }
+    Some(
+        "warning: adopted vault's secretspec.toml differs from the declarations being installed. \
+The runtime manifest was kept and the new declarations were NOT merged; \
+`sudo-secretspec template-check` will report drift. To reconcile, add names with \
+`sudo-secretspec add NAME --description ... --reason ...`, or copy the template over the \
+runtime manifest only after confirming no stored values depend on removed names."
+            .to_string(),
+    )
+}
+
 fn validate_adopted_env_if_present(vault: &Path) -> Result<(), InstallError> {
     let env_path = vault.join(".env");
     if let Ok(meta) = fs::symlink_metadata(&env_path)
@@ -1517,6 +1534,14 @@ fn run_for_host(host: platform::Host, req: InstallRequest) -> Result<(), Install
             )));
         }
         validate_adopted_env_if_present(&req.vault)?;
+        // Bytes only; no values are opened. Install runs as root, so the 0600
+        // service-owned manifest is readable.
+        if let (Ok(adopted), Ok(shipped)) = (fs::read(&manifest_path), fs::read(&declarations_dst))
+        {
+            if let Some(warning) = adopted_manifest_drift_warning(&adopted, &shipped) {
+                eprintln!("{warning}");
+            }
+        }
     }
 
     // Create or adopt service identity.
@@ -2296,6 +2321,15 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn adopted_manifest_drift_warns_only_when_bytes_differ() {
+        assert!(adopted_manifest_drift_warning(b"a", b"a").is_none());
+        let w = adopted_manifest_drift_warning(b"a", b"b").unwrap();
+        assert!(w.contains("NOT merged"));
+        assert!(w.contains("template-check"));
+        assert!(w.contains("sudo-secretspec add NAME --description ... --reason ..."));
     }
 
     #[test]

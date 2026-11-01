@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `install` now warns on stderr when it adopts an existing vault whose
+  `secretspec.toml` differs from the declarations being installed: the runtime
+  manifest is kept, the new declarations are not merged, and `template-check`
+  will report drift. The warning gives the reconcile steps.
+
 - `secretspec add` accepts `--optional` and `--required` (0.22+) to override
   profile defaults when declaring a secret. Omitting both keeps the defaults.
 
