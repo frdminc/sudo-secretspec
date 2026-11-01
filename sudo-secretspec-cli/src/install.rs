@@ -1534,14 +1534,6 @@ fn run_for_host(host: platform::Host, req: InstallRequest) -> Result<(), Install
             )));
         }
         validate_adopted_env_if_present(&req.vault)?;
-        // Bytes only; no values are opened. Install runs as root, so the 0600
-        // service-owned manifest is readable.
-        if let (Ok(adopted), Ok(shipped)) = (fs::read(&manifest_path), fs::read(&declarations_dst))
-        {
-            if let Some(warning) = adopted_manifest_drift_warning(&adopted, &shipped) {
-                eprintln!("{warning}");
-            }
-        }
     }
 
     // Create or adopt service identity.
@@ -1723,6 +1715,14 @@ fn run_for_host(host: platform::Host, req: InstallRequest) -> Result<(), Install
             )));
         }
         validate_adopted_env_if_present(&req.vault)?;
+        // Bytes only; no values are opened. Install runs as root, so the 0600
+        // service-owned manifest is readable.
+        if let (Ok(adopted), Ok(shipped)) = (fs::read(&manifest_path), fs::read(&declarations_dst))
+        {
+            if let Some(warning) = adopted_manifest_drift_warning(&adopted, &shipped) {
+                eprintln!("{warning}");
+            }
+        }
     }
 
     // Hygiene, after the install itself has succeeded: every install captures
