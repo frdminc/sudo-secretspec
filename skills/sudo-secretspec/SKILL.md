@@ -319,10 +319,17 @@ sudo-secretspec undeclare NAME --reason "purpose"
 upper case, starting with a letter (`CLINE_PASS_KEY_2`, not `cline_pass_key_2`).
 The audit ledger enforces this for every subcommand that takes a name, and it
 checks before the command runs, so a bad name fails as
-`broker: audit attempt failed: audit denied: invalid secret name` and the
-client then prints a hint about `--reason-sha256` and re-running `install`.
-**Ignore that hint**: it is a generic fallback for any audit denial, not the
-cause here. Upper-case the name and retry.
+`broker: audit attempt failed: audit denied: invalid secret name`. Clients
+through `0.21.1-sudo.4` then also printed a hint about `--reason-sha256` and
+re-running `install` after *every* broker exit 2. **Ignore that hint** if you
+see it: it is not the cause here. Newer clients print it only when the broker
+really rejected `--reason-sha256`. Upper-case the name and retry.
+
+A `broker: audit attempt failed: … database is locked` failure is different:
+another broker call is holding the audit ledger and this one gave up waiting
+before it started, so nothing ran. Retry in a few seconds; if it keeps
+happening, `sudo-secretspec doctor` reports `LEDGER_LOCK_HELD` with the process
+holding it.
 
 ### Requiredness (`0.19.1-sudo.12+`)
 

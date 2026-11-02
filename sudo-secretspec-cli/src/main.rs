@@ -1,8 +1,8 @@
 use std::ffi::OsString;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus, Stdio};
 
 use clap::{Parser, Subcommand};
 
@@ -761,19 +761,86 @@ fn reason_digest_or_exit(reason: &str) -> String {
     })
 }
 
-/// Report a broker exit, adding a hint for the one confusing failure.
-fn exit_from_broker(code: i32) -> ! {
+/// The most of a broker's stderr kept for [`broker_hint`]. Its own messages are
+/// a line or two; the cap only bounds a broker that misbehaves.
+const BROKER_STDERR_KEPT: usize = 64 * 1024;
+
+/// Run a broker command with its stderr passed straight through to ours as it
+/// arrives, keeping a copy so a failure can be explained by what the broker
+/// actually said rather than by guessing from its exit code.
+///
+/// stdin and stdout stay inherited: `get` streams the secret value straight to
+/// the caller's stdout, and capturing it here would put a copy in this process.
+fn run_broker(command: &mut Command) -> io::Result<(ExitStatus, String)> {
+    let mut child = command.stderr(Stdio::piped()).spawn()?;
+    let mut kept = Vec::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        let mut chunk = [0u8; 4096];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let _ = io::stderr().lock().write_all(&chunk[..n]);
+                    let room = BROKER_STDERR_KEPT.saturating_sub(kept.len());
+                    kept.extend_from_slice(&chunk[..n.min(room)]);
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+    }
+    let status = child.wait()?;
+    Ok((status, String::from_utf8_lossy(&kept).into_owned()))
+}
+
+/// A hint for a broker exit whose cause the broker's own message does not make
+/// obvious, chosen from what the broker said. `None` when its message is enough.
+///
+/// Exit 2 is the broker's generic refusal, and used to get one hint whatever it
+/// said: the hint below about an old boundary was printed after
+/// `database is locked` and after `audit denied: invalid secret name`, sending
+/// the operator to re-install over a problem that had nothing to do with it.
+fn broker_hint(code: i32, broker_stderr: &str) -> Option<&'static str> {
+    if code != 2 {
+        return None;
+    }
     // The client and the broker are installed as a pair, but the Homebrew keg
     // ships a bootstrap binary that can be newer than the installed broker. An
     // older broker rejects `--reason-sha256` with clap's usage exit, which
     // otherwise reads as an unexplained argument error. Deliberately *not* a
     // retry with plaintext: falling back would hand an attacker who can
     // downgrade the broker a way to get the prose back.
-    if code == 2 {
-        eprintln!(
-            "sudo-secretspec: if the broker reported an unexpected '--reason-sha256' argument,\n\
-             the installed boundary predates this client; re-run `sudo-secretspec install`"
+    //
+    // Only clap's own unknown-argument wording counts. The broker's validation
+    // message for a bad digest also names the flag and is not this problem.
+    if broker_stderr.contains("unexpected argument '--reason-sha256'")
+        || broker_stderr.contains("Found argument '--reason-sha256'")
+    {
+        return Some(
+            "sudo-secretspec: the installed boundary predates this client (it rejects \
+             '--reason-sha256'); re-run `sudo-secretspec install`",
         );
+    }
+    // SQLite's own words, which the broker passes through. The audit ledger
+    // allows one writer at a time and the broker waits a bounded time for it.
+    if broker_stderr.contains("database is locked") {
+        return Some(if broker_stderr.contains("audit attempt failed") {
+            "sudo-secretspec: another broker call is holding the audit ledger and this one gave \
+             up waiting, so nothing ran; retry in a few seconds. If it keeps happening, \
+             `sudo-secretspec doctor` names a stalled holder"
+        } else {
+            "sudo-secretspec: another broker call is holding one of the vault's databases and \
+             this one gave up waiting; retry in a few seconds. If it keeps happening, \
+             `sudo-secretspec doctor` names a stalled holder"
+        });
+    }
+    None
+}
+
+/// Report a broker exit, adding a hint where [`broker_hint`] has one.
+fn exit_from_broker(code: i32, broker_stderr: &str) -> ! {
+    if let Some(hint) = broker_hint(code, broker_stderr) {
+        eprintln!("{hint}");
     }
     std::process::exit(code);
 }
@@ -820,30 +887,30 @@ fn lifecycle_add(name: &str, description: &str, optional: bool, required: bool, 
     if required {
         command.arg("--required");
     }
-    let status = command.status().unwrap_or_else(|e| {
+    let (status, broker_stderr) = run_broker(&mut command).unwrap_or_else(|e| {
         eprintln!("cannot invoke broker: {e}");
         std::process::exit(2);
     });
     if !status.success() {
-        exit_from_broker(status.code().unwrap_or(1));
+        exit_from_broker(status.code().unwrap_or(1), &broker_stderr);
     }
 }
 
 fn audit_verify() {
-    let status = Command::new(SUDO)
+    let mut command = Command::new(SUDO);
+    command
         .arg("-u")
         .arg(get_service_user())
         .arg("-n")
         .arg(privileged_broker())
         .arg("__broker")
-        .arg("audit-verify")
-        .status()
-        .unwrap_or_else(|e| {
-            eprintln!("cannot invoke broker: {e}");
-            std::process::exit(2);
-        });
+        .arg("audit-verify");
+    let (status, broker_stderr) = run_broker(&mut command).unwrap_or_else(|e| {
+        eprintln!("cannot invoke broker: {e}");
+        std::process::exit(2);
+    });
     if !status.success() {
-        exit_from_broker(status.code().unwrap_or(1));
+        exit_from_broker(status.code().unwrap_or(1), &broker_stderr);
     }
 }
 
@@ -862,14 +929,14 @@ fn lifecycle(op: &str, name: &str, reason: &str) {
     if !name.is_empty() {
         cmd.arg("--name").arg(name);
     }
-    // `status`, not `output`: `get` streams the secret value straight to the
-    // caller's stdout, and capturing it here would put a copy in this process.
-    let status = cmd.status().unwrap_or_else(|e| {
+    // Stdout stays inherited, not captured: `get` streams the secret value
+    // straight to the caller's stdout, and a copy here would sit in this process.
+    let (status, broker_stderr) = run_broker(&mut cmd).unwrap_or_else(|e| {
         eprintln!("cannot invoke broker: {e}");
         std::process::exit(2);
     });
     if !status.success() {
-        exit_from_broker(status.code().unwrap_or(1));
+        exit_from_broker(status.code().unwrap_or(1), &broker_stderr);
     }
 }
 
@@ -921,12 +988,12 @@ fn lifecycle_restore(name: Option<String>, to: &str, force: bool, all: bool, rea
         cmd.arg("--all");
     }
 
-    let status = cmd.status().unwrap_or_else(|e| {
+    let (status, broker_stderr) = run_broker(&mut cmd).unwrap_or_else(|e| {
         eprintln!("cannot invoke broker: {e}");
         std::process::exit(2);
     });
     if !status.success() {
-        exit_from_broker(status.code().unwrap_or(1));
+        exit_from_broker(status.code().unwrap_or(1), &broker_stderr);
     }
 }
 
@@ -944,12 +1011,12 @@ fn lifecycle_destroy(name: &str, reason: &str) {
         .arg("--name")
         .arg(name);
 
-    let status = cmd.status().unwrap_or_else(|e| {
+    let (status, broker_stderr) = run_broker(&mut cmd).unwrap_or_else(|e| {
         eprintln!("cannot invoke broker: {e}");
         std::process::exit(2);
     });
     if !status.success() {
-        exit_from_broker(status.code().unwrap_or(1));
+        exit_from_broker(status.code().unwrap_or(1), &broker_stderr);
     }
 }
 
@@ -999,8 +1066,9 @@ fn run_target(reason: &str, command: &[OsString]) {
         });
 
     if !output.status.success() {
-        eprint!("{}", String::from_utf8_lossy(&output.stderr));
-        exit_from_broker(output.status.code().unwrap_or(1));
+        let broker_stderr = String::from_utf8_lossy(&output.stderr);
+        eprint!("{broker_stderr}");
+        exit_from_broker(output.status.code().unwrap_or(1), &broker_stderr);
     }
 
     let env: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
@@ -1444,5 +1512,107 @@ mod tests {
             assert_privileged_config(&file, Some(my_uid)),
             Err("config is group- or world-writable")
         );
+    }
+
+    // --- the hint printed after a broker exit -------------------------------
+    //
+    // It used to be printed on every exit 2, whatever the broker said, so a
+    // locked ledger told the operator to re-install the boundary.
+
+    /// What clap 4 prints when an older broker does not know the flag.
+    const OLD_BROKER_STDERR: &str = "error: unexpected argument '--reason-sha256' found\n\n  \
+         tip: a similar argument exists: '--reason'\n\nUsage: sudo-secretspec __broker \
+         <OPERATION>\n\nFor more information, try '--help'.\n";
+
+    #[test]
+    fn an_older_broker_rejecting_the_digest_flag_gets_the_install_hint() {
+        let hint = broker_hint(2, OLD_BROKER_STDERR).expect("this is the case the hint is for");
+        assert!(hint.contains("sudo-secretspec install"), "{hint}");
+        assert!(hint.contains("predates"), "{hint}");
+    }
+
+    #[test]
+    fn a_locked_ledger_gets_a_retry_hint_and_not_the_install_hint() {
+        // The report from the issue, verbatim.
+        let said = "broker: audit attempt failed: database error: database is locked\n";
+        let hint = broker_hint(2, said).expect("a lock is worth explaining");
+        assert!(hint.contains("audit ledger"), "{hint}");
+        assert!(hint.contains("retry"), "{hint}");
+        assert!(!hint.contains("install"), "{hint}");
+        assert!(!hint.contains("reason-sha256"), "{hint}");
+    }
+
+    #[test]
+    fn the_brokers_own_busy_message_gets_the_same_retry_hint() {
+        let said = format!(
+            "broker: audit attempt failed: {}\n",
+            sudo_secretspec_cli::audit::AuditError::Busy
+        );
+        let hint = broker_hint(2, &said).expect("a lock is worth explaining");
+        assert!(
+            hint.contains("audit ledger") && hint.contains("retry"),
+            "{hint}"
+        );
+        assert!(!hint.contains("install"), "{hint}");
+    }
+
+    #[test]
+    fn a_lock_on_another_vault_database_is_not_called_the_audit_ledger() {
+        let hint = broker_hint(2, "broker: secret store: database is locked\n")
+            .expect("a lock is worth explaining");
+        assert!(!hint.contains("audit ledger"), "{hint}");
+        assert!(hint.contains("retry"), "{hint}");
+    }
+
+    #[test]
+    fn other_exit_2_failures_get_no_hint() {
+        for said in [
+            // The broker's own validation message names the flag too; it is not
+            // an old boundary.
+            "broker: --reason-sha256 must be the hex SHA-256 of a non-empty reason\n",
+            // The case the skill documents as "ignore the hint".
+            "broker: audit attempt failed: audit denied: invalid secret name\n",
+            "broker: Secret 'X' is not defined in profile 'default'\n",
+            "",
+        ] {
+            assert_eq!(broker_hint(2, said), None, "{said:?}");
+        }
+    }
+
+    #[test]
+    fn only_exit_2_is_explained() {
+        // An unrecorded outcome (126) already says so itself, and an operation
+        // that ran and failed (1, 125, ...) is not an argument or lock problem.
+        for code in [0, 1, 126, 125, 127] {
+            assert_eq!(broker_hint(code, OLD_BROKER_STDERR), None, "{code}");
+            assert_eq!(
+                broker_hint(code, "broker: audit terminal failed: database is locked"),
+                None,
+                "{code}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_broker_hands_back_the_exit_status_and_what_the_broker_said() {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("echo 'broker: audit attempt failed: database is locked' >&2; exit 2");
+        let (status, said) = run_broker(&mut command).unwrap();
+        assert_eq!(status.code(), Some(2));
+        assert!(said.contains("database is locked"), "{said:?}");
+        assert!(broker_hint(2, &said).is_some());
+    }
+
+    #[test]
+    fn run_broker_keeps_a_bounded_copy_of_a_noisy_broker() {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("head -c 300000 /dev/zero | tr '\\0' x >&2");
+        let (status, said) = run_broker(&mut command).unwrap();
+        assert!(status.success());
+        assert_eq!(said.len(), BROKER_STDERR_KEPT);
     }
 }

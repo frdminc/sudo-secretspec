@@ -14,6 +14,7 @@ use std::fs;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -21,6 +22,7 @@ use thiserror::Error;
 
 use crate::audit;
 use crate::config::Config;
+use crate::history;
 use crate::platform::{self, Host};
 
 #[derive(Debug, Error)]
@@ -262,6 +264,66 @@ fn finding(code: &str, path: Option<&Path>, detail: impl Into<String>) -> Findin
         path: path.map(|p| p.display().to_string()),
         advisory: ADVISORY_CODES.contains(&code),
     }
+}
+
+/// How many times `doctor` looks at a ledger's write lock before calling it
+/// stuck, and how far apart. Thirty looks 100 ms apart is about three seconds,
+/// against the milliseconds an ordinary broker call holds it for.
+const LOCK_LOOKS: u32 = 30;
+const LOCK_LOOK_INTERVAL: Duration = Duration::from_millis(100);
+
+/// The process `look` finds holding the lock on every one of `looks` successive
+/// looks, with `pause` between them; `None` as soon as the lock is free or
+/// changes hands. Several brokers taking the lock in turn are healthy contention,
+/// not one stuck process, so only an unbroken hold by the same process counts.
+fn sustained_holder(
+    mut look: impl FnMut() -> Option<u32>,
+    mut pause: impl FnMut(),
+    looks: u32,
+) -> Option<u32> {
+    let first = look()?;
+    for _ in 1..looks {
+        pause();
+        if look() != Some(first) {
+            return None;
+        }
+    }
+    Some(first)
+}
+
+/// One non-advisory `LEDGER_LOCK_HELD` finding for each ledger in `vault` whose
+/// write lock a single process has held for the whole look window.
+///
+/// A read-only connection is never blocked by SQLite's write lock, so
+/// [`audit::verify_read_only`] passes while a stalled broker keeps every other
+/// call failing with "database is locked" (issue #4); this asks who holds the
+/// lock instead. A probe that cannot run (a symlink, an unreadable file, a
+/// filesystem without POSIX locks) reports nothing here: the metadata checks and
+/// the verification already own those failures.
+fn stuck_lock_findings(
+    vault: &Path,
+    mut probe: impl FnMut(&Path) -> std::io::Result<Option<u32>>,
+    mut pause: impl FnMut(),
+) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    for name in [audit::DB_NAME, history::DB_NAME] {
+        let path = vault.join(name);
+        let holder = sustained_holder(|| probe(&path).ok().flatten(), &mut pause, LOCK_LOOKS);
+        if let Some(pid) = holder {
+            findings.push(finding(
+                "LEDGER_LOCK_HELD",
+                Some(&path),
+                format!(
+                    "process {pid} has held the write lock on {name} for about three seconds; \
+                     a broker call holds it for milliseconds, so every other broker call is \
+                     waiting on it and then failing with 'database is locked'. Inspect it with \
+                     `ps -p {pid} -o pid,etime,user,command`; if it is a stalled `__broker` \
+                     process, `sudo kill {pid}` releases the lock."
+                ),
+            ));
+        }
+    }
+    findings
 }
 
 /// Load and validate the protected TOML configuration at `path`.
@@ -1295,6 +1357,16 @@ pub fn inspect_for_host(host: Host, layout: &Layout, opts: &InspectOptions) -> R
         }
     }
 
+    // A broker that stalls while it holds a ledger's write lock blocks every
+    // other call, yet a read-only connection is never blocked by that lock, so
+    // the verification below would pass. Ask the kernel who holds it instead,
+    // before this process opens either ledger itself.
+    findings.extend(stuck_lock_findings(
+        &layout.vault,
+        audit::write_lock_holder,
+        || std::thread::sleep(LOCK_LOOK_INTERVAL),
+    ));
+
     // Audit integrity via library (no secret contents, and no writes: this
     // module promises never to mutate state, and the read-write path repairs
     // the ledger's mode and ownership and creates its schema).
@@ -2322,5 +2394,103 @@ service_group = "sudo-secretspec"
             layout.sudoers,
             PathBuf::from("/etc/sudoers.d/sudo-secretspec")
         );
+    }
+
+    #[test]
+    fn a_lock_held_by_one_process_throughout_the_window_fails_doctor() {
+        let tmp = tempdir().unwrap();
+        let mut pauses = 0;
+        let findings = stuck_lock_findings(
+            tmp.path(),
+            |path| Ok(path.ends_with(audit::DB_NAME).then_some(4242)),
+            || pauses += 1,
+        );
+
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        let f = &findings[0];
+        assert_eq!(f.code, "LEDGER_LOCK_HELD");
+        assert!(!f.advisory, "a stuck broker means every call is failing");
+        assert!(f.detail.contains("4242"), "{}", f.detail);
+        assert!(f.detail.contains("database is locked"), "{}", f.detail);
+        assert!(f.path.as_deref().unwrap().ends_with(audit::DB_NAME));
+        assert_eq!(pauses, LOCK_LOOKS - 1, "it must look for the whole window");
+        assert!(!Report::from_findings(findings).ok);
+    }
+
+    #[test]
+    fn a_lock_released_inside_the_window_is_not_reported() {
+        let tmp = tempdir().unwrap();
+        let mut looks = 0;
+        let findings = stuck_lock_findings(
+            tmp.path(),
+            |path| {
+                if !path.ends_with(audit::DB_NAME) {
+                    return Ok(None);
+                }
+                looks += 1;
+                Ok((looks <= 5).then_some(7))
+            },
+            || {},
+        );
+        assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    #[test]
+    fn a_lock_that_changes_hands_is_contention_and_not_reported() {
+        // Brokers taking the lock in turn is the ordinary busy case; only one
+        // process sitting on it is the fault.
+        assert_eq!(sustained_holder(|| Some(7), || {}, LOCK_LOOKS), Some(7));
+
+        let mut pid = 100;
+        let handing_over = || {
+            pid += 1;
+            Some(pid)
+        };
+        assert_eq!(sustained_holder(handing_over, || {}, LOCK_LOOKS), None);
+    }
+
+    #[test]
+    fn a_free_lock_costs_no_waiting() {
+        let tmp = tempdir().unwrap();
+        let mut pauses = 0;
+        let findings = stuck_lock_findings(tmp.path(), |_| Ok(None), || pauses += 1);
+        assert!(findings.is_empty());
+        assert_eq!(pauses, 0, "a healthy vault must not slow doctor down");
+    }
+
+    #[test]
+    fn a_probe_that_cannot_run_reports_nothing() {
+        let tmp = tempdir().unwrap();
+        let mut pauses = 0;
+        let findings = stuck_lock_findings(
+            tmp.path(),
+            |_| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            || pauses += 1,
+        );
+        assert!(findings.is_empty(), "{findings:?}");
+        assert_eq!(pauses, 0);
+    }
+
+    #[test]
+    fn a_real_stalled_writer_in_another_process_is_found_by_the_kernel_probe() {
+        use crate::audit::test_support::{Hold, ProcessLock};
+
+        // End to end with no fakes: another process takes SQLite's write lock on
+        // a ledger and sits on it, exactly as the stalled broker did.
+        let tmp = tempdir().unwrap();
+        let db = tmp.path().join(audit::DB_NAME);
+        let holder = ProcessLock::hold(&db, Hold::Write);
+
+        let findings = stuck_lock_findings(tmp.path(), audit::write_lock_holder, || {});
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].code, "LEDGER_LOCK_HELD");
+        assert!(
+            findings[0].detail.contains(&holder.pid().to_string()),
+            "{}",
+            findings[0].detail
+        );
+
+        holder.release();
+        assert!(stuck_lock_findings(tmp.path(), audit::write_lock_holder, || {}).is_empty());
     }
 }

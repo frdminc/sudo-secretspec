@@ -9,6 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension};
 
@@ -22,6 +23,10 @@ pub const DB_NAME: &str = "broker-history.sqlite3";
 
 const MAX_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
 
+/// Rows fetched per statement while verifying. Small, because each row carries
+/// a whole captured manifest.
+const VERIFY_CHUNK_ROWS: usize = 32;
+
 // ---------------------------------------------------------------------------
 // Error
 // ---------------------------------------------------------------------------
@@ -31,17 +36,35 @@ pub enum HistoryError {
     #[error("history denied: {0}")]
     Denied(String),
 
+    /// Another process held the store's lock for longer than the busy timeout.
+    /// See [`AuditError::Busy`]; the wording is shared on purpose.
+    #[error(
+        "database is locked: another broker call is holding the history store and did not release it in time; retry shortly"
+    )]
+    Busy,
+
     #[error("database error: {0}")]
-    Database(#[from] rusqlite::Error),
+    Database(rusqlite::Error),
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+impl From<rusqlite::Error> for HistoryError {
+    fn from(error: rusqlite::Error) -> Self {
+        if audit::is_busy(&error) {
+            HistoryError::Busy
+        } else {
+            HistoryError::Database(error)
+        }
+    }
 }
 
 impl From<AuditError> for HistoryError {
     fn from(error: AuditError) -> Self {
         match error {
             AuditError::Denied(message) => HistoryError::Denied(message),
+            AuditError::Busy => HistoryError::Busy,
             AuditError::Database(error) => HistoryError::Database(error),
             AuditError::Io(error) => HistoryError::Io(error),
         }
@@ -147,71 +170,121 @@ fn compute_entry_hash(previous_hash: &str, entry: &Entry) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Chain verification (in-transaction)
+// Chain verification
 // ---------------------------------------------------------------------------
 
-fn verify_rows(conn: &Connection) -> Result<(String, i64), HistoryError> {
-    let mut previous = ZERO_HASH.to_string();
-    let mut count: i64 = 0;
+/// One `entries` row exactly as stored, before any check has run on it.
+type RawEntry = (
+    i64,     // sequence
+    i64,     // timestamp_ns
+    String,  // transaction_id
+    String,  // operation
+    Vec<u8>, // manifest_blob
+    String,  // manifest_sha256
+    String,  // previous_hash
+    String,  // entry_hash
+);
 
+fn read_raw_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawEntry> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+    ))
+}
+
+/// Fetch up to `limit` entries numbered after `after`, in order, and finish the
+/// statement before returning, so the read lock it needed is already released.
+fn fetch_entries_after(
+    conn: &Connection,
+    after: i64,
+    limit: usize,
+) -> rusqlite::Result<Vec<RawEntry>> {
     let mut stmt = conn.prepare(
         "SELECT sequence, timestamp_ns, transaction_id, operation,\
                 manifest_blob, manifest_sha256, previous_hash, entry_hash \
-         FROM entries ORDER BY sequence",
+         FROM entries WHERE sequence > ?1 ORDER BY sequence LIMIT ?2",
     )?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, Vec<u8>>(4)?,
-            row.get::<_, String>(5)?,
-            row.get::<_, String>(6)?,
-            row.get::<_, String>(7)?,
-        ))
-    })?;
+    let rows: Vec<RawEntry> = stmt
+        .query_map(rusqlite::params![after, limit as i64], read_raw_entry)?
+        .collect::<Result<_, _>>()?;
+    Ok(rows)
+}
 
-    for row in rows {
-        let (
-            sequence,
-            timestamp_ns,
-            transaction_id,
-            operation,
-            manifest_blob,
-            manifest_sha256,
-            stored_previous,
-            entry_hash,
-        ) = row?;
+/// Check one entry against the hash of the entry before it. Returns the entry's
+/// own hash and sequence, which become the next call's `previous`.
+fn check_entry(previous: &str, raw: RawEntry) -> Result<(String, i64), HistoryError> {
+    let (
+        sequence,
+        timestamp_ns,
+        transaction_id,
+        operation,
+        manifest_blob,
+        manifest_sha256,
+        stored_previous,
+        entry_hash,
+    ) = raw;
 
-        if sha256_hex(&manifest_blob) != manifest_sha256 {
-            return Err(HistoryError::Denied(
-                "history manifest does not match its digest".into(),
-            ));
-        }
-
-        let transaction = uuid::Uuid::parse_str(&transaction_id).map_err(|e| {
-            HistoryError::Denied(format!("invalid transaction UUID in history: {e}"))
-        })?;
-
-        let entry = Entry {
-            sequence,
-            timestamp_ns,
-            transaction,
-            operation,
-            manifest_sha256,
-            previous_hash: stored_previous.clone(),
-            entry_hash: entry_hash.clone(),
-        };
-
-        if stored_previous != previous || entry_hash != compute_entry_hash(&previous, &entry) {
-            return Err(HistoryError::Denied("history chain is invalid".into()));
-        }
-
-        previous = entry_hash;
-        count = sequence;
+    if sha256_hex(&manifest_blob) != manifest_sha256 {
+        return Err(HistoryError::Denied(
+            "history manifest does not match its digest".into(),
+        ));
     }
 
+    let transaction = uuid::Uuid::parse_str(&transaction_id)
+        .map_err(|e| HistoryError::Denied(format!("invalid transaction UUID in history: {e}")))?;
+
+    let entry = Entry {
+        sequence,
+        timestamp_ns,
+        transaction,
+        operation,
+        manifest_sha256,
+        previous_hash: stored_previous.clone(),
+        entry_hash: entry_hash.clone(),
+    };
+
+    if stored_previous != previous || entry_hash != compute_entry_hash(previous, &entry) {
+        return Err(HistoryError::Denied("history chain is invalid".into()));
+    }
+
+    Ok((entry_hash, sequence))
+}
+
+/// Verify every entry numbered after `after`, chaining from `previous` (the hash
+/// of entry `after`, or [`ZERO_HASH`] when `after` is 0). Returns the new tip as
+/// `(hash, sequence)`, which is the inputs unchanged when nothing follows.
+///
+/// Rows are read [`VERIFY_CHUNK_ROWS`] at a time and each statement is finished
+/// before its rows are hashed; see [`audit`]'s "Locking" section for why. Called
+/// with no transaction open, no lock is held while the hashing runs.
+fn verify_chain_after(
+    conn: &Connection,
+    mut after: i64,
+    mut previous: String,
+) -> Result<(String, i64), HistoryError> {
+    loop {
+        let rows = fetch_entries_after(conn, after, VERIFY_CHUNK_ROWS)?;
+        let fetched = rows.len();
+        for raw in rows {
+            let (hash, sequence) = check_entry(&previous, raw)?;
+            previous = hash;
+            after = sequence;
+        }
+        if fetched < VERIFY_CHUNK_ROWS {
+            return Ok((previous, after));
+        }
+    }
+}
+
+/// Check that the `head` row names the tip the chain actually ended on (or is
+/// absent when there are no entries).
+fn check_head(conn: &Connection, count: i64, tip_hash: &str) -> Result<(), HistoryError> {
     let head: Option<(i64, String)> = conn
         .query_row(
             "SELECT sequence, entry_hash FROM head WHERE singleton = 1",
@@ -222,12 +295,18 @@ fn verify_rows(conn: &Connection) -> Result<(String, i64), HistoryError> {
     let expected_head = if count == 0 {
         None
     } else {
-        Some((count, previous.clone()))
+        Some((count, tip_hash.to_string()))
     };
     if head != expected_head {
         return Err(HistoryError::Denied("history head is invalid".into()));
     }
+    Ok(())
+}
 
+/// Verify the whole chain and the head inside the caller's transaction.
+fn verify_rows(conn: &Connection) -> Result<(String, i64), HistoryError> {
+    let (previous, count) = verify_chain_after(conn, 0, ZERO_HASH.to_string())?;
+    check_head(conn, count, &previous)?;
     Ok((previous, count))
 }
 
@@ -356,7 +435,21 @@ pub fn list(
     }
 }
 
+/// Archive one manifest. The write lock is held only around the insert: the
+/// chain is verified first with no transaction open (see [`audit`]'s "Locking"
+/// section). Waits up to [`audit::WRITE_BUSY_TIMEOUT`] for another writer, then
+/// fails with [`HistoryError::Busy`] having stored nothing.
 pub fn capture(directory: &Path, request: CaptureRequest) -> Result<Entry, HistoryError> {
+    capture_waiting(directory, request, audit::WRITE_BUSY_TIMEOUT)
+}
+
+/// [`capture`] with the busy timeout given, so a test can show the bound
+/// without waiting out the production one.
+pub(crate) fn capture_waiting(
+    directory: &Path,
+    request: CaptureRequest,
+    busy_timeout: Duration,
+) -> Result<Entry, HistoryError> {
     if request.manifest.len() > MAX_CAPTURE_BYTES {
         return Err(HistoryError::Denied(
             "captured file exceeds the history size limit".into(),
@@ -373,18 +466,25 @@ pub fn capture(directory: &Path, request: CaptureRequest) -> Result<Entry, Histo
 
     let manifest_sha256 = sha256_hex(&request.manifest);
 
-    let conn = audit::open_protected_db(
+    let conn = audit::open_protected_db_waiting(
         directory,
         DB_NAME,
         request.expected_uid,
         VerifyMode::ReadWrite,
+        busy_timeout,
     )?;
 
     let result = (|| -> Result<Entry, HistoryError> {
         ensure_schema(&conn)?;
+
+        // Verify before locking, and under the lock check only what landed since.
+        let (verified_hash, verified_sequence) =
+            verify_chain_after(&conn, 0, ZERO_HASH.to_string())?;
+
         conn.execute("BEGIN IMMEDIATE", [])?;
 
-        let (previous_hash, count) = verify_rows(&conn)?;
+        let (previous_hash, count) = verify_chain_after(&conn, verified_sequence, verified_hash)?;
+        check_head(&conn, count, &previous_hash)?;
         let sequence = count + 1;
 
         let timestamp_ns = {
@@ -723,5 +823,86 @@ mod tests {
             verify_read_only(dir.path(), None),
             Err(HistoryError::Denied(_))
         ));
+    }
+
+    #[test]
+    fn a_capture_waits_out_a_held_write_lock_and_then_succeeds() {
+        use crate::audit::test_support::ThreadLock;
+
+        let dir = vault();
+        capture(dir.path(), request(uuid::Uuid::new_v4())).unwrap();
+
+        let held = ThreadLock::hold(&dir.path().join(DB_NAME));
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(600));
+            held.release();
+        });
+
+        let started = std::time::Instant::now();
+        let entry = capture_waiting(
+            dir.path(),
+            request(uuid::Uuid::new_v4()),
+            Duration::from_secs(30),
+        )
+        .expect("contention must be waited out, not reported as a failure");
+        let waited = started.elapsed();
+        releaser.join().unwrap();
+
+        assert!(
+            waited >= Duration::from_millis(300),
+            "returned after {waited:?}: the capture never waited for the lock"
+        );
+        assert_eq!(entry.sequence, 2);
+        let result = verify(dir.path(), None).unwrap();
+        assert_eq!(result.entries, 2);
+        assert_eq!(result.hash, entry.entry_hash);
+    }
+
+    #[test]
+    fn a_capture_gives_up_after_the_bound_with_a_clear_error_and_stores_nothing() {
+        use crate::audit::test_support::ThreadLock;
+
+        let dir = vault();
+        capture(dir.path(), request(uuid::Uuid::new_v4())).unwrap();
+        let held = ThreadLock::hold(&dir.path().join(DB_NAME));
+
+        let err = capture_waiting(
+            dir.path(),
+            request(uuid::Uuid::new_v4()),
+            Duration::from_millis(400),
+        )
+        .expect_err("the lock is held for the whole call, so this cannot succeed");
+
+        assert!(matches!(err, HistoryError::Busy), "{err}");
+        let text = err.to_string();
+        assert!(text.contains("database is locked"), "{text}");
+        assert!(text.contains("retry"), "{text}");
+
+        held.release();
+        assert_eq!(verify(dir.path(), None).unwrap().entries, 1);
+    }
+
+    #[test]
+    fn a_capture_still_refuses_a_store_whose_history_was_altered() {
+        // Verification runs before the write lock now. It must still stop the
+        // capture before anything is written.
+        let dir = vault();
+        let conn = captured(dir.path(), 2);
+        conn.execute(
+            "UPDATE entries SET manifest_blob = ?1 WHERE sequence = 1",
+            rusqlite::params![&b"[project]\nname = \"forged\"\n"[..]],
+        )
+        .unwrap();
+        drop(conn);
+
+        let err = capture(dir.path(), request(uuid::Uuid::new_v4()))
+            .expect_err("a forged manifest must fail closed");
+        assert!(matches!(err, HistoryError::Denied(_)), "{err}");
+
+        let conn = Connection::open(dir.path().join(DB_NAME)).unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT count(*) FROM entries", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 2, "a refused capture must add nothing");
     }
 }

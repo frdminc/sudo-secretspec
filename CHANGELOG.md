@@ -455,6 +455,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- One stalled broker no longer takes every other call down with it (issue #4).
+  Appending to the audit ledger and to the history store verified the whole hash
+  chain *inside* the database's write transaction, so how long the lock was held
+  grew with the ledger, and under memory pressure a single descheduled
+  `__broker` kept every other `get` and `run` failing with `database is locked`
+  while `doctor` reported OK. The chain is still verified in full on every
+  append and the ledger still fails closed on a bad chain or head, but the
+  verification now runs before the lock is taken, in short reads; only a check
+  of what landed in the meantime and the insert run under it. Broker connections
+  now wait up to 30 seconds for another call's lock (`doctor` and `drift`: 5
+  seconds) and then fail without appending anything, with `database is locked:
+  another broker call is holding the ledger and did not release it in time;
+  retry shortly` instead of a bare SQLite error. `doctor` gains a failing
+  `LEDGER_LOCK_HELD` finding, naming the process, when one process has held a
+  ledger's write lock for about three seconds; a read-only check is never
+  blocked by that lock, which is why `doctor` could not see it before. The
+  client no longer prints "the installed boundary predates this client; re-run
+  `sudo-secretspec install`" after every broker exit 2: it does so only when the
+  broker rejected `--reason-sha256`, and for a locked ledger it says another
+  call holds it and to retry. To choose its hint the client now reads the
+  broker's stderr as it is relayed.
+
 - `sudo-secretspec rollback` preserves root and service ownership when restoring
   installed files on macOS and Linux, so a restored boundary passes `doctor`.
 - Fresh installs on macOS and Linux refuse an existing service group unless it

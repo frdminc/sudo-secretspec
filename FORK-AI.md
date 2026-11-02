@@ -64,6 +64,20 @@ loaded into agent context automatically.
     one of the scan candidates is the retired wrapper's store. The rule is
     `install::adopts_without_flag`; keep it there rather than re-deciding it
     inline in `main.rs`.
+12. **Keep the ledger's write lock short, and never verify inside it.**
+    `audit::append_event` and `history::capture` verify the whole chain in
+    short chunked reads *before* `BEGIN IMMEDIATE` and re-check only the delta
+    under it; the ledger is in `DELETE` journal mode, so a lock held across an
+    O(ledger) scan stalls every other broker call (issue #4: one descheduled
+    `__broker` under memory pressure, 20 minutes). rusqlite installs a 5 s
+    busy timeout on its own, so "no `busy_timeout`" is not the failure mode;
+    the explicit bounds are `audit::WRITE_BUSY_TIMEOUT` (30 s) and
+    `READ_BUSY_TIMEOUT` (5 s). `doctor` cannot see a stalled writer through a
+    read-only SQLite connection (`RESERVED` never blocks readers), so
+    `audit::write_lock_holder` asks the kernel with `fcntl(F_GETLK)` on the
+    `RESERVED` byte (`0x40000001`) instead. POSIX locks never conflict with
+    their own process, so a test of it needs a second process: the test binary
+    re-runs itself as `audit::test_support::lock_holder_child`.
 
 ## Useful commands
 
