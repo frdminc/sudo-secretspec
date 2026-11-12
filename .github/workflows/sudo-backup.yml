@@ -25,5 +25,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y age libsqlite3-dev pkg-config
       - name: Test encrypted capture, history, restore, and event parsing
         run: python3 -m unittest discover -s sudo-secretspec/backup -p 'test_*.py' -v
-      - name: Test companion CLI and doctor integration
-        run: cargo test --locked -p sudo-secretspec-cli
+      - name: Test companion modules and CLI
+        # The existing release workflow covers the full platform integration
+        # suite. This job targets backup/doctor code and the public CLI without
+        # invoking host sudo-policy fixtures (Ubuntu's sudo-rs differs from sudo).
+        run: cargo test --locked -p sudo-secretspec-cli --lib --bin sudo-secretspec --test cli

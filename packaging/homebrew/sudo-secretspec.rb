@@ -46,7 +46,8 @@ class SudoSecretspec < Formula
     (share/"sudo-secretspec/skills/sudo-secretspec").install "skills/sudo-secretspec/SKILL.md"
     (share/"sudo-secretspec").install "sudo-secretspec/BACKUPS.md"
     (share/"sudo-secretspec/backup").install "sudo-secretspec/backup/backup.py",
-      "sudo-secretspec/backup/observer.py", "sudo-secretspec/backup/install.py"
+      "sudo-secretspec/backup/observer.py", "sudo-secretspec/backup/install.py",
+      "sudo-secretspec/backup/benchmark.py"
   end
 
   def caveats

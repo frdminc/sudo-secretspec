@@ -80,8 +80,9 @@ else:
     with os.fdopen(fd,'w') as f: f.write(d['recovery_key'])
 repo=pathlib.Path(d['repo'])
 if not repo.exists():
-    subprocess.run(['/usr/bin/git','init','--bare','--initial-branch=main',str(repo)],check=True,stdout=subprocess.DEVNULL)
+    subprocess.run(['/usr/bin/git','init','--bare',str(repo)],check=True,stdout=subprocess.DEVNULL)
 if repo.is_symlink(): raise SystemExit('repository symlink refused')
+subprocess.run(['/usr/bin/git','--git-dir',str(repo),'symbolic-ref','HEAD','refs/heads/main'],check=True)
 os.chmod(repo,0o700)
 for k,v in [('receive.denyDeletes','true'),('receive.denyNonFastForwards','true'),('gc.auto','0')]:
     subprocess.run(['/usr/bin/git','--git-dir',str(repo),'config',k,v],check=True)
@@ -112,6 +113,8 @@ def main():
     p.add_argument('--age', default=shutil.which('age') or '/opt/homebrew/bin/age')
     p.add_argument('--age-keygen', default=shutil.which('age-keygen') or '/opt/homebrew/bin/age-keygen')
     p.add_argument('--activate', action='store_true')
+    p.add_argument('--enable-observer', action='store_true',
+                   help='enable attribution only after benchmark.py passed on this host')
     args = p.parse_args()
     if sys.platform != 'darwin':
         p.error('automated backup installation currently supports macOS only')
@@ -126,7 +129,7 @@ def main():
     for path in (PREFIX, STATE, KEYS):
         directory(path)
     print('Installing protected helpers and independent keys', flush=True)
-    for name in ('backup.py', 'observer.py'):
+    for name in ('backup.py', 'observer.py', 'benchmark.py'):
         write(PREFIX / name, (HERE / name).read_bytes(), 0o700)
     write(PREFIX / 'age', Path(args.age).resolve().read_bytes(), 0o700)
     write(PREFIX / 'age-keygen', Path(args.age_keygen).resolve().read_bytes(), 0o700)
@@ -200,8 +203,28 @@ def main():
         if loaded:
             command(['/bin/launchctl', 'bootout', 'system/' + label])
         command(['/bin/launchctl', 'bootstrap', 'system', str(target)])
+    if args.enable_observer:
+        benchmark = STATE / 'observer/benchmark.json'
+        validate_key(benchmark)
+        report = json.loads(benchmark.read_text())
+        if not (report.get('passed') and report.get('coverage_verified') and
+                report.get('duration_seconds', 0) >= 600 and
+                report.get('cpu_percent_one_core', 100) <= 1 and
+                report.get('max_rss_bytes', 2**63) <= 100 * 1024**2):
+            raise RuntimeError('observer benchmark/coverage gate has not passed')
+        observer_label = label + '-observer'
+        observer_plist = dict(plist, Label=observer_label,
+            ProgramArguments=['/usr/bin/python3', '-I', str(PREFIX / 'observer.py'), 'observe'],
+            StandardOutPath=str(logs / 'observer.log'), StandardErrorPath=str(logs / 'observer-error.log'))
+        observer_target = Path('/Library/LaunchDaemons') / (observer_label + '.plist')
+        write(observer_target, plistlib.dumps(observer_plist), 0o644)
+        loaded = subprocess.run(['/bin/launchctl', 'print', 'system/' + observer_label],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+        if loaded:
+            command(['/bin/launchctl', 'bootout', 'system/' + observer_label])
+        command(['/bin/launchctl', 'bootstrap', 'system', str(observer_target)])
     print(json.dumps({'installed': True, 'activated': args.activate, 'remote_key_decryption_verified': True,
-                      'observer': 'not enabled: benchmark and Full Disk Access required'}))
+                      'observer': 'enabled' if args.enable_observer else 'not enabled: benchmark and Full Disk Access required'}))
 
 
 if __name__ == '__main__':
@@ -209,5 +232,5 @@ if __name__ == '__main__':
         main()
     except Exception as exc:
         # No exception payloads: external programs may include secret bytes.
-        print('installation failed: ' + type(exc).__name__)
+        print('installation failed: ' + (str(exc) if isinstance(exc, RuntimeError) else type(exc).__name__))
         raise SystemExit(1)

@@ -112,6 +112,32 @@ def metadata(s):
                 inode=s.st_ino, device=s.st_dev, kind='dir' if stat.S_ISDIR(s.st_mode) else 'file')
 
 
+@contextlib.contextmanager
+def source_access(credentials):
+    """Temporarily drop privilege for source access in this single-threaded helper.
+
+    Outputs stay root-only, opened before this scope. Never launch subprocesses
+    or execute callbacks supplied by configuration while privileges are lowered.
+    """
+    if credentials is None:
+        yield
+        return
+    uid, gid = credentials
+    old_uid, old_gid = os.geteuid(), os.getegid()
+    try:
+        os.setgroups([])
+        os.setegid(gid)
+        os.seteuid(uid)
+        yield
+    finally:
+        os.seteuid(old_uid)
+        os.setegid(old_gid)
+        # getgroups() on macOS includes dynamically resolved memberships and
+        # cannot be round-tripped through setgroups(). This dedicated root
+        # helper deliberately retains no supplementary groups.
+        os.setgroups([])
+
+
 def open_db(path):
     # mode=ro honors WAL/journals. Never immutable=1 on a live SQLite database.
     conn = sqlite3.connect(Path(path).absolute().as_uri() + '?mode=ro', uri=True, timeout=2)
@@ -119,8 +145,8 @@ def open_db(path):
     return conn
 
 
-def audit_state(path):
-    with contextlib.closing(open_db(path)) as db:
+def audit_state(path, credentials=None):
+    with source_access(credentials), contextlib.closing(open_db(path)) as db:
         # Filled from the product's actual schema; explicit columns fail closed
         # if a future version changes the recovery contract.
         heads = db.execute('SELECT sequence, event_hash FROM head').fetchall()
@@ -156,25 +182,44 @@ def verify_audit(path):
         raise BackupError('AUDIT_HEAD_INVALID')
 
 
-def sqlite_copy(source, destination, deadline):
+def sqlite_copy(source, destination, deadline, credentials=None, memory_limit=512 * 1024 * 1024):
     def progress(status, remaining, total):
         if time.monotonic() > deadline:
             raise BackupError('SNAPSHOT_TIMEOUT')
-    with contextlib.closing(open_db(source)) as src:
-        with contextlib.closing(sqlite3.connect(str(destination))) as dst:
+    # SQLite may reopen its destination while backing up. A service-UID source
+    # cannot back up directly into a root-only path, even with preopened FDs.
+    # Materialize one bounded in-memory image as that UID, then write the image
+    # as root. No plaintext scratch is ever exposed outside root-only staging.
+    if credentials is not None:
+        size = Path(source).stat().st_size
+        wal = Path(str(source) + '-wal')
+        if wal.exists():
+            size += wal.stat().st_size
+        if size > memory_limit:
+            raise BackupError('DATABASE_EXCEEDS_MEMORY_SNAPSHOT_LIMIT')
+        with contextlib.closing(sqlite3.connect(':memory:')) as image:
+            with source_access(credentials), contextlib.closing(open_db(source)) as src:
+                src.backup(image, pages=256, progress=progress, sleep=0.05)
+            with contextlib.closing(sqlite3.connect(str(destination))) as dst:
+                image.backup(dst, pages=256, progress=progress, sleep=0.05)
+                dst.execute('PRAGMA journal_mode=DELETE')
+                if dst.execute('PRAGMA integrity_check').fetchall() != [('ok',)]:
+                    raise BackupError('DATABASE_INTEGRITY_FAILED')
+        return
+    with contextlib.closing(sqlite3.connect(str(destination))) as dst:
+        dst.execute('PRAGMA journal_mode=OFF')
+        with source_access(credentials), contextlib.closing(open_db(source)) as src:
             src.backup(dst, pages=256, progress=progress, sleep=0.05)
-            # Normalize the COPY, never the live source. Opening a restored WAL
-            # database must not manufacture omitted sidecars after validation.
-            dst.execute('PRAGMA journal_mode=DELETE')
-            if dst.execute('PRAGMA integrity_check').fetchall() != [('ok',)]:
-                raise BackupError('DATABASE_INTEGRITY_FAILED')
+        dst.execute('PRAGMA journal_mode=DELETE')
+        if dst.execute('PRAGMA integrity_check').fetchall() != [('ok',)]:
+            raise BackupError('DATABASE_INTEGRITY_FAILED')
 
 
-def capture(vault, destination):
+def capture(vault, destination, credentials=None, memory_limit=512 * 1024 * 1024):
     """Stable capture across all DBs and files; interrupted operations fail closed."""
     vault, destination = Path(vault), Path(destination)
     before = inventory(vault)
-    audit_before = audit_state(vault / 'broker-audit.sqlite3')
+    audit_before = audit_state(vault / 'broker-audit.sqlite3', credentials)
     if audit_before['pending']:
         raise BackupError('AUDIT_UNFINISHED_OPERATION')
     deadline = time.monotonic() + 20
@@ -193,9 +238,10 @@ def capture(vault, destination):
             continue
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         if name in DATABASES:
-            sqlite_copy(vault / name, path, deadline)
+            sqlite_copy(vault / name, path, deadline, credentials, memory_limit)
         else:
-            fd = os.open(vault / name, os.O_RDONLY | os.O_NOFOLLOW)
+            with source_access(credentials):
+                fd = os.open(vault / name, os.O_RDONLY | os.O_NOFOLLOW)
             opened = os.fstat(fd)
             if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (info['device'], info['inode']):
                 os.close(fd)
@@ -205,7 +251,7 @@ def capture(vault, destination):
         os.chmod(path, 0o600)
         records[name] = dict(info, sha256=digest(path))
     after = inventory(vault)
-    audit_after = audit_state(vault / 'broker-audit.sqlite3')
+    audit_after = audit_state(vault / 'broker-audit.sqlite3', credentials)
     if before != after or audit_before != audit_after:
         raise BackupError('VAULT_CHANGED_DURING_CAPTURE')
     # SQLite backup image must carry the same audit tip as the live stable view.
@@ -224,56 +270,21 @@ def capture(vault, destination):
 
 
 def restricted_capture(cfg, image):
-    """Root orchestrates, but only the vault UID ever reads live secret files.
-
-    SQLite's Python API cannot request SQLITE_OPEN_NOFOLLOW. Dropping privilege
-    before SQLite opens prevents a source-path swap from becoming a root read.
-    The child starts inside its staging dir, hidden behind the root-only parent.
-    """
-    if os.geteuid() != 0:
-        return capture(cfg['vault'], image)
-    uid, gid = cfg['vault_uid'], cfg['vault_gid']
-    try:
-        root = Path(cfg['vault']).lstat()
-    except FileNotFoundError:
-        raise BackupError('VAULT_MISSING') from None
-    if root.st_uid != uid or root.st_gid != gid or uid == 0:
-        raise BackupError('VAULT_OWNER_MISMATCH')
-    os.chown(image, uid, gid)
-    readfd, writefd = os.pipe()
-    pid = os.fork()
-    if pid == 0:
-        os.close(readfd)
+    credentials = None
+    if os.geteuid() == 0:
+        # A sudo-launched process can inherit more directory-service groups
+        # than macOS setgroups permits restoring. This dedicated helper needs
+        # none of them; discard them before entering temporary source scopes.
+        os.setgroups([])
+        uid, gid = cfg['vault_uid'], cfg['vault_gid']
         try:
-            os.chdir(image)
-            os.setgroups([])
-            os.setgid(gid)
-            os.setuid(uid)
-            result = capture(cfg['vault'], Path('.'))
-            atomic_json(Path('.capture-result.json'), result)
-            os.write(writefd, b'OK')
-            os._exit(0)
-        except BaseException as exc:
-            code = str(exc) if isinstance(exc, BackupError) else type(exc).__name__
-            os.write(writefd, code.encode()[:512])
-            os._exit(1)
-    os.close(writefd)
-    try:
-        ready, _, _ = select.select([readfd], [], [], 30)
-        if not ready:
-            os.kill(pid, signal.SIGKILL)
-            os.waitpid(pid, 0)
-            raise BackupError('SNAPSHOT_TIMEOUT')
-        message = os.read(readfd, 512)
-        _, status = os.waitpid(pid, 0)
-        if status != 0 or message != b'OK':
-            raise BackupError(message.decode(errors='replace') or 'CAPTURE_CHILD_FAILED')
-        result = json.loads((image / '.capture-result.json').read_text())
-        (image / '.capture-result.json').unlink()
-        return result
-    finally:
-        os.close(readfd)
-        os.chown(image, 0, 0)
+            root = Path(cfg['vault']).lstat()
+        except FileNotFoundError:
+            raise BackupError('VAULT_MISSING') from None
+        if root.st_uid != uid or root.st_gid != gid or uid == 0:
+            raise BackupError('VAULT_OWNER_MISMATCH')
+        credentials = (uid, gid)
+    return capture(cfg['vault'], image, credentials, cfg.get('snapshot_memory_limit_bytes', 512 * 1024 * 1024))
 
 
 class Backup:
@@ -401,7 +412,7 @@ class Backup:
                             raise BackupError('ESTABLISHED_DATABASE_MISSING')
                         if manifest['fingerprint'] != self.status.get('fingerprint'):
                             archive = stage / 'vault.tar'
-                            with tarfile.open(archive, 'w') as tar:
+                            with tarfile.open(archive, 'w:gz') as tar:
                                 tar.add(image, arcname='vault')
                             encrypted = stage / 'vault.tar.age'
                             run([self.age, '-r', self.cfg['recipient'], '-o', str(encrypted), str(archive)])
@@ -552,7 +563,7 @@ def restore(cfg, revision, destination, *, repo=None):
              '-i', cfg['identity'], '-o', str(archive), str(encrypted)])
         extracted = tmp / 'extracted'
         extracted.mkdir(mode=0o700)
-        with tarfile.open(archive, 'r:') as tar:
+        with tarfile.open(archive, 'r:*') as tar:
             members = tar.getmembers()
             for member in members:
                 p = Path(member.name)

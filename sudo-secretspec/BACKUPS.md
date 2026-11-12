@@ -136,3 +136,13 @@ current external capture protocol detects concurrent changes but is not a
 global transaction lock against arbitrary root writes or filesystem damage.
 An actor able to delete both repositories and their keys can defeat this
 protection; indefinite retention is a policy, not unlimited physical storage.
+
+### Protected capture memory
+
+The privileged helper opens live SQLite sources with the vault service identity,
+materializes one in-memory SQLite image at a time, then writes it to root-only
+staging. The default per-database limit (database plus WAL) is 512 MiB. Exceeding
+it raises `DATABASE_EXCEEDS_MEMORY_SNAPSHOT_LIMIT` and retains the last good
+backup. An operator can raise `snapshot_memory_limit_bytes` in the protected
+backup JSON configuration after checking available RAM. Archives are compressed
+before encryption. No history is pruned to meet a resource limit.
