@@ -21,6 +21,17 @@ sudo-secretspec install                 # prompts / auto-detects when possible
 sudo-secretspec run --reason "start app" -- your-command
 ```
 
+## Vault backup and recovery (0.21.1-sudo.6+, macOS)
+
+Opt-in encrypted Git snapshots preserve the whole vault and its internal
+history outside the live store, with an SSH mirror and indefinite retention.
+The new `sudo-secretspec backup status`, `backup run`, and `backup restore`
+commands expose health, authenticated capture, and isolated recovery.
+`doctor` reports missing or unhealthy protection as advisories. This feature is
+unreleased and requires 0.21.1-sudo.6+; see
+[the backup guide](sudo-secretspec/BACKUPS.md). Setup is explicit, never a
+Homebrew side effect.
+
 ## Where things are documented
 
 | Topic | File |

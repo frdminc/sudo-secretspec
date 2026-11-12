@@ -8,6 +8,17 @@ a single mediated control plane for autonomous local AI/operator use on macOS
 and on Linux (Debian and other non-NixOS systems through the imperative
 installer; NixOS through `services.sudo-secretspec`).
 
+## Independent backups (0.21.1-sudo.6+, macOS)
+
+The opt-in backup service encrypts complete vault snapshots before committing
+them to a dedicated local Git repository and replicating to an SSH mirror.
+Hourly and change-triggered captures retain history indefinitely, independently
+of the live vault. Missing or stale protection appears as advisory `doctor`
+findings and does not disable credential use. The unreleased
+`sudo-secretspec backup status`, `backup run`, and `backup restore` interface
+requires 0.21.1-sudo.6+. See [explicit setup and isolated recovery](BACKUPS.md).
+Package installation never configures this privileged service automatically.
+
 ## Quick start (short forms)
 
 After the binary is available (`brew install` or local build):

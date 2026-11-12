@@ -13,6 +13,24 @@ Use this policy in `AGENTS.md`, skills, runbooks, and autonomous-agent prompts f
 - Report only the non-secret error and request operator action for boundary installation or repair.
 - Normal broker-mediated credential operations are autonomous when the installed sudoers policy allows them.
 
+## Backup operations (0.21.1-sudo.6+, macOS)
+
+The unreleased `sudo-secretspec backup status` command reads only the protected
+non-secret health summary. Report backup advisories from `doctor` to the
+operator and continue otherwise healthy credential operations. Never treat
+`BACKUP_NOT_CONFIGURED`, `BACKUP_UNHEALTHY`, `BACKUP_STALE`, or
+`BACKUP_REPLICATION_STALE` as authority to install, decrypt, restore, or change
+permissions autonomously; inspect the `advisory` field as with other findings.
+
+Backup setup, `sudo-secretspec backup run`, and `sudo-secretspec backup restore`
+(0.21.1-sudo.6+) require explicit operator authorization and administrator
+authentication. Authorized recovery uses an isolated destination first and
+never promotes it automatically into the live vault. The dedicated recovery
+keys stay outside the vault and Git; never print them or plaintext recovered
+values. The backing-file prohibition below applies to routine credential use,
+not to explicitly authorized backup/recovery through the installed helper.
+See [the backup guide](BACKUPS.md) for setup, retention, and recovery boundaries.
+
 ## Forbidden behavior
 
 Never:

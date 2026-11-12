@@ -1,0 +1,29 @@
+name: sudo-secretspec backup checks
+
+on:
+  push:
+    branches: [sudo-main]
+    paths:
+      - 'sudo-secretspec/backup/**'
+      - 'sudo-secretspec-cli/**'
+      - 'Cargo.lock'
+      - '.github/workflows/sudo-backup.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install backup test tools
+        run: sudo apt-get update && sudo apt-get install -y age libsqlite3-dev pkg-config
+      - name: Test encrypted capture, history, restore, and event parsing
+        run: python3 -m unittest discover -s sudo-secretspec/backup -p 'test_*.py' -v
+      - name: Test companion CLI and doctor integration
+        run: cargo test --locked -p sudo-secretspec-cli

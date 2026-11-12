@@ -126,6 +126,10 @@ const ADVISORY_CODES: &[&str] = &[
     "SUDOERS_NEIGHBOUR_SKIPPED",
     "SUDOERS_NEIGHBOUR_VISUDO_REJECTED",
     "UPGRADE_AVAILABLE",
+    "BACKUP_NOT_CONFIGURED",
+    "BACKUP_UNHEALTHY",
+    "BACKUP_STALE",
+    "BACKUP_REPLICATION_STALE",
 ];
 
 /// Where a package manager keeps the bootstrap copy of the boundary.
@@ -1381,7 +1385,23 @@ pub fn inspect_for_host(host: Host, layout: &Layout, opts: &InspectOptions) -> R
         ));
     }
 
+    if backup_health_is_for_layout(host, layout) {
+        findings.extend(crate::backup::findings(
+            crate::backup::read_health(),
+            time::OffsetDateTime::now_utc(),
+        ));
+    }
     Report::from_findings(findings)
+}
+
+/// Backup health belongs to the canonical macOS installation, not to whichever
+/// alternate config or isolated test vault a caller is inspecting. In
+/// particular, a fixture must never read health from the machine running CI.
+fn backup_health_is_for_layout(host: Host, layout: &Layout) -> bool {
+    host == Host::MacOs
+        && layout.config == Path::new("/usr/local/etc/sudo-secretspec.toml")
+        && layout.client == Path::new("/usr/local/bin/sudo-secretspec")
+        && layout.broker == Path::new("/usr/local/libexec/sudo-secretspec")
 }
 
 #[cfg(test)]
@@ -1600,6 +1620,21 @@ service_group = "{group}"
             adopted_vault: false,
             installed_version: None,
         }
+    }
+
+    #[test]
+    fn backup_health_is_not_read_for_custom_or_fixture_layouts() {
+        let tmp = tempdir().unwrap();
+        let mut layout = layout_for_vault(tmp.path(), &tmp.path().join("vault"));
+        assert!(!backup_health_is_for_layout(Host::MacOs, &layout));
+        layout.config = "/usr/local/etc/sudo-secretspec.toml".into();
+        layout.client = "/usr/local/bin/sudo-secretspec".into();
+        layout.broker = "/usr/local/libexec/sudo-secretspec".into();
+        assert!(backup_health_is_for_layout(Host::MacOs, &layout));
+        assert!(!backup_health_is_for_layout(Host::Linux, &layout));
+        assert!(!backup_health_is_for_layout(Host::NixOs, &layout));
+        layout.config = tmp.path().join("alternate.toml");
+        assert!(!backup_health_is_for_layout(Host::MacOs, &layout));
     }
 
     fn findings_for<'a>(report: &'a Report, path: &Path) -> Vec<&'a str> {

@@ -24,6 +24,15 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Cmd {
+    /// Encrypted whole-vault backup status, capture, and isolated recovery (0.21.1-sudo.6+, macOS).
+    ///
+    /// Requires explicit backup setup; installing the package never creates keys,
+    /// schedules a backup, or provisions a remote mirror. Backup failures are
+    /// advisory in doctor and do not disable normal credential access.
+    Backup {
+        #[command(subcommand)]
+        command: BackupCmd,
+    },
     /// Declare a new secret in the runtime manifest.
     ///
     /// Creates the declaration only; it assigns no value. Follow with `set`.
@@ -237,6 +246,22 @@ enum Cmd {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum BackupCmd {
+    /// Read the root-owned health summary without opening the vault (0.21.1-sudo.6+).
+    Status,
+    /// Capture and replicate a validated snapshot; requires sudo authentication (0.21.1-sudo.6+).
+    Run,
+    /// Decrypt one full commit into a new isolated directory; requires sudo (0.21.1-sudo.6+).
+    ///
+    /// Never overwrites the live vault. Validate the isolated restore before an
+    /// operator promotes it. COMMIT must be the full 40-character Git object ID.
+    Restore {
+        commit: String,
+        destination: PathBuf,
+    },
+}
+
 /// True when this process is the installed privileged broker, i.e. it was
 /// reached through the NOPASSWD sudoers rule rather than the public client.
 ///
@@ -281,6 +306,7 @@ fn main() {
     }
 
     match cli.cmd {
+        Cmd::Backup { command } => backup_command(command),
         Cmd::Add {
             name,
             description,
@@ -395,6 +421,109 @@ fn main() {
                     std::process::exit(2);
                 }
             }
+        }
+    }
+}
+
+fn backup_command(command: BackupCmd) {
+    use sudo_secretspec_cli::backup;
+    if platform::host() != platform::Host::MacOs {
+        eprintln!(
+            "sudo-secretspec backup: automated backup integration currently supports macOS only (0.21.1-sudo.6+)"
+        );
+        std::process::exit(2);
+    }
+    if matches!(command, BackupCmd::Status) {
+        match backup::read_health() {
+            Ok(health) => {
+                // Serialize the typed allowlist, never the original JSON: unknown
+                // fields such as plaintext fingerprints must not be disclosed.
+                println!("{}", serde_json::to_string_pretty(&health).unwrap());
+                let findings = backup::findings(Ok(health), time::OffsetDateTime::now_utc());
+                if !findings.is_empty() {
+                    for finding in &findings {
+                        print_finding("advisory", finding);
+                    }
+                    std::process::exit(1);
+                }
+                return;
+            }
+            Err(error) => {
+                for finding in backup::findings(Err(error), time::OffsetDateTime::now_utc()) {
+                    print_finding("advisory", &finding);
+                }
+                std::process::exit(1);
+            }
+        }
+    }
+    let mut helper_args = Vec::<OsString>::new();
+    let mut public_args = vec![OsString::from("backup")];
+    match command {
+        BackupCmd::Run => {
+            helper_args.push("once".into());
+            public_args.push("run".into());
+        }
+        BackupCmd::Restore {
+            commit,
+            destination,
+        } => {
+            if !backup::valid_commit(&commit)
+                || !destination.is_absolute()
+                || destination
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                eprintln!(
+                    "backup restore requires a full lowercase commit ID and an absolute isolated destination"
+                );
+                std::process::exit(2);
+            }
+            public_args.extend([
+                "restore".into(),
+                commit.clone().into(),
+                destination.clone().into_os_string(),
+            ]);
+            helper_args.extend([
+                "restore".into(),
+                commit.into(),
+                destination.into_os_string(),
+            ]);
+        }
+        BackupCmd::Status => unreachable!(),
+    }
+    if unsafe { libc::geteuid() } != 0 {
+        let status = Command::new(SUDO)
+            .arg("-k")
+            .arg(self_exe())
+            .args(public_args)
+            .status();
+        match status {
+            Ok(s) => std::process::exit(s.code().unwrap_or(1)),
+            Err(_) => {
+                eprintln!("cannot authenticate backup operation");
+                std::process::exit(2);
+            }
+        }
+    }
+    if let Err(message) = backup::validate_helper_installation() {
+        eprintln!("backup unavailable: {message}");
+        std::process::exit(2);
+    }
+    let status = Command::new("/usr/bin/python3")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("HOME", "/var/root")
+        .arg("-I")
+        .arg(backup::HELPER_PATH)
+        .arg("--config")
+        .arg(backup::CONFIG_PATH)
+        .args(helper_args)
+        .status();
+    match status {
+        Ok(s) => std::process::exit(s.code().unwrap_or(1)),
+        Err(_) => {
+            eprintln!("cannot execute installed backup helper");
+            std::process::exit(2);
         }
     }
 }

@@ -15,8 +15,8 @@ consumer execution. Do not access SecretSpec's provider, manifest, or protected
 backing files directly, and never invoke `secretspec` itself for a managed
 deployment.
 
-Platforms: macOS and Linux. The client commands are the same on both; only the
-install layout differs (Linux client `/usr/bin/sudo-secretspec`, broker
+Platforms: macOS and Linux. Credential commands are the same on both; the
+optional backup integration (0.21.1-sudo.6+) is macOS-only. The install layout differs (Linux client `/usr/bin/sudo-secretspec`, broker
 `/usr/libexec/sudo-secretspec`; NixOS declares the boundary with
 `services.sudo-secretspec` and refuses `install`/`uninstall`/`rollback`/
 `doctor`). Where this file says Touch ID or macOS paths, read "the operator's
@@ -27,6 +27,21 @@ authority; if it reports something newer, re-read
 `sudo-secretspec/AI-GUIDANCE.md` rather than trusting this file's specifics.
 If it reports something *older*, the flags marked with a minimum version below
 will be rejected by your client — check `--help` before assuming a flag exists.
+
+## Independent backups (0.21.1-sudo.6+, macOS)
+
+This unreleased companion feature adds `sudo-secretspec backup status` for a
+non-secret health report, and authenticated `sudo-secretspec backup run` and
+`sudo-secretspec backup restore` for operator-authorized capture and isolated
+recovery. It is macOS-only; ordinary credential commands still support Linux.
+Read [the backup guide](../../sudo-secretspec/BACKUPS.md) before setup/recovery.
+
+Missing, unhealthy, stale, or unreplicated backups are advisory `doctor`
+findings. Report them, but do not stop otherwise healthy credential operations.
+Never use an advisory as permission to install services, decrypt backups,
+repair a vault, or alter keys. Setup and recovery require explicit operator
+authorization. Keep recovery keys outside the vault and Git, and never print
+plaintext backup contents. A successful push is not a verified restore.
 
 ## When to Use
 

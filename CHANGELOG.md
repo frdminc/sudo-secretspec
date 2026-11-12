@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `sudo-secretspec backup` (0.21.1-sudo.6+, macOS) adds opt-in encrypted
+  whole-vault Git history, an SSH mirror, health reporting, authenticated
+  capture, and isolated recovery. `doctor` warns when backup protection is
+  missing, unhealthy, stale, or unreplicated without blocking credential use.
+  Privileged backup setup and recovery remain explicit operator actions.
+
 - `install` now warns on stderr when it adopts an existing vault whose
   `secretspec.toml` differs from the declarations being installed: the runtime
   manifest is kept, the new declarations are not merged, and `template-check`

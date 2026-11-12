@@ -1,4 +1,5 @@
 pub mod audit;
+pub mod backup;
 pub mod broker;
 pub mod config;
 pub mod drift;

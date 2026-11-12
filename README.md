@@ -29,6 +29,16 @@ upstream documentation carry a `0.22+` label even though this fork is stamped
 `secretspec` CLI reference, is kept unchanged in this tree at
 [`secretspec/README.md`](secretspec/README.md).
 
+## Independent encrypted backups (0.21.1-sudo.6+, macOS)
+
+The downstream companion adds opt-in whole-vault backups with encrypted local
+Git history, an append-only SSH mirror, hourly and filesystem-change capture,
+and isolated restore commands. `sudo-secretspec doctor` reports missing,
+unhealthy, or stale backup protection as advisory warnings. Installing the
+package never enables backups or creates recovery keys. See
+[backup setup, health, and recovery](sudo-secretspec/BACKUPS.md) for this
+unreleased feature and `sudo-secretspec backup --help` (0.21.1-sudo.6+).
+
 ## Install
 
 macOS, through the Homebrew tap (the bottle is built on a GitHub macOS runner):

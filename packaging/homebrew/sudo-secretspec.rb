@@ -26,6 +26,7 @@ class SudoSecretspec < Formula
   # dependency, not just a build one: declaring it `=> :build` would let
   # Homebrew remove sqlite and leave an installed binary that cannot start.
   depends_on "sqlite"
+  depends_on "age"
 
   def install
     system "cargo", "install", "--locked", "--root", prefix, "--path", "secretspec"
@@ -43,6 +44,9 @@ class SudoSecretspec < Formula
     (share/"sudo-secretspec").install "sudo-secretspec/AI-GUIDANCE.md"
     (share/"sudo-secretspec").install "sudo-secretspec/sudo-secretspec-retired.toml"
     (share/"sudo-secretspec/skills/sudo-secretspec").install "skills/sudo-secretspec/SKILL.md"
+    (share/"sudo-secretspec").install "sudo-secretspec/BACKUPS.md"
+    (share/"sudo-secretspec/backup").install "sudo-secretspec/backup/backup.py",
+      "sudo-secretspec/backup/observer.py", "sudo-secretspec/backup/install.py"
   end
 
   def caveats

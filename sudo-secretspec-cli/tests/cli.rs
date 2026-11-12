@@ -61,9 +61,57 @@ fn help_exposes_typed_boundary_commands() {
         "uninstall",
         "doctor",
         "rollback",
+        "backup",
     ] {
         assert!(stdout.contains(command), "missing {command}");
     }
+}
+
+#[test]
+fn backup_help_describes_privilege_and_restore_boundary() {
+    let output = binary().args(["backup", "--help"]).output().unwrap();
+    assert!(output.status.success());
+    let help = String::from_utf8(output.stdout).unwrap();
+    for text in [
+        "status",
+        "run",
+        "restore",
+        "0.21.1-sudo.6",
+        "explicit backup setup",
+    ] {
+        assert!(help.contains(text), "missing {text}: {help}");
+    }
+    let output = binary()
+        .args(["backup", "restore", "--help"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("Never overwrites the live vault")
+    );
+}
+
+#[test]
+fn backup_commands_reject_control_plane_overrides() {
+    for args in [
+        vec!["backup", "run", "--config", "/tmp/untrusted"],
+        vec!["backup", "run", "--helper", "/tmp/untrusted"],
+        vec!["backup", "restore", "--repo", "/tmp/untrusted"],
+    ] {
+        let output = binary().args(args).output().unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument"));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn unsupported_backup_platform_is_explicit_and_never_elevates() {
+    let output = binary().args(["backup", "status"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("macOS only"));
 }
 
 #[test]
