@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   capture, and isolated recovery. `doctor` warns when backup protection is
   missing, unhealthy, stale, or unreplicated without blocking credential use.
   Privileged backup setup and recovery remain explicit operator actions.
+  Explicit offline recovery preserves historical interrupted audit attempts
+  without inventing outcomes; backups warn about that history and reject new
+  unfinished operations.
 
 - `install` now warns on stderr when it adopts an existing vault whose
   `secretspec.toml` differs from the declarations being installed: the runtime

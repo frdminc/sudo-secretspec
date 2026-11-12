@@ -46,6 +46,21 @@ def activate(label, target):
         time.sleep(1)
 
 
+def verify_observer_health(path, previous_mtime):
+    # An interactive benchmark may inherit Full Disk Access that launchd lacks.
+    # Require a fresh daemon health record before reporting activation success.
+    time.sleep(2)
+    for _ in range(10):
+        if path.exists() and path.stat().st_mtime_ns != previous_mtime:
+            report = json.loads(path.read_text())
+            if report.get('errors') or report.get('status') in ('failed', 'unavailable', 'stopped', 'degraded'):
+                raise RuntimeError('observer unavailable in launchd context; check Full Disk Access and observer health')
+            if report.get('status') in ('observing', 'waiting_for_events'):
+                return
+        time.sleep(1)
+    raise RuntimeError('observer did not publish fresh running health')
+
+
 def write(path, data, mode=0o600):
     if path.is_symlink():
         raise RuntimeError('refusing symlink destination')
@@ -205,6 +220,13 @@ def main():
                expected_databases=['secrets.db','broker-audit.sqlite3','broker-history.sqlite3'],
                notify_argv=['/bin/launchctl','asuser',str(user.pw_uid),'/usr/bin/sudo','-u',args.operator,
                    '/usr/bin/osascript','-e','on run argv\ndisplay notification (item 1 of argv) with title "Vault backup"\nend run'])
+    if CONFIG.exists():
+        validate_key(CONFIG)
+        prior_config = json.loads(CONFIG.read_text())
+        # Explicit offline-recovery evidence must survive service upgrades.
+        # Never derive or advance this acknowledgement from the live vault.
+        if 'audit_anchor' in prior_config:
+            cfg['audit_anchor'] = prior_config['audit_anchor']
     write(CONFIG, (json.dumps(cfg, indent=2) + '\n').encode())
     logs = STATE / 'logs'
     directory(logs)
@@ -232,7 +254,16 @@ def main():
             StandardOutPath=str(logs / 'observer.log'), StandardErrorPath=str(logs / 'observer-error.log'))
         observer_target = Path('/Library/LaunchDaemons') / (observer_label + '.plist')
         write(observer_target, plistlib.dumps(observer_plist), 0o644)
+        health = STATE / 'observer/health.json'
+        previous_mtime = health.stat().st_mtime_ns if health.exists() else None
         activate(observer_label, observer_target)
+        try:
+            verify_observer_health(health, previous_mtime)
+        except (RuntimeError, OSError, ValueError):
+            subprocess.run(['/bin/launchctl', 'bootout', 'system/' + observer_label],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            observer_target.unlink()
+            raise
     print(json.dumps({'installed': True, 'activated': args.activate, 'remote_key_decryption_verified': True,
                       'observer': 'enabled' if args.enable_observer else 'not enabled: benchmark and Full Disk Access required'}))
 

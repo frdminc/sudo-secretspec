@@ -73,6 +73,25 @@ class CaptureTests(unittest.TestCase):
         second = backup.capture(self.vault, second_image)
         self.assertNotEqual(first['fingerprint'], second['fingerprint'])
 
+    def test_large_unindexed_audit_pending_scan_is_bounded(self):
+        path = self.root / 'large-audit.db'
+        audit_fixture(path)
+        with sqlite3.connect(path) as db:
+            rows = [(i * 2 + offset, str(i), phase) for i in range(10000)
+                    for offset, phase in ((1, 'attempt'), (2, 'success'))]
+            db.executemany('INSERT INTO events(sequence,transaction_id,phase) VALUES (?,?,?)', rows)
+        original = backup.open_db
+        steps = [0]
+        def bounded_open(source):
+            db = original(source)
+            def progress():
+                steps[0] += 1
+                return steps[0] > 1000
+            db.set_progress_handler(progress, 1000)
+            return db
+        with patch.object(backup, 'open_db', bounded_open):
+            self.assertEqual(backup.audit_state(path)['pending'], 0)
+
     def test_capture_preserves_three_databases_and_files(self):
         with sqlite3.connect(self.vault / 'broker-history.sqlite3') as db:
             db.execute('CREATE TABLE history (manifest BLOB)')
@@ -98,6 +117,90 @@ class CaptureTests(unittest.TestCase):
         with self.assertRaisesRegex(backup.BackupError, 'AUDIT_UNFINISHED_OPERATION'):
             backup.capture(self.vault, self.image)
         self.assertEqual(backup.audit_state(self.vault / 'broker-audit.sqlite3')['pending'], 1)
+
+    def test_offline_anchor_accepts_exact_history_without_modifying_audit(self):
+        ledger = self.vault / 'broker-audit.sqlite3'
+        append_event(ledger, 'attempt', str(uuid.uuid4()))
+        original = backup.digest(ledger)
+        anchor = backup.build_offline_anchor(self.vault)
+        self.assertEqual(anchor['format'], 1)
+        self.assertEqual(len(anchor['pending']), 1)
+        result = backup.capture(self.vault, self.image, historical_anchor=anchor)
+        self.assertEqual(result['historical_anchor'], anchor)
+        self.assertEqual(result['audit']['pending'], 1)
+        self.assertEqual(json.loads((self.image / 'backup-manifest.json').read_text())['historical_anchor'], anchor)
+        self.assertEqual(backup.digest(ledger), original)
+        backup.verify_audit(self.image / 'broker-audit.sqlite3')
+
+    def test_historical_anchor_does_not_accept_new_pending(self):
+        ledger = self.vault / 'broker-audit.sqlite3'
+        append_event(ledger, 'attempt', str(uuid.uuid4()))
+        anchor = backup.build_offline_anchor(self.vault)
+        append_event(ledger, 'attempt', str(uuid.uuid4()))
+        with self.assertRaisesRegex(backup.BackupError, 'AUDIT_NEW_UNFINISHED_OPERATION'):
+            backup.capture(self.vault, self.image, historical_anchor=anchor)
+        self.assertEqual(backup.audit_state(ledger)['pending'], 2)
+
+    def test_historical_anchor_rejects_reused_transaction_with_new_sequence(self):
+        ledger = self.vault / 'broker-audit.sqlite3'
+        tx = str(uuid.uuid4())
+        append_event(ledger, 'attempt', tx)
+        anchor = backup.build_offline_anchor(self.vault)
+        append_event(ledger, 'attempt', tx)
+        with self.assertRaisesRegex(backup.BackupError, 'AUDIT_NEW_UNFINISHED_OPERATION'):
+            backup.capture(self.vault, self.image, historical_anchor=anchor)
+
+    def test_historical_anchor_rejects_rewritten_valid_prefix(self):
+        ledger = self.vault / 'broker-audit.sqlite3'
+        append_event(ledger, 'attempt', str(uuid.uuid4()))
+        anchor = backup.build_offline_anchor(self.vault)
+        with sqlite3.connect(ledger) as db:
+            db.execute('DELETE FROM events')
+            db.execute('DELETE FROM head')
+        tx = str(uuid.uuid4())
+        append_event(ledger, 'attempt', tx)
+        append_event(ledger, 'success', tx)
+        append_event(ledger, 'attempt', str(uuid.uuid4()))
+        backup.verify_audit(ledger)  # Internally valid, but a DIFFERENT prefix.
+        with self.assertRaisesRegex(backup.BackupError, 'AUDIT_ANCHOR_PREFIX_MISMATCH'):
+            backup.capture(self.vault, self.image, historical_anchor=anchor)
+
+    def test_historical_anchor_still_checks_full_chain(self):
+        ledger = self.vault / 'broker-audit.sqlite3'
+        append_event(ledger, 'attempt', str(uuid.uuid4()))
+        anchor = backup.build_offline_anchor(self.vault)
+        with sqlite3.connect(ledger) as db:
+            db.execute("UPDATE events SET client='tampered' WHERE sequence=1")
+        # Stored anchor-row hash still matches; full-chain validation must fail.
+        with self.assertRaisesRegex(backup.BackupError, 'AUDIT_CHAIN_INVALID'):
+            backup.capture(self.vault, self.image, historical_anchor=anchor)
+
+    def test_historical_anchor_allows_later_completed_attempt(self):
+        ledger = self.vault / 'broker-audit.sqlite3'
+        tx = str(uuid.uuid4())
+        append_event(ledger, 'attempt', tx)
+        anchor = backup.build_offline_anchor(self.vault)
+        append_event(ledger, 'unknown', tx)
+        result = backup.capture(self.vault, self.image, historical_anchor=anchor)
+        self.assertEqual(result['audit']['pending'], 0)
+        self.assertEqual(result['historical_anchor'], anchor)
+
+    def test_anchor_schema_rejects_duplicates_or_unanchored_event(self):
+        ledger = self.vault / 'broker-audit.sqlite3'
+        append_event(ledger, 'attempt', str(uuid.uuid4()))
+        anchor = backup.build_offline_anchor(self.vault)
+        for invalid in [dict(anchor, pending=anchor['pending'] * 2),
+                        dict(anchor, head=[1, anchor['head'][1]]),
+                        dict(anchor, format=True)]:
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(backup.BackupError, 'AUDIT_ANCHOR_INVALID'):
+                backup.anchor_identities(invalid)
+
+    def test_anchor_file_beneath_writable_parent_is_refused(self):
+        path = self.root / 'anchor.json'
+        path.write_text(json.dumps({'format': 1, 'head': [0, '0' * 64], 'pending': []}))
+        os.chmod(path, 0o600)
+        with self.assertRaisesRegex(backup.BackupError, 'AUDIT_ANCHOR_PARENT_UNPROTECTED'):
+            backup.load_audit_anchor(path)
 
     def test_tampered_chain_rejected(self):
         with sqlite3.connect(self.vault / 'broker-audit.sqlite3') as db:
@@ -198,6 +301,26 @@ class EncryptionHistoryTests(CaptureTests):
                 backup.restore(self.cfg, revision, dest, repo=source)
                 with sqlite3.connect(dest / 'secrets.db') as db:
                     self.assertEqual(db.execute('SELECT value FROM secrets').fetchone()[0], expected)
+
+    def test_historical_anchor_is_encrypted_and_restores_from_both_repositories(self):
+        ledger = self.vault / 'broker-audit.sqlite3'
+        append_event(ledger, 'attempt', str(uuid.uuid4()))
+        anchor = backup.build_offline_anchor(self.vault)
+        self.cfg['audit_anchor'] = '/root-protected/anchor.json'
+        self.cfg['health_file'] = str(self.root / 'health.json')
+        with patch.object(backup, 'load_audit_anchor', return_value=anchor) as load:
+            self.assertTrue(self.b.once())
+            load.assert_called_once_with(self.cfg['audit_anchor'])
+        public = json.loads((self.root / 'health.json').read_text())
+        self.assertEqual(public['historical_pending_count'], 1)
+        self.assertNotIn('pending_attempts', public)
+        self.assertNotIn('historical_anchor', public)
+        self.assertNotIn(anchor['pending'][0][1], json.dumps(public))
+        for index, source in enumerate((self.b.repo, self.remote)):
+            restored = self.root / ('historical-restore-' + str(index))
+            backup.restore(self.cfg, self.b.status['commit'], restored, repo=source)
+            self.assertEqual(backup.audit_state(restored / 'broker-audit.sqlite3')['pending'], 1)
+            backup.verify_audit(restored / 'broker-audit.sqlite3')
 
     def test_remote_outage_keeps_local_snapshot_and_retries(self):
         self.b.cfg['remote'] = str(self.root / 'unavailable.git')

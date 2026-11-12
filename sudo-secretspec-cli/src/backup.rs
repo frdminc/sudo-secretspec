@@ -28,6 +28,10 @@ pub struct Health {
     pub mirrored_commit: Option<String>,
     pub capture_error: Option<String>,
     pub mirror_error: Option<String>,
+    /// Previously interrupted attempts preserved by an explicit recovery anchor.
+    /// Omitted by older helper health records; never inferred from an event's age.
+    #[serde(default)]
+    pub historical_pending_count: u64,
 }
 
 #[derive(Debug)]
@@ -187,6 +191,12 @@ pub fn findings(health: Result<Health, HealthError>, now: OffsetDateTime) -> Vec
             "the mirror has not recently verified the current local backup commit",
         );
     }
+    if health.historical_pending_count > 0 {
+        add(
+            "BACKUP_HISTORICAL_UNRESOLVED",
+            "backup preserves explicitly anchored historical audit attempts with unknown outcomes; these do not indicate active transactions or audit corruption",
+        );
+    }
     result
 }
 
@@ -206,6 +216,7 @@ mod tests {
             mirrored_commit: Some("a".repeat(40)),
             capture_error: None,
             mirror_error: None,
+            historical_pending_count: 0,
         }
     }
     fn now() -> OffsetDateTime {
@@ -220,6 +231,32 @@ mod tests {
     #[test]
     fn unchanged_old_snapshot_with_recent_check_is_healthy() {
         assert!(findings(Ok(healthy()), now()).is_empty());
+    }
+    #[test]
+    fn anchored_historical_attempts_are_informational_not_a_backup_failure() {
+        let mut health = healthy();
+        health.historical_pending_count = 8254;
+        let result = findings(Ok(health), now());
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].code, "BACKUP_HISTORICAL_UNRESOLVED");
+        assert!(result[0].advisory);
+        assert!(result[0].detail.contains("unknown outcomes"));
+        assert!(
+            result[0]
+                .detail
+                .contains("do not indicate active transactions")
+        );
+    }
+    #[test]
+    fn old_health_records_default_to_no_anchored_historical_attempts() {
+        let mut value = serde_json::to_value(healthy()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("historical_pending_count");
+        let health: Health = serde_json::from_value(value).unwrap();
+        assert_eq!(health.historical_pending_count, 0);
+        assert!(findings(Ok(health), now()).is_empty());
     }
     #[test]
     fn stale_checks_and_mismatched_mirror_are_distinct() {

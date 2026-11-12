@@ -130,6 +130,7 @@ const ADVISORY_CODES: &[&str] = &[
     "BACKUP_UNHEALTHY",
     "BACKUP_STALE",
     "BACKUP_REPLICATION_STALE",
+    "BACKUP_HISTORICAL_UNRESOLVED",
 ];
 
 /// Where a package manager keeps the bootstrap copy of the boundary.

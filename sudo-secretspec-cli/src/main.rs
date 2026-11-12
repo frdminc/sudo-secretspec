@@ -440,10 +440,10 @@ fn backup_command(command: BackupCmd) {
                 // fields such as plaintext fingerprints must not be disclosed.
                 println!("{}", serde_json::to_string_pretty(&health).unwrap());
                 let findings = backup::findings(Ok(health), time::OffsetDateTime::now_utc());
-                if !findings.is_empty() {
-                    for finding in &findings {
-                        print_finding("advisory", finding);
-                    }
+                for finding in &findings {
+                    print_finding("advisory", finding);
+                }
+                if backup_status_needs_attention(&findings) {
                     std::process::exit(1);
                 }
                 return;
@@ -526,6 +526,12 @@ fn backup_command(command: BackupCmd) {
             std::process::exit(2);
         }
     }
+}
+
+fn backup_status_needs_attention(findings: &[sudo_secretspec_cli::Finding]) -> bool {
+    findings
+        .iter()
+        .any(|finding| finding.code != "BACKUP_HISTORICAL_UNRESOLVED")
 }
 
 /// NixOS owns its boundary declaratively; macOS and ordinary Linux use the
@@ -1528,6 +1534,27 @@ fn print_finding(label: &str, finding: &sudo_secretspec_cli::Finding) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn historical_backup_advisory_does_not_fail_status() {
+        let historical = sudo_secretspec_cli::Finding {
+            code: "BACKUP_HISTORICAL_UNRESOLVED".into(),
+            detail: "preserved historical unknown outcomes".into(),
+            path: None,
+            advisory: true,
+        };
+        assert!(!backup_status_needs_attention(&[]));
+        assert!(!backup_status_needs_attention(std::slice::from_ref(
+            &historical
+        )));
+        let failure = sudo_secretspec_cli::Finding {
+            code: "BACKUP_UNHEALTHY".into(),
+            detail: "capture failed".into(),
+            path: None,
+            advisory: true,
+        };
+        assert!(backup_status_needs_attention(&[historical, failure]));
+    }
 
     #[test]
     fn all_without_force_still_uses_the_auth_gated_verb() {

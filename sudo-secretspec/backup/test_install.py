@@ -7,11 +7,24 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import install
 
 
 class RemoteSetupTests(unittest.TestCase):
+    @patch('install.time.sleep')
+    def test_observer_needs_fresh_launchd_health(self, sleep):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'health.json'
+            path.write_text(json.dumps({'status': 'observing', 'errors': []}))
+            install.verify_observer_health(path, None)
+            with self.assertRaisesRegex(RuntimeError, 'fresh running health'):
+                install.verify_observer_health(path, path.stat().st_mtime_ns)
+            path.write_text(json.dumps({'status': 'failed', 'errors': ['permission_or_full_disk_access']}))
+            with self.assertRaisesRegex(RuntimeError, 'launchd context'):
+                install.verify_observer_health(path, None)
+
     def test_remote_setup_idempotency_and_forced_command(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)

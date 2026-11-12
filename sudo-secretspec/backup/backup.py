@@ -147,17 +147,123 @@ def open_db(path):
 
 def audit_state(path, credentials=None):
     with source_access(credentials), contextlib.closing(open_db(path)) as db:
-        # Filled from the product's actual schema; explicit columns fail closed
-        # if a future version changes the recovery contract.
+        # Head and pending identities must describe one SQLite read snapshot.
+        db.execute('BEGIN')
         heads = db.execute('SELECT sequence, event_hash FROM head').fetchall()
         if len(heads) > 1:
             raise BackupError('AUDIT_HEAD_INVALID')
         head = heads[0] if heads else None
-        pending = db.execute("SELECT count(*) FROM events a WHERE a.phase = 'attempt' "
-                             "AND NOT EXISTS (SELECT 1 FROM events t "
-                             "WHERE t.transaction_id = a.transaction_id "
-                             "AND t.phase IN ('success','failure','unknown'))").fetchone()[0]
-        return {'head': list(head) if head else None, 'pending': pending}
+        # Group once: deployed ledgers do not necessarily index transaction_id.
+        # IN materializes the pending set instead of running a correlated scan
+        # for each attempt (which was quadratic on large historical ledgers).
+        rows = db.execute("SELECT sequence, transaction_id, event_hash FROM events "
+                          "WHERE phase = 'attempt' AND transaction_id IN ("
+                          "SELECT transaction_id FROM events GROUP BY transaction_id "
+                          "HAVING max(phase = 'attempt') = 1 "
+                          "AND max(phase IN ('success','failure','unknown')) = 0) "
+                          "ORDER BY sequence").fetchall()
+        return {'head': list(head) if head else None, 'pending': len(rows),
+                'pending_attempts': [list(row) for row in rows]}
+
+
+def anchor_identities(anchor):
+    """Validate external recovery metadata; never derive exceptions from age."""
+    def hash_ok(value):
+        return isinstance(value, str) and len(value) == 64 and all(
+            c in '0123456789abcdef' for c in value)
+
+    if not isinstance(anchor, dict) or type(anchor.get('format')) is not int or anchor['format'] != 1:
+        raise BackupError('AUDIT_ANCHOR_INVALID')
+    head, pending = anchor.get('head'), anchor.get('pending')
+    if (not isinstance(head, list) or len(head) != 2 or type(head[0]) is not int
+            or head[0] < 0 or not hash_ok(head[1]) or not isinstance(pending, list)):
+        raise BackupError('AUDIT_ANCHOR_INVALID')
+    if head[0] == 0 and (head[1] != '0' * 64 or pending):
+        raise BackupError('AUDIT_ANCHOR_INVALID')
+    identities = set()
+    sequences = set()
+    for event in pending:
+        if (not isinstance(event, list) or len(event) != 3 or type(event[0]) is not int
+                or not 0 < event[0] <= head[0] or not isinstance(event[1], str)
+                or not hash_ok(event[2])):
+            raise BackupError('AUDIT_ANCHOR_INVALID')
+        try:
+            if str(uuid.UUID(event[1])) != event[1]:
+                raise ValueError('noncanonical UUID')
+        except ValueError:
+            raise BackupError('AUDIT_ANCHOR_INVALID') from None
+        if event[0] in sequences:
+            raise BackupError('AUDIT_ANCHOR_INVALID')
+        sequences.add(event[0])
+        identities.add(tuple(event))
+    return identities
+
+
+def check_historical_pending(path, state, anchor=None, credentials=None):
+    """Only exact offline-acknowledged attempts may remain unterminated.
+
+    A matching anchor row alone is not proof of an intact prefix: callers must
+    ALSO run verify_audit on the captured image before accepting it.
+    """
+    if anchor is None:
+        if state['pending']:
+            raise BackupError('AUDIT_UNFINISHED_OPERATION')
+        return
+    allowed = anchor_identities(anchor)
+    sequence, expected_hash = anchor['head']
+    if sequence:
+        with source_access(credentials), contextlib.closing(open_db(path)) as db:
+            row = db.execute('SELECT event_hash FROM events WHERE sequence = ?', (sequence,)).fetchone()
+        if row != (expected_hash,):
+            raise BackupError('AUDIT_ANCHOR_PREFIX_MISMATCH')
+    if not set(map(tuple, state['pending_attempts'])).issubset(allowed):
+        raise BackupError('AUDIT_NEW_UNFINISHED_OPERATION')
+
+
+def build_offline_anchor(vault):
+    """Explicit recovery utility, ONLY for a protected offline recovery image.
+
+    Never called by live capture. This records honest incomplete audit history;
+    it does not reconcile outcomes or modify a single audit byte.
+    """
+    path = Path(vault) / 'broker-audit.sqlite3'
+    before = audit_state(path)
+    verify_audit(path)
+    after = audit_state(path)
+    if before != after:
+        raise BackupError('AUDIT_CHANGED_DURING_ANCHOR')
+    anchor = {'format': 1, 'head': before['head'] or [0, '0' * 64],
+              'pending': before['pending_attempts']}
+    anchor_identities(anchor)
+    return anchor
+
+
+def load_audit_anchor(path):
+    """Read only root-controlled, bounded recovery metadata outside the vault."""
+    path = Path(path)
+    if not path.is_absolute():
+        raise BackupError('AUDIT_ANCHOR_PATH_INVALID')
+    # Resolve conventional /var aliases, then reject writable/non-root parents.
+    parent = path.parent.resolve(strict=True)
+    for directory in (parent, *parent.parents):
+        info = directory.stat()
+        if info.st_uid != 0 or info.st_mode & 0o022:
+            raise BackupError('AUDIT_ANCHOR_PARENT_UNPROTECTED')
+    fd = os.open(parent / path.name, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, 'rb') as source:
+        info = os.fstat(source.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0
+                or stat.S_IMODE(info.st_mode) != 0o600 or info.st_size > 16 * 1024 * 1024):
+            raise BackupError('AUDIT_ANCHOR_METADATA_INVALID')
+        data = source.read(16 * 1024 * 1024 + 1)
+    if len(data) > 16 * 1024 * 1024:
+        raise BackupError('AUDIT_ANCHOR_TOO_LARGE')
+    try:
+        anchor = json.loads(data)
+    except (ValueError, UnicodeError):
+        raise BackupError('AUDIT_ANCHOR_INVALID') from None
+    anchor_identities(anchor)
+    return anchor
 
 
 def verify_audit(path):
@@ -220,13 +326,12 @@ def sqlite_copy(source, destination, deadline, credentials=None, memory_limit=51
             raise BackupError('DATABASE_INTEGRITY_FAILED')
 
 
-def capture(vault, destination, credentials=None, memory_limit=512 * 1024 * 1024):
+def capture(vault, destination, credentials=None, memory_limit=512 * 1024 * 1024, historical_anchor=None):
     """Stable capture across all DBs and files; interrupted operations fail closed."""
     vault, destination = Path(vault), Path(destination)
     before = inventory(vault)
     audit_before = audit_state(vault / 'broker-audit.sqlite3', credentials)
-    if audit_before['pending']:
-        raise BackupError('AUDIT_UNFINISHED_OPERATION')
+    check_historical_pending(vault / 'broker-audit.sqlite3', audit_before, historical_anchor, credentials)
     deadline = time.monotonic() + 20
     records = {}
     for name, info in before.items():
@@ -263,13 +368,18 @@ def capture(vault, destination, credentials=None, memory_limit=512 * 1024 * 1024
     if audit_state(destination / 'broker-audit.sqlite3') != audit_before:
         raise BackupError('AUDIT_SNAPSHOT_MISMATCH')
     verify_audit(destination / 'broker-audit.sqlite3')
+    check_historical_pending(destination / 'broker-audit.sqlite3', audit_before, historical_anchor)
     stable = {name: {k: v for k, v in info.items()
                      if k in ('uid', 'gid', 'mode', 'kind', 'sha256')}
               for name, info in records.items()}
     stable['.'] = {key: before['.'][key] for key in ('uid', 'gid', 'mode', 'kind')}
+    if historical_anchor is not None:
+        stable['historical_anchor'] = historical_anchor
     fingerprint = hashlib.sha256(json.dumps(stable, sort_keys=True).encode()).hexdigest()
     manifest = dict(format=1, captured_at=utc(), root=before['.'], files=records,
                     audit=audit_before, fingerprint=fingerprint)
+    if historical_anchor is not None:
+        manifest['historical_anchor'] = historical_anchor
     atomic_json(destination / 'backup-manifest.json', manifest)
     manifest['_source_inventory'] = before
     return manifest
@@ -290,7 +400,9 @@ def restricted_capture(cfg, image):
         if root.st_uid != uid or root.st_gid != gid or uid == 0:
             raise BackupError('VAULT_OWNER_MISMATCH')
         credentials = (uid, gid)
-    return capture(cfg['vault'], image, credentials, cfg.get('snapshot_memory_limit_bytes', 512 * 1024 * 1024))
+    anchor = load_audit_anchor(cfg['audit_anchor']) if cfg.get('audit_anchor') else None
+    return capture(cfg['vault'], image, credentials,
+                   cfg.get('snapshot_memory_limit_bytes', 512 * 1024 * 1024), historical_anchor=anchor)
 
 
 class Backup:
@@ -429,7 +541,8 @@ class Backup:
                             self.save_status(commit=commit, fingerprint=manifest['fingerprint'],
                                              last_snapshot_at=manifest['captured_at'])
                         self.save_status(last_check_at=utc(), capture_error=None,
-                                         established_databases=sorted(present))
+                                         established_databases=sorted(present),
+                                         historical_pending_count=manifest['audit']['pending'])
                         last_error = None
                         break
                 except (BackupError, sqlite3.Error, OSError) as exc:
@@ -611,9 +724,13 @@ def restore(cfg, revision, destination, *, repo=None):
                 with contextlib.closing(open_db(path)) as db:
                     if db.execute('PRAGMA integrity_check').fetchall() != [('ok',)]:
                         raise BackupError('RESTORE_DATABASE_INVALID')
-        if audit_state(image / 'broker-audit.sqlite3') != manifest['audit']:
+        restored_audit = audit_state(image / 'broker-audit.sqlite3')
+        # Backups made before anchor support contain only head and pending.
+        if any(restored_audit.get(k) != v for k, v in manifest['audit'].items()):
             raise BackupError('RESTORE_AUDIT_MISMATCH')
         verify_audit(image / 'broker-audit.sqlite3')
+        check_historical_pending(image / 'broker-audit.sqlite3', restored_audit,
+                                 manifest.get('historical_anchor'))
         (image / 'backup-manifest.json').unlink()
         # All validation precedes ownership changes; directories are applied
         # deepest first while staging remains hidden by its protected parent.

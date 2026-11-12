@@ -10,10 +10,19 @@ The backup captures the complete managed vault, including declarations,
 `secrets.db`, `broker-audit.sqlite3`, and `broker-history.sqlite3` when present.
 SQLite's backup API folds committed journal/WAL state into standalone database
 images. The service verifies integrity and the audit chain, and rejects a capture
-that changes while it is being assembled or contains an unresolved audit attempt.
+that changes while it is being assembled or contains a new unresolved audit attempt.
 An interrupted operation can leave an audit attempt unresolved indefinitely:
 this is an operator-visible backup failure, never an excuse to invent an audit
 outcome or replace the last good snapshot with incomplete data.
+
+An explicitly validated offline recovery may carry a root-controlled historical
+audit anchor: the original ledger head plus the exact sequence, transaction UUID,
+and event hash of every acknowledged interrupted attempt. Capture verifies the
+anchored prefix and rejects any new pending event. It never learns an exception
+from the live vault, advances an age cutoff, or rewrites audit outcomes. The
+anchor is retained inside encrypted snapshots; the historical count is public
+health metadata. Without such offline evidence, an unresolved attempt still
+blocks capture.
 
 Every accepted changed snapshot is encrypted with `age` before being committed
 to a dedicated local Git repository. The repository is separate from the vault
@@ -87,6 +96,7 @@ credential operations or make an otherwise healthy boundary fail:
 | `BACKUP_UNHEALTHY` | The health record is invalid/unsafe, capture or replication failed, or no validated snapshot exists. |
 | `BACKUP_STALE` | No successful current-vault check within two hours, or timestamps are invalid/future-dated. |
 | `BACKUP_REPLICATION_STALE` | The mirror has not recently verified the current local backup commit. |
+| `BACKUP_HISTORICAL_UNRESOLVED` | Known interrupted attempts from an anchored offline recovery remain preserved; this alone does not make backup status fail. |
 
 An old snapshot is healthy when recent checks prove the vault remains unchanged.
 A recent failed attempt is not successful protection. Inspect the private
@@ -142,6 +152,11 @@ average CPU at or below 1% of one core, and peak resident memory at or below
 before enabling the separate observer LaunchDaemon. Full Disk Access failures
 or unsupported event formats leave attribution disabled; backup capture keeps
 working independently.
+
+The installer also checks fresh health in the launchd context. A successful
+interactive benchmark does not prove that the background service has Full Disk
+Access. On activation failure, the observer is unloaded and its LaunchDaemon
+removed; grant the required access in System Settings and repeat setup.
 
 Filesystem event delivery and debouncing cannot preserve every intermediate
 state of a rapidly changing file. Hourly reconciliation covers missed events;
