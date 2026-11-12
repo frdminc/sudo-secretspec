@@ -15,10 +15,10 @@ class SudoSecretspec < Formula
 
   depends_on "pkg-config" => :build
   depends_on "rust" => :build
+  depends_on "age"
   # install.rs targets /private/etc and the sudoers boundary it manages is
   # macOS-only, so there is nothing for this formula to do on Linux.
   depends_on :macos
-  depends_on "age"
   # The companion builds rusqlite against the system SQLite rather than the
   # bundled copy, which hangs in libsqlite3-sys on macOS. pkg-config finds it at
   # build time, and it resolves to Homebrew's sqlite rather than the one in
@@ -46,7 +46,8 @@ class SudoSecretspec < Formula
     (share/"sudo-secretspec/skills/sudo-secretspec").install "skills/sudo-secretspec/SKILL.md"
     (share/"sudo-secretspec").install "sudo-secretspec/BACKUPS.md"
     (share/"sudo-secretspec/backup").install "sudo-secretspec/backup/backup.py",
-                                             "sudo-secretspec/backup/observer.py", "sudo-secretspec/backup/install.py",
+                                             "sudo-secretspec/backup/observer.py",
+                                             "sudo-secretspec/backup/install.py",
                                              "sudo-secretspec/backup/benchmark.py"
   end
 
