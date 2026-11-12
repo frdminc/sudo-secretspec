@@ -286,12 +286,21 @@ mod tests {
             assert!(!valid_commit(bad));
         }
     }
+    fn protected_fixture_dir() -> tempfile::TempDir {
+        // GitHub's Debian container sets HOME=/github/home, which has writable
+        // ancestors. Use root's real home there; never weaken the reader's
+        // ancestor checks to accommodate the CI environment.
+        let home = if cfg!(target_os = "linux") && unsafe { libc::geteuid() } == 0 {
+            std::path::PathBuf::from("/root")
+        } else {
+            std::path::PathBuf::from(std::env::var_os("HOME").unwrap())
+        };
+        tempfile::tempdir_in(home.canonicalize().unwrap()).unwrap()
+    }
+
     #[test]
     fn protected_reader_rejects_symlinks_and_writable_files() {
-        // Use a directory under the home rather than /tmp: every parent must be
-        // protected. Root CI uses /root, macOS uses the user's protected home.
-        let home = std::env::var_os("HOME").unwrap();
-        let dir = tempfile::tempdir_in(home).unwrap();
+        let dir = protected_fixture_dir();
         let uid = unsafe { libc::geteuid() };
         let path = dir.path().join("health.json");
         std::fs::write(&path, serde_json::to_vec(&healthy()).unwrap()).unwrap();
@@ -311,8 +320,10 @@ mod tests {
     }
     #[test]
     fn oversized_health_is_rejected() {
-        let dir = tempfile::tempdir_in(std::env::var_os("HOME").unwrap()).unwrap();
+        let dir = protected_fixture_dir();
         let path = dir.path().join("health.json");
+        std::fs::write(&path, serde_json::to_vec(&healthy()).unwrap()).unwrap();
+        assert!(read_health_at(&path, unsafe { libc::geteuid() }).is_ok());
         std::fs::write(&path, vec![b' '; MAX_HEALTH_BYTES as usize + 1]).unwrap();
         assert!(matches!(
             read_health_at(&path, unsafe { libc::geteuid() }),
@@ -322,9 +333,11 @@ mod tests {
 
     #[test]
     fn health_error_strings_are_bounded_and_cannot_inject_log_lines() {
-        let dir = tempfile::tempdir_in(std::env::var_os("HOME").unwrap()).unwrap();
+        let dir = protected_fixture_dir();
         let path = dir.path().join("health.json");
         let mut health = healthy();
+        std::fs::write(&path, serde_json::to_vec(&health).unwrap()).unwrap();
+        assert!(read_health_at(&path, unsafe { libc::geteuid() }).is_ok());
         for message in ["x".repeat(161), "error\nforged log line".into()] {
             health.capture_error = Some(message);
             std::fs::write(&path, serde_json::to_vec(&health).unwrap()).unwrap();
