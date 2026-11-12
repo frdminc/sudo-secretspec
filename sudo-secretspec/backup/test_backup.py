@@ -159,6 +159,17 @@ class EncryptionHistoryTests(CaptureTests):
                         remote=str(self.remote), min_free_bytes=0)
         self.b = backup.Backup(self.cfg)
 
+    def test_competing_capture_preserves_owner_staging(self):
+        stage = self.b.state / '.capture-active'
+        stage.mkdir()
+        (stage / 'plaintext').write_text('synthetic')
+        with open(self.b.state / 'backup.lock', 'a') as lock:
+            backup.fcntl.flock(lock, backup.fcntl.LOCK_EX | backup.fcntl.LOCK_NB)
+            with patch.object(self.b, 'init_repo') as initialize:
+                self.assertFalse(self.b.once())
+                initialize.assert_not_called()
+            self.assertEqual((stage / 'plaintext').read_text(), 'synthetic')
+
     def test_encrypted_history_old_new_local_remote_restore(self):
         self.assertTrue(self.b.once())
         old = self.b.status['commit']

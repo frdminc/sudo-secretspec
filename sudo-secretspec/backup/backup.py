@@ -183,9 +183,12 @@ def verify_audit(path):
 
 
 def sqlite_copy(source, destination, deadline, credentials=None, memory_limit=512 * 1024 * 1024):
+    page_size = 0
     def progress(status, remaining, total):
         if time.monotonic() > deadline:
             raise BackupError('SNAPSHOT_TIMEOUT')
+        if credentials is not None and total * page_size > memory_limit:
+            raise BackupError('DATABASE_EXCEEDS_MEMORY_SNAPSHOT_LIMIT')
     # SQLite may reopen its destination while backing up. A service-UID source
     # cannot back up directly into a root-only path, even with preopened FDs.
     # Materialize one bounded in-memory image as that UID, then write the image
@@ -199,6 +202,8 @@ def sqlite_copy(source, destination, deadline, credentials=None, memory_limit=51
             raise BackupError('DATABASE_EXCEEDS_MEMORY_SNAPSHOT_LIMIT')
         with contextlib.closing(sqlite3.connect(':memory:')) as image:
             with source_access(credentials), contextlib.closing(open_db(source)) as src:
+                page_size = src.execute('PRAGMA page_size').fetchone()[0]
+                progress(0, 0, src.execute('PRAGMA page_count').fetchone()[0])
                 src.backup(image, pages=256, progress=progress, sleep=0.05)
             with contextlib.closing(sqlite3.connect(str(destination))) as dst:
                 image.backup(dst, pages=256, progress=progress, sleep=0.05)
@@ -380,6 +385,11 @@ class Backup:
     def once(self):
         lock = open(self.state / 'backup.lock', 'a')
         try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lock.close()
+            return False
+        try:
             self.status = json.loads(self.status_path.read_text()) if self.status_path.exists() else {'format': 1}
             self.init_repo()
             # Only this lock holder can capture; stale private staging from a
@@ -388,11 +398,6 @@ class Backup:
                 info = abandoned.lstat()
                 if stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid():
                     shutil.rmtree(abandoned)
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            lock.close()
-            return False
-        try:
             if shutil.disk_usage(self.state).free < self.cfg.get('min_free_bytes', 1024 ** 3):
                 raise BackupError('LOW_DISK_SPACE')
             last_error = None

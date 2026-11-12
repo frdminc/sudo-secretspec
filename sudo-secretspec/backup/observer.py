@@ -25,6 +25,9 @@ MAX_LINE = 2 * 1024 * 1024
 ROTATE_BYTES = 4 * 1024 * 1024
 EVENTS = ('unlink', 'rename')  # macOS eslogger exposes directory removal as unlink.
 SUPPORTED_SCHEMAS = {1}
+# EndpointSecurity/ESTypes.h es_event_type_t ABI values. Current eslogger
+# emits numeric enums; older fixtures/tools may use their symbolic spelling.
+NUMERIC_EVENT_TYPES = {25: 'rename', 32: 'unlink'}
 
 
 class ObserverError(Exception):
@@ -88,10 +91,13 @@ class EventFilter:
     def parse(self, value: dict) -> dict | None:
         if not isinstance(value, dict) or type(value.get('schema_version')) is not int or value.get('schema_version') not in SUPPORTED_SCHEMAS:
             raise ObserverError('unsupported_schema')
-        event_type = value.get('event_type')
-        if not isinstance(event_type, str):
+        raw_type = value.get('event_type')
+        if type(raw_type) is int:
+            event_type = NUMERIC_EVENT_TYPES.get(raw_type)
+        elif isinstance(raw_type, str):
+            event_type = raw_type.lower().removeprefix('es_event_type_').removeprefix('notify_')
+        else:
             raise ObserverError('event_type_missing')
-        event_type = event_type.lower().removeprefix('es_event_type_').removeprefix('notify_')
         if event_type not in EVENTS:
             raise ObserverError('unexpected_event_type')
         seq = value.get('seq_num')

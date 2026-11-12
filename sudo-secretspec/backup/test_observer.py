@@ -47,6 +47,44 @@ class FilterTests(unittest.TestCase):
         self.assertNotIn('argv', encoded)
         self.assertNotIn('env', encoded)
 
+    def test_live_numeric_unlink_schema(self):
+        # Structural fixture from macOS eslogger: numeric enum, not a string.
+        # Values are synthetic; no captured live paths/process data are stored.
+        event = unlink()
+        event['event_type'] = 32
+        event['action_type'] = 1
+        event['action'] = {'result': {'result_type': 0, 'result': {'auth': 0}}}
+        event['process']['team_id'] = None
+        record = self.filter.parse(event)
+        self.assertEqual(record['event'], 'unlink')
+        self.assertNotIn('team_id', record)
+
+    def test_live_numeric_rename_schema(self):
+        event = rename('/private/var/db/sudo-secretspec/secrets.db', {
+            'existing_file': {'path': '/tmp/replaced', 'path_truncated': False}}, seq=0)
+        event['event_type'] = 25
+        event['event']['rename']['destination_type'] = 0
+        record = self.filter.parse(event)
+        self.assertEqual(record['event'], 'rename')
+
+    def test_numeric_enum_and_payload_mismatch_fails_closed(self):
+        event = unlink()
+        event['event_type'] = 25
+        with self.assertRaisesRegex(observer.ObserverError, 'event_payload_missing'):
+            self.filter.parse(event)
+
+    def test_unknown_numeric_enum_fails_closed(self):
+        event = unlink()
+        event['event_type'] = 99999
+        with self.assertRaisesRegex(observer.ObserverError, 'unexpected_event_type'):
+            self.filter.parse(event)
+
+    def test_boolean_enum_fails_closed(self):
+        event = unlink()
+        event['event_type'] = True
+        with self.assertRaisesRegex(observer.ObserverError, 'event_type_missing'):
+            self.filter.parse(event)
+
     def test_outside_vault_and_similar_prefix_are_discarded(self):
         for seq, path in enumerate(['/tmp/unrelated', '/private/var/db/sudo-secretspec-copy/secrets.db']):
             self.assertIsNone(self.filter.parse(unlink(path, seq)))

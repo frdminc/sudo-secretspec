@@ -13,6 +13,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 
 HERE = Path(__file__).resolve().parent
 PREFIX = Path('/usr/local/libexec/sudo-secretspec-backup')
@@ -26,6 +27,23 @@ def command(argv, data=None, timeout=60):
     if r.returncode:
         raise RuntimeError('%s exited %s' % (Path(argv[0]).name, r.returncode))
     return r.stdout
+
+
+def activate(label, target):
+    loaded = subprocess.run(['/bin/launchctl', 'print', 'system/' + label],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    if loaded:
+        command(['/bin/launchctl', 'bootout', 'system/' + label])
+    # bootout returns before launchd finishes removing an old service. Bootstrap
+    # may transiently return EIO during that interval; retry boundedly.
+    for attempt in range(10):
+        result = subprocess.run(['/bin/launchctl', 'bootstrap', 'system', str(target)],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if result.returncode == 0:
+            return
+        if result.returncode != 5 or attempt == 9:
+            raise RuntimeError('launchctl bootstrap exited %s' % result.returncode)
+        time.sleep(1)
 
 
 def write(path, data, mode=0o600):
@@ -198,11 +216,7 @@ def main():
     write(target, plistlib.dumps(plist), 0o644)
     command(['/usr/bin/plutil', '-lint', str(target)])
     if args.activate:
-        loaded = subprocess.run(['/bin/launchctl', 'print', 'system/' + label], stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL).returncode == 0
-        if loaded:
-            command(['/bin/launchctl', 'bootout', 'system/' + label])
-        command(['/bin/launchctl', 'bootstrap', 'system', str(target)])
+        activate(label, target)
     if args.enable_observer:
         benchmark = STATE / 'observer/benchmark.json'
         validate_key(benchmark)
@@ -218,11 +232,7 @@ def main():
             StandardOutPath=str(logs / 'observer.log'), StandardErrorPath=str(logs / 'observer-error.log'))
         observer_target = Path('/Library/LaunchDaemons') / (observer_label + '.plist')
         write(observer_target, plistlib.dumps(observer_plist), 0o644)
-        loaded = subprocess.run(['/bin/launchctl', 'print', 'system/' + observer_label],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
-        if loaded:
-            command(['/bin/launchctl', 'bootout', 'system/' + observer_label])
-        command(['/bin/launchctl', 'bootstrap', 'system', str(observer_target)])
+        activate(observer_label, observer_target)
     print(json.dumps({'installed': True, 'activated': args.activate, 'remote_key_decryption_verified': True,
                       'observer': 'enabled' if args.enable_observer else 'not enabled: benchmark and Full Disk Access required'}))
 
