@@ -158,6 +158,14 @@ interactive benchmark does not prove that the background service has Full Disk
 Access. On activation failure, the observer is unloaded and its LaunchDaemon
 removed; grant the required access in System Settings and repeat setup.
 
+Because the observer launches `eslogger` as a child, macOS may attribute access
+to the Python interpreter rather than `eslogger` itself. The installer resolves
+the selected interpreter directly to avoid Apple's shared `/usr/bin/python3`
+tool-shim identity. Authorize that interpreter's application in Full Disk Access
+(Xcode's Python application for the standard system interpreter). This grant
+also applies to other scripts run by that interpreter. Verify launchd health
+after authorization; an interactive terminal test is insufficient.
+
 Filesystem event delivery and debouncing cannot preserve every intermediate
 state of a rapidly changing file. Hourly reconciliation covers missed events;
 offline/asleep machines cannot capture or replicate until they resume. The
