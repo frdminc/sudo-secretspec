@@ -249,8 +249,13 @@ def main():
                 report.get('max_rss_bytes', 2**63) <= 100 * 1024**2):
             raise RuntimeError('observer benchmark/coverage gate has not passed')
         observer_label = label + '-observer'
+        # Apple's /usr/bin/python3 is an xcode-select shim sharing a code
+        # identity with other tools (TCC can attribute it to /usr/bin/git).
+        # Launch the selected interpreter directly so FDA has a stable, honest
+        # responsible identity. Discover it at install time, never pin a version.
+        observer_python = str(Path(sys.executable).resolve())
         observer_plist = dict(plist, Label=observer_label,
-            ProgramArguments=['/usr/bin/python3', '-I', str(PREFIX / 'observer.py'), 'observe'],
+            ProgramArguments=[observer_python, '-I', str(PREFIX / 'observer.py'), 'observe'],
             StandardOutPath=str(logs / 'observer.log'), StandardErrorPath=str(logs / 'observer-error.log'))
         observer_target = Path('/Library/LaunchDaemons') / (observer_label + '.plist')
         write(observer_target, plistlib.dumps(observer_plist), 0o644)
