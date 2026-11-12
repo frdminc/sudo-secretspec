@@ -129,6 +129,20 @@ the configured CPU and memory limits. Missing permissions, unsupported schemas,
 event loss, and observer failure must be reported; this instrumentation is
 independent of backup capture and does not promise retroactive attribution.
 
+After installing the helpers, run the protected fixture benchmark:
+
+```bash
+sudo /usr/bin/python3 /usr/local/libexec/sudo-secretspec-backup/benchmark.py
+```
+
+It runs for ten minutes and requires both rename/unlink fixture coverage,
+average CPU at or below 1% of one core, and peak resident memory at or below
+100 MiB. If it passes, repeat the explicit setup command above with
+`--enable-observer` added. The installer checks the protected benchmark report
+before enabling the separate observer LaunchDaemon. Full Disk Access failures
+or unsupported event formats leave attribution disabled; backup capture keeps
+working independently.
+
 Filesystem event delivery and debouncing cannot preserve every intermediate
 state of a rapidly changing file. Hourly reconciliation covers missed events;
 offline/asleep machines cannot capture or replicate until they resume. The
