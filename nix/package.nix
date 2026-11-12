@@ -14,6 +14,7 @@
   rustPlatform,
   pkg-config,
   sqlite,
+  aws-lc,
   # NixOS has no /usr/bin/sudo: the setuid wrapper lives in /run/wrappers/bin.
   sudoPath ? "/run/wrappers/bin/sudo",
   # Root-owned 0444 file written by the NixOS module.
@@ -50,8 +51,12 @@ rustPlatform.buildRustPackage {
   doCheck = false;
 
   nativeBuildInputs = [ pkg-config ];
-  # The companion links the system SQLite (see FORK-AI.md: not `bundled`).
-  buildInputs = [ sqlite ];
+  # Link system SQLite and AWS-LC. nixpkgs' cargo setup hook disables
+  # vendored AWS-LC, which the companion's TLS dependencies require.
+  buildInputs = [
+    sqlite
+    aws-lc
+  ];
 
   env = lib.optionalAttrs stdenv.hostPlatform.isLinux {
     SUDO_SECRETSPEC_SUDO = sudoPath;

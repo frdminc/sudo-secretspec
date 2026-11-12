@@ -464,6 +464,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Nix builds of `sudo-secretspec` now provide the system AWS-LC library
+  required by current nixpkgs, fixing the missing cryptography dependency.
+
 - One stalled broker no longer takes every other call down with it (issue #4).
   Appending to the audit ledger and to the history store verified the whole hash
   chain *inside* the database's write transaction, so how long the lock was held
