@@ -266,6 +266,7 @@ def capture(vault, destination, credentials=None, memory_limit=512 * 1024 * 1024
     stable = {name: {k: v for k, v in info.items()
                      if k in ('uid', 'gid', 'mode', 'kind', 'sha256')}
               for name, info in records.items()}
+    stable['.'] = {key: before['.'][key] for key in ('uid', 'gid', 'mode', 'kind')}
     fingerprint = hashlib.sha256(json.dumps(stable, sort_keys=True).encode()).hexdigest()
     manifest = dict(format=1, captured_at=utc(), root=before['.'], files=records,
                     audit=audit_before, fingerprint=fingerprint)

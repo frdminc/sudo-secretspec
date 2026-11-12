@@ -61,7 +61,17 @@ class CaptureTests(unittest.TestCase):
         self.image.mkdir(mode=0o700)
 
     def tearDown(self):
+        if self.vault.is_dir():
+            os.chmod(self.vault, 0o700)
         self.temp.cleanup()
+
+    def test_vault_directory_metadata_changes_fingerprint(self):
+        first = backup.capture(self.vault, self.image)
+        os.chmod(self.vault, 0o500)
+        second_image = self.root / 'second-image'
+        second_image.mkdir()
+        second = backup.capture(self.vault, second_image)
+        self.assertNotEqual(first['fingerprint'], second['fingerprint'])
 
     def test_capture_preserves_three_databases_and_files(self):
         with sqlite3.connect(self.vault / 'broker-history.sqlite3') as db:
