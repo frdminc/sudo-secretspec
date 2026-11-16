@@ -321,12 +321,16 @@ one depends on whether the name is meant to persist:
   step.**
 
 ```bash
-sudo-secretspec add NAME --description "what it is" --reason "purpose"
+sudo-secretspec add NAME --description "what it is" --optional --reason "purpose"
 sudo-secretspec set NAME --reason "purpose"
 # undo, in this order:
 sudo-secretspec delete NAME --reason "purpose"
 sudo-secretspec undeclare NAME --reason "purpose"
 ```
+
+When `sudo-secretspec set` fails with `Secret '<NAME>' is not defined in profile 'default'` and the operator authorizes declaring it:
+1. Run `sudo-secretspec add <NAME> --description "..." [--optional] --reason "..."` to add it to the runtime manifest (do **not** run `install --declarations` expecting it to merge new names into an adopted vault — `install` keeps the existing runtime manifest).
+2. Mirror the declaration (name, description, `required = false`; never values) into the host's tracked declarations file (e.g., `~/ops/site-private-djbclark/secretspec/mac-declarations.toml` on macOS) and commit/push it.
 
 `--description` is required by `add` and may not be empty.
 
