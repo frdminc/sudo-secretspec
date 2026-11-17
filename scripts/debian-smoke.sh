@@ -82,14 +82,14 @@ visudo -c
 ok 'combined sudoers accepted by visudo'
 policy=/etc/sudoers.d/sudo-secretspec
 forbid_match '^ALL[[:space:]].*NOPASSWD|NOPASSWD:.*[[:space:]](install|uninstall|rollback|doctor)([[:space:]]|$)' "$policy"
-[[ $(grep -c 'NOPASSWD:' "$policy") == 11 ]]
-for verb in source-add source-set source-delete source-undeclare source-get source-check source-export source-template-check source-schema source-restore; do
+[[ $(grep -c 'NOPASSWD:' "$policy") == 12 ]]
+for verb in source-add source-set source-delete source-undeclare source-get source-check source-export source-template-check source-schema source-export-declarations source-restore; do
   grep -Fx "opuser ALL=(sudo-secretspec) NOPASSWD: /usr/libexec/sudo-secretspec __broker $verb --*" "$policy"
 done
 grep -Fx 'opuser ALL=(sudo-secretspec) NOPASSWD: /usr/libexec/sudo-secretspec __broker audit-verify' "$policy"
 grep -F 'secure_path=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' "$policy"
 grep -Fx 'Defaults!/usr/bin/sudo-secretspec timestamp_timeout=0' "$policy"
-ok 'only the eleven broker verbs are granted NOPASSWD; Debian PATH and client timeout are pinned'
+ok 'only the twelve broker verbs are granted NOPASSWD; Debian PATH and client timeout are pinned'
 su opuser -c 'sudo -n -l' > "$work/sudo-list.txt"
 cat "$work/sudo-list.txt"
 # sudo wraps this human-readable listing to the terminal width. Preserve the

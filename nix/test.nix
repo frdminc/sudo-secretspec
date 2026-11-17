@@ -4,8 +4,8 @@
 # `dann` (deliberately NOT in `wheel`, so the module's sudoers policy is the
 # only thing granting him anything), then asserts the boundary:
 #
-#   * exactly the ten mediated broker verbs and `audit-verify` are NOPASSWD —
-#     11 grant lines, each naming the broker once;
+#   * exactly the eleven mediated broker verbs and `audit-verify` are NOPASSWD —
+#     12 grant lines, each naming the broker once;
 #   * no blanket `NOPASSWD: ALL` grant sneaks in;
 #   * the broker's `Defaults!` line is exactly as emitted (env_reset, HOME
 #     pinned, /run/current-system secure_path, umask 0077, always_set_home);
@@ -76,7 +76,7 @@
       sudoers = machine.succeed("cat /etc/sudoers")
 
       broker_lines = [l for l in sudoers.splitlines() if "__broker" in l]
-      assert len(broker_lines) == 11, f"expected 11 broker grant lines, got {len(broker_lines)}\n{sudoers}"
+      assert len(broker_lines) == 12, f"expected 12 broker grant lines, got {len(broker_lines)}\n{sudoers}"
       assert all("NOPASSWD:" in l for l in broker_lines), f"broker grants must all be NOPASSWD:\n{sudoers}"
       assert not any("NOPASSWD: ALL" in l for l in broker_lines), f"no blanket grant may exist:\n{sudoers}"
 
@@ -93,7 +93,7 @@
       for verb in [
           "source-add", "source-set", "source-delete", "source-undeclare",
           "source-get", "source-check", "source-export", "source-template-check",
-          "source-schema", "source-restore",
+          "source-schema", "source-export-declarations", "source-restore",
       ]:
           out = machine.execute(
               f"sudo -u dann sudo -n -u sudo-secretspec {broker} __broker {verb} --client vmtest 2>&1"
