@@ -1,0 +1,214 @@
+name: Linux CI
+
+# Overlay-only on ci/base. Port of .forgejo/workflows/ci.yml; no loopback-port-shim
+# (GitHub runners are not libkrun). The companion runs on Debian and macOS;
+# Debian also proves the imperative installer in a disposable root container.
+# macos covers the release helper and Homebrew formula; nix covers the module.
+
+on:
+  push:
+    branches: ['ci/run/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: linux (fmt, clippy, build, test, features, package)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system deps and Rust
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libsqlite3-dev pkg-config
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh
+          sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          . "$HOME/.cargo/env"
+          rustup toolchain install --profile minimal
+          rustup component add rustfmt clippy
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-registry-v1-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-registry-v1-
+      - name: Install SOPS 3.13.2
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /usr/local/bin/sops https://github.com/getsops/sops/releases/download/v3.13.2/sops-v3.13.2.linux.amd64
+          sudo chmod 0755 /usr/local/bin/sops
+      # Upstream 0.21+ builds libsecretspec-resolver's C sources in the
+      # conformance runner, against a system yyjson that ubuntu-latest lacks.
+      # Same pinned install upstream's test.yml runs; a tree that predates the
+      # script has nothing to build against it.
+      - name: Install yyjson
+        run: |
+          if [ -f scripts/install-yyjson.sh ]; then bash scripts/install-yyjson.sh; fi
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run Clippy
+        run: cargo clippy --workspace --exclude secretspec-php-native --exclude sudo-secretspec-cli
+      - name: Build secretspec
+        run: cargo build -p secretspec --locked
+      - name: Run tests
+        run: cargo test --workspace --exclude secretspec-php-native --exclude sudo-secretspec-cli
+      - name: Check each provider feature standalone
+        run: |
+          set -euo pipefail
+          for feature in cli keyring keeper gcsm awssm vault openbao infisical bws akv aac sops bw; do
+            echo "== feature $feature"
+            cargo check --package secretspec --no-default-features --features "$feature"
+          done
+      - name: Verify the published crate contains its schema fixture
+        run: |
+          set -euo pipefail
+          fixture="secretspec/src/fixtures/resolution-report.schema.json"
+          cmp schema/resolution-report.schema.json "$fixture"
+          cargo package --package secretspec --list |
+            grep -Fx 'src/fixtures/resolution-report.schema.json'
+
+  debian:
+    name: debian (companion crate and imperative installer)
+    runs-on: ubuntu-latest
+    container: debian:12
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install Debian dependencies
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends sudo build-essential pkg-config libsqlite3-dev curl ca-certificates git
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          timeout 600 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh
+          timeout 600 sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          . "$HOME/.cargo/env"
+          rustup toolchain install --profile minimal
+          rustup component add clippy
+      - name: Test downstream companion crate
+        run: cargo test -p sudo-secretspec-cli --locked
+      - name: Lint downstream companion crate
+        run: cargo clippy -p sudo-secretspec-cli --all-targets --locked -- -D warnings
+      - name: Build release binary
+        run: cargo build --release -p sudo-secretspec-cli --locked
+      - name: Smoke the Debian installer as root
+        run: bash scripts/debian-smoke.sh target/release/sudo-secretspec
+      # The tag job runs this script only on a release tag, so a drift in it
+      # (a version-shape check left on an old upstream base) shipped nothing
+      # and warned no one. Run it here, in the same Debian image, every time.
+      - name: Build the release media the way the tag job does
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          base=$(sed -n 's/^UPSTREAM_VERSION = "\(.*\)"$/\1/p' packaging/release.py)
+          bash packaging/build-linux-artifact.sh target/release/sudo-secretspec "$base-sudo.1" 0 /tmp/media
+          media=$(ls /tmp/media/*.tar.gz)
+          tar -tzf "$media" | grep -E '/libexec/sudo-secretspec$'
+          tar -tzf "$media" | grep -E '/share/sudo-secretspec/AI-GUIDANCE\.md$'
+          (cd /tmp/media && sha256sum -c ./*.sha256)
+          # The shape check must refuse everything that is not <x.y.z>-sudo.<N>, N >= 1, no leading zero.
+          for bad in "$base-sudo.0" "$base-sudo.01" "$base" "$base-djbclark.1"; do
+            if bash packaging/build-linux-artifact.sh target/release/sudo-secretspec "$bad" 0 /tmp/media-bad 2>/dev/null; then
+              echo "artifact script accepted bad version $bad" >&2
+              exit 1
+            fi
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sudo-secretspec-linux-x86_64
+          path: target/release/sudo-secretspec
+          if-no-files-found: error
+          retention-days: 7
+
+  macos:
+    name: macos (companion crate, release helper, formula)
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      # Same steps as sudo-release.yml, which fires only on tags and PRs.
+      # Homebrew's SQLite, not rusqlite's `bundled`, which can hang in build scripts.
+      - name: Install focused test dependencies
+        run: |
+          python -m pip install pytest ruff
+          brew install sqlite
+      - name: Test downstream companion crate
+        env:
+          PKG_CONFIG_PATH: /opt/homebrew/opt/sqlite/lib/pkgconfig
+          LIBRARY_PATH: /opt/homebrew/opt/sqlite/lib
+        run: cargo test -p sudo-secretspec-cli --locked
+      # Emit the installable CLI binary so a hotfix can be installed on the Mac
+      # without a full release ceremony (C1 privileged-config fix, 2026-10-28).
+      # Same Homebrew-SQLite env as the test step above (rusqlite is not
+      # `bundled` here, matching release.py's own build).
+      - name: Build release binary
+        env:
+          PKG_CONFIG_PATH: /opt/homebrew/opt/sqlite/lib/pkgconfig
+          LIBRARY_PATH: /opt/homebrew/opt/sqlite/lib
+        run: cargo build --release -p sudo-secretspec-cli --locked
+      - name: Upload release binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: sudo-secretspec-macos
+          path: target/release/sudo-secretspec
+          if-no-files-found: error
+          retention-days: 7
+      - name: Test release helper
+        run: |
+          python -m ruff check packaging tests/sudo_packaging
+          python -m ruff format --check packaging tests/sudo_packaging
+          python -m pytest tests/sudo_packaging -q
+      - name: Check formula style and syntax
+        run: |
+          ruby -c packaging/homebrew/sudo-secretspec.rb
+          brew style packaging/homebrew/sudo-secretspec.rb
+
+  nix:
+    name: 'nix (flake check: build + VM test)'
+    runs-on: ubuntu-latest
+    # The NixOS half of the Linux port: `nix flake check` builds the package and
+    # runs the VM test (nix/test.nix), which boots a minimal NixOS machine and
+    # asserts the sudoers boundary (11 NOPASSWD grants, the exact broker
+    # Defaults! line, no doctor/timestamp_timeout, and runtime sudo behaviour).
+    # This is the only place that proof runs: the module's import-from-derivation
+    # (`print-sudoers`) needs `allow-import-from-derivation = true`, and the VM
+    # test needs QEMU, neither of which a macOS dev box has. GitHub runners have
+    # no KVM, so QEMU falls back to TCG: the minimal boot + assertions are a few
+    # minutes, but the first run also builds/downloads the NixOS closure, so
+    # leave headroom. There is no committed flake.lock (single nixpkgs input),
+    # so the job generates it first.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Nix
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -sSf -L https://install.determinate.systems/nix -o /tmp/nix-install.sh
+          sh /tmp/nix-install.sh install \
+            --no-confirm \
+            --extra-conf "experimental-features = nix-command flakes" \
+            --extra-conf "allow-import-from-derivation = true"
+          . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+          printf '%s\n' "/nix/var/nix/profiles/default/bin" >> "$GITHUB_PATH"
+      - name: nix flake check
+        run: |
+          set -euo pipefail
+          . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+          nix flake lock
+          nix flake check
