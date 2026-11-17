@@ -1,7 +1,9 @@
 # Design note: `template-check` byte-exactness and a lighter resync
 
-**Status:** analysed, deliberately **not implemented**. No known users.
-**Date:** 2026-08-15
+**Status:** implemented as `export-declarations` in 0.21.1-sudo.7. The
+byte-exact comparison is unchanged; the command adds the cheap value-free
+resync this note proposed.
+**Date:** 2026-08-15 (analysis); 2026-11-20 (implemented)
 **Scope:** fork-only (`frdminc/sudo-secretspec`). Not upstream material.
 **Prompted by:** an operator report, after they hit the resync cost and
 resolved it by abandoning the tracked-declarations workflow entirely.
@@ -153,3 +155,23 @@ explicit `None` permits; a configured path that fails to read must keep
 refusing exactly as it does today. Implemented as a `match` on the `Option`
 with the read error arm untouched, never as a truthiness check that would
 collapse the two.
+
+## Implemented, 2026-11-20 (0.21.1-sudo.7)
+
+The operator re-adopted the tracked-declarations workflow, so the cheap resync
+this note proposed is now built. `sudo-secretspec export-declarations` is a new
+mediated, value-free read that streams the runtime manifest's exact bytes to
+stdout over the same NOPASSWD broker path as `schema` and `export`:
+
+```bash
+sudo-secretspec export-declarations --reason "resync after add" \
+  > secretspec.toml.example
+git commit -am "declare FOO"
+```
+
+It takes a `--reason` and records an audit event like every other mediated
+operation, is read-only (no rollback copy, no history entry), and never opens
+the value store — the broker arm reads `secretspec.toml` directly and never
+touches the loaded `Secrets`, so no provider value is resolved. The raw-byte
+comparison in `template-check` is unchanged; the command exists only to make
+returning to green cost no privilege escalation, exactly as this note argued.

@@ -5,7 +5,7 @@ Use this policy in `AGENTS.md`, skills, runbooks, and autonomous-agent prompts f
 ## Required behavior
 
 - Use only the installed `/usr/local/bin/sudo-secretspec` client for credential CRUD and use.
-- Supply a short operational `--reason` for every `add`, `undeclare`, `set`, `delete`, `get`, `check`, `export`, `template-check`, `schema`, or `run` operation. `add` additionally requires `--description`: it declares a secret, it does not set a value. The protected audit ledger stores only its SHA-256 digest.
+- Supply a short operational `--reason` for every `add`, `undeclare`, `set`, `delete`, `get`, `check`, `export`, `export-declarations`, `template-check`, `schema`, or `run` operation. `add` additionally requires `--description`: it declares a secret, it does not set a value. The protected audit ledger stores only its SHA-256 digest.
 - Run a consumer as `sudo-secretspec run --reason "purpose" -- <command>` instead of extracting values into shell history or command arguments.
 - Treat an unavailable broker, failed audit append/verification, declaration mismatch, authorization failure, or non-advisory drift finding as a hard stop. `doctor` marks advisory findings — currently `LEGACY_VAULT_CLUTTER`, `PENDING_ROLLBACK`, `CLIENT_DUPLICATE`, `UPGRADE_AVAILABLE`, and the three `SUDOERS_NEIGHBOUR_*` codes — and still exits zero; report them to the operator and continue. Read the `advisory` field rather than matching code names: that list has already grown three times, and this sentence is the wrong place to learn it has grown again.
 - An audit *attempt* that fails with `database is locked` (`broker: audit attempt failed: …`) is contention, not damage: another broker call holds the ledger, this one gave up waiting, and the operation never started. Retry once after a few seconds. Treat it as a hard stop only if it repeats, or if `doctor` reports `LEDGER_LOCK_HELD` (a stalled broker is holding the lock; report the process id it names). A failure to record the *outcome* (`audit terminal failed`, exit 126) is different: the operation did run, so report it rather than retrying.
@@ -47,7 +47,7 @@ Never:
 ## Mediated surface
 
 The companion is not a wrapper around the whole engine. It exposes `add`, `undeclare`, `set`,
-`delete`, `get`, `check`, `export`, `run`, `template-check`, `schema`, `audit-verify`, and
+`delete`, `get`, `check`, `export`, `export-declarations` (0.21.1-sudo.7+), `run`, `template-check`, `schema`, `audit-verify`, and
 `doctor`, plus the operator-only lifecycle commands `install`, `uninstall`, and
 `rollback`. Five engine subcommands have **no** companion equivalent: `config`,
 `import`, `init`, `cache`, and `audit`.

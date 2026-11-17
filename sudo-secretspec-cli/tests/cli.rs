@@ -54,6 +54,7 @@ fn help_exposes_typed_boundary_commands() {
         "export",
         "template-check",
         "schema",
+        "export-declarations",
         "audit-verify",
         "undeclare",
         "run",
@@ -139,6 +140,21 @@ fn schema_requires_a_reason() {
         .output()
         .expect("run sudo-secretspec");
     assert!(!output.status.success(), "schema ran without --reason");
+}
+
+#[test]
+fn export_declarations_requires_a_reason() {
+    // Every brokered operation is audited, and the ledger entry is keyed by the
+    // reason digest. An `export-declarations` that could run without one would
+    // be an unaudited read of the boundary's declaration metadata.
+    let output = binary()
+        .arg("export-declarations")
+        .output()
+        .expect("run sudo-secretspec");
+    assert!(
+        !output.status.success(),
+        "export-declarations ran without --reason"
+    );
 }
 
 #[test]

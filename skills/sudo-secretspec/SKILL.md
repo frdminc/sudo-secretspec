@@ -76,6 +76,7 @@ The companion is not a wrapper around the whole engine. It exposes exactly:
 | `run --reason R -- cmd args...` | Run a child with the declared environment. |
 | `template-check --reason R` | Compare runtime manifest against the tracked declaration template. |
 | `schema --reason R` | Emit a JSON Schema of the runtime manifest's typed shape. |
+| `export-declarations --reason R` | Stream the runtime manifest's exact bytes (names, requiredness, descriptions, ordering) — never values — so the tracked declaration template can be reconciled byte-for-byte. `0.21.1-sudo.7+`. |
 | `audit-verify` | Verify the ledger's hash chain and report its tip. |
 | `doctor` | Drift and health check. |
 
@@ -102,6 +103,7 @@ sudo-secretspec set NAME --reason "rotate managed credential"
 sudo-secretspec check --reason "validate required credentials"
 sudo-secretspec template-check --reason "confirm manifest matches declarations"
 sudo-secretspec schema --reason "generate typed accessors"
+sudo-secretspec export-declarations --reason "resync tracked declarations" > secretspec.toml.example
 sudo-secretspec audit-verify
 ```
 

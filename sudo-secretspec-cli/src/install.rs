@@ -1186,6 +1186,7 @@ pub const BROKER_VERBS: &[&str] = &[
     "source-export",
     "source-template-check",
     "source-schema",
+    "source-export-declarations",
     "source-restore",
 ];
 
@@ -2189,6 +2190,7 @@ mod tests {
              dann ALL=(sudo-secretspec) NOPASSWD: {broker} __broker source-export --*\n\
              dann ALL=(sudo-secretspec) NOPASSWD: {broker} __broker source-template-check --*\n\
              dann ALL=(sudo-secretspec) NOPASSWD: {broker} __broker source-schema --*\n\
+             dann ALL=(sudo-secretspec) NOPASSWD: {broker} __broker source-export-declarations --*\n\
              dann ALL=(sudo-secretspec) NOPASSWD: {broker} __broker source-restore --*\n\
              dann ALL=(sudo-secretspec) NOPASSWD: {broker} __broker audit-verify\n",
             broker = platform::BROKER_PATH,

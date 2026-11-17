@@ -18,6 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without inventing outcomes; backups warn about that history and reject new
   unfinished operations.
 
+- `sudo-secretspec export-declarations` (0.21.1-sudo.7+) streams the runtime
+  manifest's exact bytes — declaration names, requiredness, descriptions and
+  source ordering — to stdout with no secret values, so the tracked declaration
+  template can be reconciled with the runtime manifest byte-for-byte without a
+  boundary reinstall. Like every mediated operation it requires `--reason` and
+  is audited; it never reads the value store.
+
 - `install` now warns on stderr when it adopts an existing vault whose
   `secretspec.toml` differs from the declarations being installed: the runtime
   manifest is kept, the new declarations are not merged, and `template-check`

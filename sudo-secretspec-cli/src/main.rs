@@ -108,6 +108,17 @@ enum Cmd {
         #[arg(long)]
         reason: String,
     },
+    /// Emit the runtime manifest's exact bytes (declarations only, never
+    /// values).
+    ///
+    /// Value-free (0.21.1-sudo.7+): the manifest holds names, requiredness,
+    /// descriptions and source ordering, never secret values. Redirecting the
+    /// output over the tracked declaration template resyncs it byte-for-byte,
+    /// which is the property `template-check`'s raw comparison depends on.
+    ExportDeclarations {
+        #[arg(long)]
+        reason: String,
+    },
     Run {
         #[arg(long)]
         reason: String,
@@ -322,6 +333,7 @@ fn main() {
         Cmd::Export { reason } => lifecycle("export", "", &reason),
         Cmd::TemplateCheck { reason } => lifecycle("template-check", "", &reason),
         Cmd::Schema { reason } => lifecycle("schema", "", &reason),
+        Cmd::ExportDeclarations { reason } => lifecycle("export-declarations", "", &reason),
         Cmd::Restore {
             name,
             to,

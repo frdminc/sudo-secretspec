@@ -479,6 +479,7 @@ pub const SOURCE_OPS: &[&str] = &[
     "source-export",
     "source-template-check",
     "source-schema",
+    "source-export-declarations",
     "source-restore",
     "source-restore-force",
     "source-destroy",
@@ -1547,6 +1548,30 @@ fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>
                 (1, vec![])
             }
         }
+        // Byte-for-byte read of the runtime manifest. Value-free: the manifest
+        // holds declarations only — names, requiredness, descriptions, source
+        // ordering — never values, which live in the provider beside it. This
+        // arm deliberately does not touch `secrets`, so no provider value is
+        // ever resolved. Emitting the exact bytes is what lets the operator
+        // resync the tracked template (`export-declarations > tracked.toml`)
+        // without weakening `template-check`'s raw comparison to a semantic
+        // one (docs/design/template-check-resync.md).
+        "source-export-declarations" => match declaration_export(&manifest) {
+            Ok(bytes) => {
+                use std::io::Write;
+                match std::io::stdout().lock().write_all(&bytes) {
+                    Ok(()) => (0, vec![]),
+                    Err(e) => {
+                        eprintln!("broker: cannot write declarations: {e}");
+                        (2, vec![])
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("broker: cannot read manifest: {e}");
+                (2, vec![])
+            }
+        },
         // Manifest only: `codegen` never resolves a provider value. The
         // profile is the one in the root-owned config, not a caller flag —
         // an arbitrary profile would enumerate shapes the boundary is not
@@ -1579,6 +1604,20 @@ fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>
 /// the profile; the broker always passes the one from the root-owned config.
 fn emit_schema(spec: &secretspec::Spec, profile: &str) -> Result<String, String> {
     spec.schema_json(Some(profile)).map_err(|e| e.to_string())
+}
+
+/// The exact bytes `source-export-declarations` writes to stdout: the runtime
+/// manifest, verbatim.
+///
+/// Value-free by construction. The manifest holds declarations only — names,
+/// requiredness (`required` keys or the profile's `[defaults]`), descriptions,
+/// and source ordering — never secret values; those live in the provider beside
+/// it (`secrets.db`), which this path never opens. Returning the bytes
+/// untouched is what makes `export-declarations > tracked.toml` a byte-for-byte
+/// resync, the property `template-check`'s raw comparison depends on
+/// (docs/design/template-check-resync.md).
+fn declaration_export(manifest: &std::path::Path) -> Result<Vec<u8>, String> {
+    std::fs::read(manifest).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -1779,6 +1818,62 @@ PROD_ONLY = { description = "production-only token", required = true }
         assert!(emit_schema(&spec, "staging").is_err());
     }
 
+    #[test]
+    fn export_declarations_is_registered_and_read_only() {
+        // A typo in `SOURCE_OPS` would route the verb to the "unknown operation"
+        // arm, and a misclassification in `mutates_vault` would make concurrent
+        // reads write rollback copies into the vault. Both must be pinned.
+        assert!(SOURCE_OPS.contains(&"source-export-declarations"));
+        assert!(!mutates_vault("source-export-declarations"));
+    }
+
+    #[test]
+    fn export_declarations_is_byte_exact_and_value_free() {
+        // The manifest holds declarations only; the value store sits beside it
+        // in the same vault. `declaration_export` reads exactly one file, so a
+        // value written into the provider can never appear in its output.
+        let vault = temp_vault();
+        let manifest = vault.path().join("secretspec.toml");
+        let source = r#"[project]
+name = "resync-test"
+revision = "1"
+
+[defaults]
+required = true
+
+[profiles.default]
+DATABASE_URL = { description = "app database", required = true }
+API_KEY = { description = "optional api key", required = false }
+PROD_ONLY = { description = "production-only token" }
+"#;
+        std::fs::write(&manifest, source).unwrap();
+        // A value in the provider file, which the export must never read.
+        std::fs::write(
+            vault.path().join("secrets.db"),
+            b"DATABASE_URL=super-secret-value\n",
+        )
+        .unwrap();
+
+        let exported = declaration_export(&manifest).unwrap();
+
+        // Byte-exact: the resync property `template-check` depends on. A
+        // re-serialised document would silently change the bytes the review
+        // approved, which is exactly the weakening the design note forbids.
+        assert_eq!(exported, source.as_bytes());
+        // Ordering and requiredness (explicit `required` keys and the inherited
+        // `[defaults]`) are preserved verbatim, not normalised.
+        assert_eq!(
+            String::from_utf8(exported.clone()).unwrap(),
+            source,
+            "the export must be the manifest's exact bytes, not a re-render"
+        );
+        // No-value leakage: the provider's value never appears.
+        assert!(
+            !String::from_utf8_lossy(&exported).contains("super-secret-value"),
+            "the export must never contain a secret value"
+        );
+    }
+
     /// A `Mutation` over a temporary vault, with its rollback copies already
     /// written — the state `commit` runs against.
     ///
@@ -1925,6 +2020,7 @@ PROD_ONLY = { description = "production-only token", required = true }
             "source-export",
             "source-template-check",
             "source-schema",
+            "source-export-declarations",
         ] {
             assert!(!mutates_vault(op), "{op} must not take a rollback copy");
         }
