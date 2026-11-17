@@ -1859,12 +1859,9 @@ PROD_ONLY = { description = "production-only token" }
         // Byte-exact: the resync property `template-check` depends on. A
         // re-serialised document would silently change the bytes the review
         // approved, which is exactly the weakening the design note forbids.
-        assert_eq!(exported, source.as_bytes());
-        // Ordering and requiredness (explicit `required` keys and the inherited
-        // `[defaults]`) are preserved verbatim, not normalised.
         assert_eq!(
-            String::from_utf8(exported.clone()).unwrap(),
-            source,
+            exported.as_slice(),
+            source.as_bytes(),
             "the export must be the manifest's exact bytes, not a re-render"
         );
         // No-value leakage: the provider's value never appears.
