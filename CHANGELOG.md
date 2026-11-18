@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Release waits give delayed or non-green CI jobs an additional recovery window, then explain hosted-runner and local-build options without bypassing release verification.
+
 ### Added
 
 - `sudo-secretspec backup` (0.21.1-sudo.6+, macOS) adds opt-in encrypted

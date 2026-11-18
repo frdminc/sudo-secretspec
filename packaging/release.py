@@ -131,7 +131,9 @@ CI_RUN_LOOKUP_SECONDS = 5
 CI_WATCH_SECONDS = 75 * 60
 BOTTLE_WATCH_SECONDS = 110 * 60
 # How often `watch_jobs` re-reads the per-job conclusions.
-CI_JOB_POLL_SECONDS = 30
+CI_JOB_POLL_SECONDS = 60
+# One recovery window for a delayed runner or an operator-triggered rerun.
+CI_RECOVERY_SECONDS = 15 * 60
 # The macOS bottle is built by `sudo-release.yml` on the tag push (2026-10-18),
 # so `brew reinstall` pours it instead of compiling the crate graph on this Mac.
 # The workflow uploads the bottle and its JSON as this artifact on every run.
@@ -512,33 +514,55 @@ def find_run(branch: str, sha: str, *, workflow: str | None = None) -> int:
     raise ReleaseError(f"no GitHub Actions run appeared for {branch}")
 
 
-def watch_run(run_id: int, failure: str, *, timeout_s: float = CI_WATCH_SECONDS) -> str:
-    """Block until the run finishes; raise `failure` plus its URL unless green.
+def wait_next_action(run_id: int) -> str:
+    """Compare recovery paths without launching builds or bypassing gates."""
+    return (
+        "Release is blocked pending a green verdict; this wait has not cancelled "
+        "the remote run or deleted its artifacts. Next action: inspect "
+        f"`gh run view {run_id} -R {FORK_REPO} --log-failed` and runner availability. "
+        "Compare paths: (1) CI retry retains hosted artifacts/attestations; for "
+        "macOS runner trouble, compare the current runner with WarpBuild "
+        "`warp-macos-26-arm64-6x` in ci/base (an existing run keeps its original "
+        "workflow). (2) An explicitly chosen local build through `bg` avoids "
+        "the runner queue but consumes local resources and does not replace "
+        "required CI verdicts, published artifacts, attestations or bottle/linkage "
+        "verification. Fix source failures before retrying; do not treat them as "
+        "runner failures. Before publication, retry the CI gate with the updated "
+        "ci/base; after publication, follow the justfile RESUME RULES and finish "
+        "by hand, never re-run just release. No fallback has been started."
+    )
 
-    The wait is bounded. A `runs-on` label that matches nothing leaves the job
-    queued rather than failing, and an unbounded watch would then block here
-    for about a day -- for the bottle, *after* the tag and Release are already
-    public, which is the one state release.py refuses to re-enter (2026-10-20:
-    moving the bottle job to `xcode-27` is exactly the kind of edit that can
-    mistype a label).
-    """
+
+def watch_run(run_id: int, failure: str, *, timeout_s: float = CI_WATCH_SECONDS) -> str:
+    """Wait through one bounded recovery window; only green opens the gate."""
     url = f"https://github.com/{FORK_REPO}/actions/runs/{run_id}"
     log(f"CI: {url}")
+    argv = ["gh", "run", "watch", str(run_id), "-R", FORK_REPO,
+            "--exit-status", "--interval", str(CI_JOB_POLL_SECONDS)]
+    reason = "non-green verdict"
     try:
-        watched = run(
-            ["gh", "run", "watch", str(run_id), "-R", FORK_REPO, "--exit-status"],
-            capture=False,
-            check=False,
-            timeout=timeout_s,
-        )
+        if run(argv, capture=False, check=False, timeout=timeout_s).returncode == 0:
+            return url
     except subprocess.TimeoutExpired:
-        raise ReleaseError(
-            f"{failure}: no verdict after {timeout_s / 60:.0f} minutes, so the "
-            "run is queued or stuck rather than red (a runs-on label that "
-            f"matches no runner looks exactly like this): {url}"
-        ) from None
-    _require(watched.returncode == 0, f"{failure}: {url}")
-    return url
+        reason = f"no verdict after {timeout_s / 60:.0f} minutes (queued or stuck)"
+    log(f"{reason}: {url}; waiting up to {CI_RECOVERY_SECONDS / 60:.0f} "
+        "more minutes for recovery; no run will be cancelled")
+    deadline = time.monotonic() + CI_RECOVERY_SECONDS
+    while time.monotonic() < deadline:
+        # A completed red run returns immediately. Pace rechecks so a manual
+        # rerun can recover without a busy loop or an automatic paid build.
+        time.sleep(min(CI_JOB_POLL_SECONDS, max(0, deadline - time.monotonic())))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            if run(argv, capture=False, check=False, timeout=remaining).returncode == 0:
+                return url
+            reason = "non-green verdict"
+        except subprocess.TimeoutExpired:
+            break
+    raise ReleaseError(f"{failure}: {reason}; recovery wait exhausted: {url}. "
+                       + wait_next_action(run_id))
 
 
 def watch_jobs(
@@ -557,13 +581,14 @@ def watch_jobs(
     attested and published fine, and the reverse; and a macOS job stuck queued
     would hold the Linux verdict hostage for the whole deadline. So this polls
     the per-job conclusions and returns as soon as the jobs this caller needs
-    have concluded, or as soon as one of them is not green.
+    are green. Non-green or stuck jobs get one bounded recovery window.
     A name the run does not report is an error once the run has completed,
     never a pass: a renamed job must not silently stop being checked.
     """
     url = f"https://github.com/{FORK_REPO}/actions/runs/{run_id}"
     log(f"CI: {url}")
     deadline = time.monotonic() + timeout_s
+    recovering = False
     while True:
         view = json.loads(
             output(
@@ -578,17 +603,21 @@ def watch_jobs(
         completed = view.get("status") == "completed"
         settled = all(conclusions.get(name) for name in jobs)
         red = any(conclusions.get(name) not in (None, "", "success") for name in jobs)
-        if completed or settled or red:
-            break
-        if time.monotonic() >= deadline:
-            raise ReleaseError(
-                f"{failure}: no verdict after {timeout_s / 60:.0f} minutes, so "
-                "the jobs are queued or stuck rather than red (a runs-on label "
-                f"that matches no runner looks exactly like this): {url}"
-            )
-        time.sleep(CI_JOB_POLL_SECONDS)
+        if settled and not red:
+            return url
+        now = time.monotonic()
+        if completed or red or now >= deadline:
+            if not recovering:
+                recovering = True
+                deadline = now + CI_RECOVERY_SECONDS
+                log(f"Required jobs not green: {url}; waiting up to "
+                    f"{CI_RECOVERY_SECONDS / 60:.0f} more minutes for recovery")
+            elif now >= deadline:
+                break
+        time.sleep(min(CI_JOB_POLL_SECONDS, max(0, deadline - now)))
+    guidance = wait_next_action(run_id)
     for name in jobs:
-        _require(name in conclusions, f"{failure}: job {name!r} not in the run: {url}")
+        _require(name in conclusions, f"{failure}: job {name!r} not in the run: {url}. {guidance}")
 
     def severity(name: str) -> int:
         # A job that actually failed is the cause; one still running only
@@ -600,7 +629,8 @@ def watch_jobs(
     for name in sorted(jobs, key=severity):
         _require(
             conclusions[name] == "success",
-            f"{failure}: job {name!r} concluded {conclusions[name]!r}: {url}",
+            f"{failure}: job {name!r} concluded {conclusions[name]!r}; "
+            f"queued or stuck, or non-green after recovery wait: {url}. {guidance}",
         )
     return url
 
