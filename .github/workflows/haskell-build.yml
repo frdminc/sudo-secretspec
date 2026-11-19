@@ -127,6 +127,12 @@ jobs:
       - name: Install NASM (aws-lc-sys assembly)
         uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1.5.2
       # Build the MSVC CLI before entering the MSYS2 build environment.
+      - name: Install SQLite (the CLI links the system sqlite)
+        shell: pwsh
+        run: |
+          vcpkg install sqlite3:x64-windows
+          echo "SQLITE3_LIB_DIR=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\lib" >> $env:GITHUB_ENV
+          echo "SQLITE3_INCLUDE_DIR=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\include" >> $env:GITHUB_ENV
       - name: Build CLI for the test-suite
         run: cargo build -p secretspec
       # MINGW64 (msvcrt-based) matches the CRT the x86_64-pc-windows-gnu Rust
