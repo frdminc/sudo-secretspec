@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- A `test-boundary` build of `sudo-secretspec` installs its whole boundary under `/opt/sudo-secretspec-test` with its own service identity and sudoers policy, so privileged integration tests no longer have to touch the operational install. Release binaries cannot contain it: the layout is chosen at compile time and the release workflow rejects an artifact that carries the test prefix.
+
 - `sudo-secretspec get` no longer re-verifies the entire audit ledger on every call: an append resumes from the persisted ledger head instead of sequence zero, so its cost stops growing with the ledger's history (it was ~1.5 s of CPU at ~214k events). The full chain walk stays in `audit-verify`, which is what an externally pinned tip hash compares against. SHA-256 now also uses the platform's hardware implementation where one exists.
 
 - Release waits give delayed or non-green CI jobs an additional recovery window, then explain hosted-runner and local-build options without bypassing release verification.

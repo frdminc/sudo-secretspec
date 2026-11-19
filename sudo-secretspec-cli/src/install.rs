@@ -2093,6 +2093,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "test-boundary"))]
     fn linux_policy_names_fhs_paths_and_only_grants_broker_verbs() {
         let text = linux_sudoers_text("dann", "sudo-secretspec").unwrap();
         assert!(
@@ -2295,6 +2296,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "test-boundary"))]
     fn linux_artifacts_keep_the_public_client_separate_from_the_broker() {
         let artifacts = installed_artifacts_for_host(platform::Host::Linux);
         assert_eq!(
@@ -2644,7 +2646,11 @@ adopted_vault = true
         // second copy plus the pre-migration ledger, so BOTH directories exist.
         // A reinstall must follow the installed config, not the older directory.
         let (_tmp, config) = write_config(&installed_config(
-            "sudo-secretspec",
+            Path::new(DEFAULT_VAULT)
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap(),
             DEFAULT_USER,
             DEFAULT_GROUP,
         ));

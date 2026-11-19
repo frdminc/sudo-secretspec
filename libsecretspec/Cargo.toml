@@ -47,7 +47,7 @@ description = "C ABI for SecretSpec: resolve secrets from any language"
 # defaults include the sqlite provider, and a staticlib built with it demands
 # -lsqlite3 at link time (the Haskell SDK CI build has no sqlite dev package).
 # The ABI needs none of the provider features.
-secretspec-core = { workspace = true, default-features = false }
+secretspec-core.workspace = true
 
 [dev-dependencies]
 serde_json = { workspace = true }

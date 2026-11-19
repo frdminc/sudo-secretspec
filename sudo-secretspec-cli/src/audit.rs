@@ -1175,13 +1175,7 @@ pub(crate) fn append_event_waiting(
                     )
                     .optional()?
                 };
-                match previous {
-                    Some(previous) => Some((sequence - 1, previous)),
-                    // The row before the head's tip is gone: the head names
-                    // nothing the chain can anchor on. Prove the whole ledger
-                    // before appending to it.
-                    None => None,
-                }
+                previous.map(|previous| (sequence - 1, previous))
             }
             _ => None,
         };

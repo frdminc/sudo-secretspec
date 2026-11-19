@@ -52,6 +52,7 @@ const fn pick(override_value: Option<&'static str>, default: &'static str) -> &'
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "macos")]
+#[allow(dead_code)] // superseded by the test-boundary layout when that feature is on
 mod os {
     pub const SUDO: &str = "/usr/bin/sudo";
     pub const PREFIX: &str = "/usr/local";
@@ -95,25 +96,66 @@ mod os {
 /// Absolute path to `sudo`; never resolved through `PATH`.
 pub const SUDO: &str = pick(option_env!("SUDO_SECRETSPEC_SUDO"), os::SUDO);
 
+/// The test boundary (cargo feature `test-boundary`, off in every release
+/// build) relocates the whole layout to its own prefix and service identity,
+/// so privileged integration tests never touch the operational boundary.
+/// The packager `option_env!` overrides stay available either way; the feature
+/// only changes the defaults they fall back to. Because the choice is compile
+/// time, a test-boundary binary cannot be pointed at the production prefix at
+/// run time, and a production binary contains no test-boundary path at all.
+#[cfg(not(feature = "test-boundary"))]
+mod layout {
+    pub use super::os::{
+        BROKER_PATH, CONFIG_PATH, DEFAULT_GROUP, DEFAULT_USER, DEFAULT_VAULT, PREFIX,
+        SUDOERS_DIR, SUDOERS_FILE, VAULT_PARENT, VAULT_REAL_PARENT,
+    };
+}
+
+#[cfg(feature = "test-boundary")]
+mod layout {
+    pub const PREFIX: &str = "/opt/sudo-secretspec-test";
+    pub const BROKER_PATH: &str = "/opt/sudo-secretspec-test/libexec/sudo-secretspec";
+    pub const CONFIG_PATH: &str = "/opt/sudo-secretspec-test/etc/sudo-secretspec.toml";
+    /// Its own file, so the operational policy and this one can never be
+    /// mistaken for each other by the install manifest's hash check.
+    pub const SUDOERS_FILE: &str = "/private/etc/sudoers.d/sudo-secretspec-test";
+    pub const DEFAULT_VAULT: &str = "/opt/sudo-secretspec-test/sudo-secretspec";
+    pub const VAULT_PARENT: &str = "/opt/sudo-secretspec-test";
+    pub const VAULT_REAL_PARENT: &str = "/opt/sudo-secretspec-test";
+    pub const DEFAULT_USER: &str = "_sudo_secretspec_test";
+    pub const DEFAULT_GROUP: &str = "_sudo_secretspec_test";
+
+    #[cfg(target_os = "macos")]
+    pub const SUDOERS_DIR: &str = "/private/etc/sudoers.d";
+    #[cfg(target_os = "linux")]
+    pub const SUDOERS_DIR: &str = "/etc/sudoers.d";
+}
+
 /// Installed path of the privileged broker. The sudoers policy grants NOPASSWD
 /// execution of this path.
-pub const BROKER_PATH: &str = pick(option_env!("SUDO_SECRETSPEC_BROKER_PATH"), os::BROKER_PATH);
+pub const BROKER_PATH: &str = pick(
+    option_env!("SUDO_SECRETSPEC_BROKER_PATH"),
+    layout::BROKER_PATH,
+);
 
 /// Installed protected configuration.
-pub const CONFIG_PATH: &str = pick(option_env!("SUDO_SECRETSPEC_CONFIG_PATH"), os::CONFIG_PATH);
+pub const CONFIG_PATH: &str = pick(
+    option_env!("SUDO_SECRETSPEC_CONFIG_PATH"),
+    layout::CONFIG_PATH,
+);
 
-pub const PREFIX: &str = os::PREFIX;
-pub const SUDOERS_DIR: &str = os::SUDOERS_DIR;
-pub const SUDOERS_FILE: &str = os::SUDOERS_FILE;
+pub const PREFIX: &str = layout::PREFIX;
+pub const SUDOERS_DIR: &str = layout::SUDOERS_DIR;
+pub const SUDOERS_FILE: &str = layout::SUDOERS_FILE;
 /// Where the broker lives when it is *not* overridden at compile time: the path
 /// the imperative installer writes. A binary whose [`BROKER_PATH`] differs from
 /// this was built for a declared layout (the NixOS flake bakes a store path).
-pub const DEFAULT_BROKER_PATH: &str = os::BROKER_PATH;
-pub const DEFAULT_VAULT: &str = os::DEFAULT_VAULT;
-pub const VAULT_PARENT: &str = os::VAULT_PARENT;
-pub const VAULT_REAL_PARENT: &str = os::VAULT_REAL_PARENT;
-pub const DEFAULT_USER: &str = os::DEFAULT_USER;
-pub const DEFAULT_GROUP: &str = os::DEFAULT_GROUP;
+pub const DEFAULT_BROKER_PATH: &str = layout::BROKER_PATH;
+pub const DEFAULT_VAULT: &str = layout::DEFAULT_VAULT;
+pub const VAULT_PARENT: &str = layout::VAULT_PARENT;
+pub const VAULT_REAL_PARENT: &str = layout::VAULT_REAL_PARENT;
+pub const DEFAULT_USER: &str = layout::DEFAULT_USER;
+pub const DEFAULT_GROUP: &str = layout::DEFAULT_GROUP;
 
 // `secure_path` for the broker's `Defaults!` line, so `sudo` cannot hand the
 // privileged process a caller-chosen `PATH`, and the installed public client,
@@ -356,6 +398,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "test-boundary"))]
     fn debian_policy_names_usr_bin_and_the_client_directory() {
         assert_ne!(client_path(Host::Linux), "/usr/libexec/sudo-secretspec");
         assert!(secure_path(Host::Linux).split(':').any(|d| d == "/usr/bin"));
@@ -367,5 +410,29 @@ mod tests {
         assert!(secure_path(Host::Linux).split(':').any(|d| d == client_dir));
         // NixOS keeps its own shape: no /usr/bin.
         assert!(!secure_path(Host::NixOs).contains("/usr/bin"));
+    }
+
+    #[test]
+    fn the_two_boundaries_can_never_share_a_path() {
+        // The production layout and the test boundary (feature `test-boundary`)
+        // are the only two layouts this binary can be built with, and they must
+        // be disjoint: broker, config, vault and sudoers policy. The sudoers
+        // *directory* is shared by design — provenance, not path, separates the
+        // policies (uninstall.rs removes a policy only on a manifest hash match).
+        let production = [os::BROKER_PATH, os::CONFIG_PATH, os::DEFAULT_VAULT, os::SUDOERS_FILE];
+        let test_boundary = [
+            "/opt/sudo-secretspec-test/libexec/sudo-secretspec",
+            "/opt/sudo-secretspec-test/etc/sudo-secretspec.toml",
+            "/opt/sudo-secretspec-test/sudo-secretspec",
+            "/private/etc/sudoers.d/sudo-secretspec-test",
+        ];
+        for (prod, test) in production.iter().zip(test_boundary) {
+            assert_ne!(prod, &test, "layouts collide at {prod}");
+        }
+        let active = [BROKER_PATH, CONFIG_PATH, DEFAULT_VAULT, SUDOERS_FILE];
+        let expected = if cfg!(feature = "test-boundary") { test_boundary } else { production };
+        for (got, want) in active.iter().zip(expected) {
+            assert_eq!(got, &want);
+        }
     }
 }

@@ -400,6 +400,13 @@ jobs:
           fi
           cargo build --release --locked -p sudo-secretspec-cli --target x86_64-unknown-linux-gnu
           binary=target/x86_64-unknown-linux-gnu/release/sudo-secretspec
+          # The test-boundary feature relocates the whole layout; a release
+          # binary must not contain it. Feature unification could smuggle it in
+          # without the build line above naming it, so check the artifact.
+          if strings "$binary" | grep -F 'sudo-secretspec-test'; then
+            echo "release binary contains the test-boundary layout" >&2
+            exit 1
+          fi
           ldd "$binary"
           # Keep the advertised system-SQLite dependency honest if features change.
           readelf -d "$binary" > "$RUNNER_TEMP/dynamic.txt"

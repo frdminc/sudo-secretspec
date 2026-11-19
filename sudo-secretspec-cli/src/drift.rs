@@ -1400,7 +1400,7 @@ pub fn inspect_for_host(host: Host, layout: &Layout, opts: &InspectOptions) -> R
 /// particular, a fixture must never read health from the machine running CI.
 fn backup_health_is_for_layout(host: Host, layout: &Layout) -> bool {
     host == Host::MacOs
-        && layout.config == Path::new("/usr/local/etc/sudo-secretspec.toml")
+        && layout.config == Path::new(platform::CONFIG_PATH)
         && layout.client == Path::new("/usr/local/bin/sudo-secretspec")
         && layout.broker == Path::new("/usr/local/libexec/sudo-secretspec")
 }
@@ -1506,6 +1506,7 @@ service_group = "{group}"
     }
 
     #[test]
+    #[cfg(not(feature = "test-boundary"))]
     fn load_config_builds_single_binary_layout() {
         let tmp = tempdir().unwrap();
         let path = write_cfg(tmp.path());
@@ -1628,7 +1629,7 @@ service_group = "{group}"
         let tmp = tempdir().unwrap();
         let mut layout = layout_for_vault(tmp.path(), &tmp.path().join("vault"));
         assert!(!backup_health_is_for_layout(Host::MacOs, &layout));
-        layout.config = "/usr/local/etc/sudo-secretspec.toml".into();
+        layout.config = platform::CONFIG_PATH.into();
         layout.client = "/usr/local/bin/sudo-secretspec".into();
         layout.broker = "/usr/local/libexec/sudo-secretspec".into();
         assert!(backup_health_is_for_layout(Host::MacOs, &layout));

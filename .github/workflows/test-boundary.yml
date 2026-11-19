@@ -1,0 +1,48 @@
+name: "Test boundary lifecycle"
+
+# Exercises the privileged boundary end to end on a throwaway macOS runner:
+# install, declare, set, get, drift, rollback, uninstall, purge. A fresh runner
+# is the only place the destructive paths can run honestly; the operational
+# boundary on a development machine is shared infrastructure and never a test
+# target. Synthetic secrets only.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "sudo-secretspec-cli/**"
+      - ".github/workflows/test-boundary.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  lifecycle:
+    name: install to purge (macos)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build the test-boundary binary
+        run: cargo build --release --locked -p sudo-secretspec-cli --features test-boundary
+      - name: Run the lifecycle
+        run: |
+          set -euo pipefail
+          bin="$PWD/target/release/sudo-secretspec"
+          prefix=/opt/sudo-secretspec-test
+          spec="$(mktemp -d)/secretspec.toml"
+          printf '%s\n' '[secrets]' 'TEST_TOKEN = { description = "synthetic" }' > "$spec"
+          sudo "$bin" install --non-interactive --declarations "$spec" \
+            --operator "$USER" --profile default
+          sudo "$bin" set TEST_TOKEN --value synthetic-value --reason "lifecycle test"
+          got="$(sudo "$bin" get TEST_TOKEN --reason "lifecycle test")"
+          test "$got" = "synthetic-value"
+          sudo "$bin" drift
+          sudo "$bin" rollback --dry-run
+          sudo "$bin" uninstall --purge-vault --remove-service-user
+          test ! -e "$prefix"
+          # The operational boundary must not exist on this runner, and the test
+          # policy must be gone with the uninstall.
+          test ! -e /usr/local/libexec/sudo-secretspec
+          test ! -e /private/etc/sudoers.d/sudo-secretspec-test

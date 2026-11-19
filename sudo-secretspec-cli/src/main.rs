@@ -296,6 +296,23 @@ fn invoked_as_privileged_broker() -> bool {
 }
 
 fn main() {
+    // Fail closed across boundaries. A binary built for the test boundary must
+    // never operate the operational prefix, and the production layout must
+    // never contain the test prefix: the two are compile-time constants, so
+    // this is a tripwire against a layout edit that cross-wires them.
+    #[cfg(feature = "test-boundary")]
+    assert!(
+        !platform::BROKER_PATH.starts_with("/usr/local")
+            && !platform::CONFIG_PATH.starts_with("/usr/local")
+            && platform::DEFAULT_VAULT.starts_with("/opt/sudo-secretspec-test"),
+        "test-boundary build resolved to the operational prefix"
+    );
+    #[cfg(not(feature = "test-boundary"))]
+    assert!(
+        !platform::BROKER_PATH.contains("sudo-secretspec-test")
+            && !platform::CONFIG_PATH.contains("sudo-secretspec-test"),
+        "production build resolved to the test boundary"
+    );
     let cli = Cli::parse();
 
     // The libexec path is NOPASSWD for the operator. Boundary lifecycle must

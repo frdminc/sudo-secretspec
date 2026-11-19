@@ -12,6 +12,12 @@ path = "src/lib.rs"
 name = "sudo-secretspec"
 path = "src/main.rs"
 
+[features]
+# Relocates the whole install layout to /opt/sudo-secretspec-test with its own
+# service identity, so privileged integration tests never touch the operational
+# boundary. Off in every release build; packaging/release.py asserts that.
+test-boundary = []
+
 [dependencies]
 clap.workspace = true
 dotenv.workspace = true

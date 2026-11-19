@@ -1213,7 +1213,7 @@ mod tests {
             dry_run: true,
             purge_vault: false,
             remove_service_user: false,
-            config: PathBuf::from("/usr/local/etc/sudo-secretspec.toml"),
+            config: PathBuf::from(crate::platform::CONFIG_PATH),
         })
         .expect_err("uninstall must require root, including dry-run");
         assert!(err.to_string().contains("root"), "{err}");
