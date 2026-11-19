@@ -13,7 +13,14 @@ wait=1
 if [ "${1:-}" = "--no-wait" ]; then wait=0; shift; fi
 ref="${1:-HEAD}"
 
-top=$(git rev-parse --show-toplevel)
+# Anchor to this script's own repo, never the caller's cwd: running this
+# script from another checkout used to resolve $top (and the push remote)
+# to that other repo.
+top=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+git -C "$top" rev-parse --show-toplevel >/dev/null 2>&1 || {
+  echo "github-ci-run: $top is not a git work tree" >&2
+  exit 2
+}
 cd "$top"
 
 remote="${GITHUB_CI_REMOTE:-origin}"
