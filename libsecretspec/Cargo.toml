@@ -43,8 +43,11 @@ description = "C ABI for SecretSpec: resolve secrets from any language"
 
 [dependencies]
 # The envelope/resolve logic lives in the secretspec crate (resolve_json); this
-# crate is only the C ABI wrapper.
-secretspec-core.workspace = true
+# crate is only the C ABI wrapper. Default features stay off: the fork's
+# defaults include the sqlite provider, and a staticlib built with it demands
+# -lsqlite3 at link time (the Haskell SDK CI build has no sqlite dev package).
+# The ABI needs none of the provider features.
+secretspec-core = { workspace = true, default-features = false }
 
 [dev-dependencies]
 serde_json = { workspace = true }
