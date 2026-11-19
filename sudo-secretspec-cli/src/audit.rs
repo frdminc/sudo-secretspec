@@ -30,8 +30,10 @@
 //! one writer at a time and the write lock is the scarce thing. An append keeps
 //! its hold on it short and independent of the ledger's size:
 //!
-//! 1. the whole chain is verified first, in short read statements with no
-//!    transaction open, so no lock is held while the hashing runs;
+//! 1. the chain since the persisted `head` is verified first — the tip event
+//!    itself, then everything after it; a head that names nothing real falls
+//!    back to the whole chain — in short read statements with no transaction
+//!    open, so no lock is held while the hashing runs;
 //! 2. only then does it `BEGIN IMMEDIATE`, re-check just the rows that landed
 //!    since (usually none) and the `head` row, insert, and commit.
 //!
@@ -73,6 +75,13 @@
 //! inside the ledger — that is arithmetic, not a defect. An external watcher
 //! wanting it must pin the tip hash reported by [`verify`] somewhere outside
 //! the vault and compare on each run.
+//!
+//! For the same reason an append does not re-walk history: it verifies the
+//! tip event, the segment after it, and the `head` row, so a modification
+//! older than the head surfaces on the next [`verify`] (the external-pin
+//! path), not on the next append. Walking further back would prove nothing
+//! more against a principal who can write the ledger, because `head` lives
+//! in the same database as the events it names.
 
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
@@ -1133,14 +1142,53 @@ pub(crate) fn append_event_waiting(
     let result = (|| -> Result<AuditEvent, AuditError> {
         ensure_schema(&conn)?;
 
-        // Verify the whole chain *before* taking the write lock. This is the
-        // O(ledger) part of an append; run inside the write transaction it let
-        // one descheduled broker lock every other caller out for as long as it
-        // stayed descheduled (issue #4). Done here it holds no lock beyond one
-        // chunk fetch at a time, and the rows it covers are append-only, so what
-        // it proved is still true once the lock is taken.
-        let (verified_hash, verified_sequence) =
-            verify_chain_after(&conn, 0, ZERO_HASH.to_string())?;
+        // Verify the chain since the persisted head *before* taking the write
+        // lock — not the whole ledger. Re-walking every event on each append
+        // made a broker call cost O(history) CPU (issue #9), and `head` —
+        // written atomically with the last append — already names a verified
+        // tip. The resume re-verifies the tip event itself (payload and link,
+        // one rehash) and everything after it; the under-lock `check_head`
+        // then refuses any head that disagrees with what the rows say. A head
+        // that names nothing real falls back to the full walk. Whole-ledger
+        // proof stays with `audit-verify` and its externally pinned tip (see
+        // the module's "Residual risk" section).
+        // Like the old full walk this runs before `BEGIN IMMEDIATE`: no lock
+        // beyond one chunk fetch at a time, and the rows covered are
+        // append-only, so what it proved is still true once the lock is taken
+        // (issue #4).
+        let head: Option<(i64, String)> = conn
+            .query_row(
+                "SELECT sequence, event_hash FROM head WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let resume_after = match head {
+            Some((sequence, _)) if sequence >= 1 => {
+                let previous = if sequence == 1 {
+                    Some(ZERO_HASH.to_string())
+                } else {
+                    conn.query_row(
+                        "SELECT event_hash FROM events WHERE sequence = ?1",
+                        [sequence - 1],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                };
+                match previous {
+                    Some(previous) => Some((sequence - 1, previous)),
+                    // The row before the head's tip is gone: the head names
+                    // nothing the chain can anchor on. Prove the whole ledger
+                    // before appending to it.
+                    None => None,
+                }
+            }
+            _ => None,
+        };
+        let (verified_hash, verified_sequence) = match resume_after {
+            Some((after, previous)) => verify_chain_after(&conn, after, previous)?,
+            None => verify_chain_after(&conn, 0, ZERO_HASH.to_string())?,
+        };
 
         conn.execute("BEGIN IMMEDIATE", [])?;
 
@@ -2423,9 +2471,33 @@ mod tests {
     }
 
     #[test]
-    fn an_append_still_refuses_a_ledger_whose_history_was_altered() {
-        // Verification moved out of the write transaction. It must still run,
-        // and still stop the append, before anything is written.
+    fn an_append_does_not_rewalk_history_but_verify_catches_what_it_skips() {
+        // Appends resume from the persisted head (issue #9): tampering older
+        // than the head is no longer an append-time failure — the full walk in
+        // `verify`, backed by an externally pinned tip, is what reports it.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = protected_dir(tmp.path());
+        let uid = Some(unsafe { libc::getuid() });
+        let tx = uuid::Uuid::new_v4();
+        attempt(&dir, tx).unwrap();
+        terminal(&dir, tx, Outcome::Success, 0).unwrap();
+
+        let conn = Connection::open(dir.join(DB_NAME)).unwrap();
+        conn.execute(
+            "UPDATE events SET operation='source-get' WHERE sequence=1",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        attempt(&dir, uuid::Uuid::new_v4()).unwrap();
+        assert!(verify(&dir, uid).is_err(), "the full walk still catches it");
+    }
+
+    #[test]
+    fn an_append_still_refuses_a_tip_that_disagrees_with_the_head() {
+        // Tampering the event the head points at — payload edited, hashes left
+        // stale — stays an append-time failure: the resume recomputes the tip.
         let tmp = tempfile::tempdir().unwrap();
         let dir = protected_dir(tmp.path());
         let tx = uuid::Uuid::new_v4();
@@ -2434,7 +2506,7 @@ mod tests {
 
         let conn = Connection::open(dir.join(DB_NAME)).unwrap();
         conn.execute(
-            "UPDATE events SET operation='source-get' WHERE sequence=1",
+            "UPDATE events SET operation='source-get' WHERE sequence=2",
             [],
         )
         .unwrap();

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `sudo-secretspec get` no longer re-verifies the entire audit ledger on every call: an append resumes from the persisted ledger head instead of sequence zero, so its cost stops growing with the ledger's history (it was ~1.5 s of CPU at ~214k events). The full chain walk stays in `audit-verify`, which is what an externally pinned tip hash compares against. SHA-256 now also uses the platform's hardware implementation where one exists.
+
 - Release waits give delayed or non-green CI jobs an additional recovery window, then explain hosted-runner and local-build options without bypassing release verification.
 
 ### Added

@@ -85,7 +85,7 @@ bech32 = "0.11"
 ed25519-dalek = { version = "2.2", features = ["rand_core"] }
 p256 = { version = "0.13", default-features = false, features = ["arithmetic"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
-sha2 = { version = "0.10", features = ["oid"] }
+sha2 = { version = "0.10", features = ["oid", "asm"] }
 detect-coding-agent = "0.1"
 age = { version = "0.12", features = ["armor", "plugin", "ssh"] }
 ssh-key = { version = "0.6.7", features = ["crypto"] }
