@@ -79,8 +79,7 @@ jobs:
           devenv shell -- bash -c '
             set -euo pipefail
             cargo build -p libsecretspec -p secretspec
-            target_dir="$(cargo metadata --no-deps --format-version 1 \
-              | grep -o "\"target_directory\":\"[^\"]*\"" | head -1 | sed "s/.*:\"\(.*\)\"/\1/")"
+            target_dir="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
             export SECRETSPEC_BIN="$target_dir/debug/secretspec"
             # The codegen test runs the CLI, which links the system sqlite. devenv
             # builds against nix's sqlite but does not export its lib dir, so on
