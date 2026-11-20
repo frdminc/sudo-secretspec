@@ -82,6 +82,14 @@ jobs:
             target_dir="$(cargo metadata --no-deps --format-version 1 \
               | grep -o "\"target_directory\":\"[^\"]*\"" | head -1 | sed "s/.*:\"\(.*\)\"/\1/")"
             export SECRETSPEC_BIN="$target_dir/debug/secretspec"
+            # The codegen test runs the CLI, which links the system sqlite. devenv
+            # builds against nix's sqlite but does not export its lib dir, so on
+            # Linux the dynamic loader cannot find libsqlite3.so.0 at runtime.
+            # macOS finds Homebrew's sqlite via its install name, so it needs nothing.
+            if [ "$(uname)" = Linux ]; then
+              sqlite_lib="$(pkg-config --variable=libdir sqlite3)"
+              export LD_LIBRARY_PATH="$sqlite_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            fi
             # Capture the staticlib archive plus its transitive native deps. Stage
             # the .a alone so -lsecretspec resolves to the archive (target/debug
             # also holds the .so) and the resolver is embedded with no loader path.
