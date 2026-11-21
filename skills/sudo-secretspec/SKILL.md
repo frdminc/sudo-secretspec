@@ -22,10 +22,10 @@ optional backup integration (0.21.1-sudo.6+) is macOS-only. The install layout d
 `doctor`). Where this file says Touch ID or macOS paths, read "the operator's
 sudo password" and the Linux paths on a Linux host.
 
-Verified against client **0.19.1-sudo.15**. `sudo-secretspec --version` is the
-authority; if it reports something newer, re-read
-`sudo-secretspec/AI-GUIDANCE.md` rather than trusting this file's specifics.
-If it reports something *older*, the flags marked with a minimum version below
+Flags and behaviours that need a minimum client version are marked inline
+(for example `0.21.1-sudo.7+`); `sudo-secretspec --version` is the authority,
+and `sudo-secretspec/AI-GUIDANCE.md` in the distribution is the full policy
+contract. If your client is older than a flag's marked version, that flag
 will be rejected by your client — check `--help` before assuming a flag exists.
 
 ## Independent backups (0.21.1-sudo.6+, macOS)
@@ -449,20 +449,11 @@ explicit `unknown` terminal state if restoration cannot be proven.
   gateway — was wrong in both directions. `get`/`check` tell you about
   *declared* names only; grep the consumer for `lookup('env'` or its equivalent
   to learn which those are.
-- **`set`'s exit status on an undeclared name was already correct; this entry
-  used to claim otherwise.** Direct testing against the installed
-  0.19.1-sudo.22 boundary (2026-10-03) found it already returns a non-zero
-  exit and writes nothing — the opposite of what this note previously said.
-  What *was* real: the error message wrapped itself a second time, reading
-  `broker: Secret 'Secret '<NAME>' is not defined in profile '<P>' ...' not
-  found` — a fully-formed sentence re-wrapped by its own error type's
-  `Display` template. Fixed in 0.19.1-sudo.23: the message now reads once,
-  still naming the available secrets, and the exit status is unchanged. `get`
-  and `delete` on an undeclared name were audited at the same time and hit
-  the same double-wrap on their `SecretNotFound` path; `check` and
-  `undeclare` use a different error type and were already single-wrapped.
-  Still follow a `set` an unattended script depends on with a presence
-  check — a non-zero exit is the real signal, but confirming the value
+- **`set` on an undeclared name exits non-zero and writes nothing.** The
+  error names the secret and the available secrets (clients before
+  0.19.1-sudo.23 print that sentence wrapped twice, for `get` and `delete`
+  too; the exit status is the same). Still follow a `set` an unattended script depends on with a
+  presence check: a non-zero exit is the real signal, but confirming the value
   actually changed catches a different class of failure, such as a provider
   that silently no-ops.
 - **`run` needs no `sudo` and costs no Touch ID prompt.** The client is
