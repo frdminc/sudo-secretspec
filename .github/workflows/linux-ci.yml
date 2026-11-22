@@ -135,7 +135,7 @@ jobs:
 
   macos:
     name: macos (companion crate, release helper, formula)
-    runs-on: warp-macos-26-arm64-6x
+    runs-on: macos-26
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
