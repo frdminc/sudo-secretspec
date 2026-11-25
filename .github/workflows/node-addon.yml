@@ -89,6 +89,16 @@ jobs:
       - name: Sync SDK package versions
         run: bash scripts/sync-sdk-versions.sh
 
+      - name: Install SQLite (the CLI links the system sqlite)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          vcpkg install sqlite3:x64-windows
+          $prefix = Join-Path $env:VCPKG_INSTALLATION_ROOT "installed\x64-windows"
+          echo "SQLITE3_LIB_DIR=$prefix\lib" >> $env:GITHUB_ENV
+          echo "SQLITE3_INCLUDE_DIR=$prefix\include" >> $env:GITHUB_ENV
+          echo "$prefix\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
       - name: Install verified rustup (the manylinux container ships none)
         if: matrix.container
         run: |
@@ -176,7 +186,9 @@ jobs:
             bash -c '
               set -euo pipefail
               # setup-node serves glibc builds, so Node comes from Alpine.
-              apk add --no-cache nodejs npm
+              # sqlite-static is required for `-lsqlite3` when the CLI (default
+              # features) is built with the musl target in this image.
+              apk add --no-cache nodejs npm sqlite-dev sqlite-static
               bash scripts/install-rustup.sh
               export PATH="$HOME/.cargo/bin:$PATH"
               rustup toolchain install
