@@ -108,6 +108,12 @@ in
     # For development of the SOPS provider
     pkgs.sops
     pkgs.pkg-config
+    # The secretspec CLI links the system SQLite (rusqlite is not `bundled`).
+    # devenv may already build against a transitive nix sqlite, but without
+    # this package the shell does not export sqlite3.pc or the lib dir, so
+    # the Haskell SDK job's `pkg-config --variable=libdir sqlite3` fails and
+    # the codegen test cannot load libsqlite3.so.0 at runtime on Linux.
+    pkgs.sqlite
     # JSON parsing for libsecretspec-resolver, resolved through pkg-config
     # (Meson, cc-rs) and its CMake package config rather than vendored
     pkgs.yyjson

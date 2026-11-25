@@ -95,11 +95,16 @@ jobs:
           fi
           export SECRETSPEC_BIN="$target_dir/debug/secretspec"
           # The codegen test runs the CLI, which links the system sqlite. devenv
-          # builds against nix's sqlite but does not export its lib dir, so on
-          # Linux the dynamic loader cannot find libsqlite3.so.0 at runtime.
-          # macOS finds Homebrew's sqlite via its install name, so it needs nothing.
+          # builds against nix's sqlite but does not export its lib dir unless
+          # pkgs.sqlite is in devenv packages (so sqlite3.pc is on
+          # PKG_CONFIG_PATH). On Linux the dynamic loader then cannot find
+          # libsqlite3.so.0 at runtime. macOS finds Homebrew's sqlite via its
+          # install name, so it needs nothing.
           if [ "$(uname)" = Linux ]; then
-            sqlite_lib="$(pkg-config --variable=libdir sqlite3)"
+            if ! sqlite_lib="$(pkg-config --variable=libdir sqlite3)"; then
+              echo "error: pkg-config could not find sqlite3 (need pkgs.sqlite in devenv.nix)" >&2
+              exit 1
+            fi
             export LD_LIBRARY_PATH="$sqlite_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           fi
           # Capture the staticlib archive plus its transitive native deps. Stage
