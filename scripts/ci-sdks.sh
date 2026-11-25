@@ -45,23 +45,23 @@ export SECRETSPEC_BIN="$target_dir/debug/secretspec"
 
 # Raw linker flags for the legs that do not call pkg-config. A Rust staticlib
 # does not carry its own native dependency closure; NEVER hardcode this list --
-# it drifts as providers change.
-SECRETSPEC_FFI_NATIVE_LIBS="$(cargo rustc -q -p libsecretspec --crate-type staticlib -- \
-  --print native-static-libs 2>&1 | sed -n 's/^note: native-static-libs: //p' | tail -1)"
-export SECRETSPEC_FFI_NATIVE_LIBS
-
-# Static-link contract: SDKs link libsecretspec.a (the resolver compiled in)
-# instead of dlopening the cdylib. Stage the artifacts Cargo already built into
-# a test-only prefix. Using cargo-c here would compile the full dependency graph
-# again under target/<host-triple>, adding several minutes without adding test
-# coverage; release/install workflows still exercise cargo-c itself.
+# it drifts as providers change. Capture the flags from the same rustc
+# invocation that writes the archive we stage, then *copy* that archive into
+# the prefix. Symlinking target/debug/libsecretspec.a is racy: later suite
+# cargo invocations (or the unified `cargo build -p libsecretspec -p secretspec`
+# above) can rebuild that path with a different feature set, so the .pc's Libs
+# no longer match the archive (Ruby then fails to load with
+# `undefined symbol: sqlite3_changes`).
 echo "==> Staging staticlib + header + pkg-config file"
 SECRETSPEC_FFI_PREFIX="$target_dir/ci-sdk-prefix"
 export SECRETSPEC_FFI_PREFIX
 mkdir -p \
   "$SECRETSPEC_FFI_PREFIX/lib/pkgconfig" \
   "$SECRETSPEC_FFI_PREFIX/include"
-ln -sfn "$target_dir/debug/libsecretspec.a" \
+SECRETSPEC_FFI_NATIVE_LIBS="$(cargo rustc -q -p libsecretspec --crate-type staticlib -- \
+  --print native-static-libs 2>&1 | sed -n 's/^note: native-static-libs: //p' | tail -1)"
+export SECRETSPEC_FFI_NATIVE_LIBS
+cp -f "$target_dir/debug/libsecretspec.a" \
   "$SECRETSPEC_FFI_PREFIX/lib/libsecretspec.a"
 ln -sfn "$repo_root/libsecretspec/include/secretspec.h" \
   "$SECRETSPEC_FFI_PREFIX/include/secretspec.h"
