@@ -354,7 +354,11 @@ jobs:
       - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         if: matrix.musl == false
         with:
-          dotnet-version: "8.0.427"
+          # 8.0.427 is the patched 8.0 SDK, but its installer currently
+          # crashes on windows-11-arm (CLR 0x80131506). That RID uses
+          # 8.0.x; SecretSpec.PackageSmoke pins ILCompiler 8.0.33 so
+          # NativeAOT restore still avoids GHSA-p3jp-9v83-76w9.
+          dotnet-version: ${{ matrix.rid == 'win-arm64' && '8.0.x' || '8.0.427' }}
       - name: Install Linux NativeAOT toolchain
         if: runner.os == 'Linux' && matrix.musl == false
         run: |
