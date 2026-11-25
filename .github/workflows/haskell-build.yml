@@ -76,45 +76,57 @@ jobs:
         run: nix profile install nixpkgs#devenv
       - name: Build staticlib + CLI and run the Haskell SDK test-suite
         run: |
-          devenv shell -- bash -c '
-            set -euo pipefail
-            cargo build -p libsecretspec -p secretspec
-            # Double quotes around python -c (escaped quotes on the JSON key)
-            # so the one-liner stays inside the outer bash -c single quotes.
-            target_dir="$(cargo metadata --no-deps --format-version 1 | python3 -c "import json,sys; print(json.load(sys.stdin)[\"target_directory\"])")"
-            export SECRETSPEC_BIN="$target_dir/debug/secretspec"
-            # The codegen test runs the CLI, which links the system sqlite. devenv
-            # builds against nix's sqlite but does not export its lib dir, so on
-            # Linux the dynamic loader cannot find libsqlite3.so.0 at runtime.
-            # macOS finds Homebrew's sqlite via its install name, so it needs nothing.
-            if [ "$(uname)" = Linux ]; then
-              sqlite_lib="$(pkg-config --variable=libdir sqlite3)"
-              export LD_LIBRARY_PATH="$sqlite_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-            fi
-            # Capture the staticlib archive plus its transitive native deps. Stage
-            # the .a alone so -lsecretspec resolves to the archive (target/debug
-            # also holds the .so) and the resolver is embedded with no loader path.
-            native_libs="$(cargo rustc -q -p libsecretspec --crate-type staticlib -- \
-              --print native-static-libs 2>&1 | sed -n "s/^note: native-static-libs: //p" | tail -1)"
-            hs_lib_dir="$(mktemp -d)"
-            cp "$target_dir/debug/libsecretspec.a" "$hs_lib_dir/"
-            cd secretspec-hs
-            cabal update
-            # --write-ghc-environment-files lets the codegen test compile the
-            # quicktype-generated module; SECRETSPEC_BIN lets it run the CLI.
-            # All -optl flags go in ONE --ghc-options occurrence: cabal reverses
-            # the order of repeated occurrences, which breaks `-framework X`
-            # pairs on macOS.
-            cabal test --extra-lib-dirs="$hs_lib_dir" \
-              --ghc-options="-optl${native_libs// / -optl}" \
-              --write-ghc-environment-files=always --test-show-details=streaming
-            ffi_prefix="$(mktemp -d)"
-            bash ../libsecretspec/scripts/cinstall.sh "$ffi_prefix" static
-            PKG_CONFIG_PATH="$ffi_prefix/lib/pkgconfig" \
-              pkg-config --print-errors --exists libsecretspec
-            PKG_CONFIG_PATH="$ffi_prefix/lib/pkgconfig" cabal test -f use-pkg-config \
-              --write-ghc-environment-files=always --test-show-details=streaming
-          '
+          # Pass the body as a quoted heredoc so devenv's
+          # `eval "set --; exec $1"` wrapper does not have to re-parse a
+          # nested python3 -c string. The previous python one-liner was
+          # syntactically valid inside bash -c but still left target_dir
+          # empty on the Linux runner, so cp looked for /debug/libsecretspec.a
+          # (same path the earlier grep/sed extractor produced). jq is already
+          # in the devenv packages; `jq -re .target_directory` needs no extra
+          # quotes and -e fails if the field is missing or null.
+          devenv shell -- bash -c "$(cat <<'SCRIPT'
+          set -euo pipefail
+          cargo build -p libsecretspec -p secretspec
+          target_dir="$(cargo metadata --no-deps --format-version 1 | jq -re .target_directory)"
+          artifact="$target_dir/debug/libsecretspec.a"
+          if [ -z "$target_dir" ] || [ ! -f "$artifact" ]; then
+            echo "error: expected staticlib at $target_dir/debug/libsecretspec.a (target_dir=${target_dir:-<empty>})" >&2
+            exit 1
+          fi
+          export SECRETSPEC_BIN="$target_dir/debug/secretspec"
+          # The codegen test runs the CLI, which links the system sqlite. devenv
+          # builds against nix's sqlite but does not export its lib dir, so on
+          # Linux the dynamic loader cannot find libsqlite3.so.0 at runtime.
+          # macOS finds Homebrew's sqlite via its install name, so it needs nothing.
+          if [ "$(uname)" = Linux ]; then
+            sqlite_lib="$(pkg-config --variable=libdir sqlite3)"
+            export LD_LIBRARY_PATH="$sqlite_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          fi
+          # Capture the staticlib archive plus its transitive native deps. Stage
+          # the .a alone so -lsecretspec resolves to the archive (target/debug
+          # also holds the .so) and the resolver is embedded with no loader path.
+          native_libs="$(cargo rustc -q -p libsecretspec --crate-type staticlib -- \
+            --print native-static-libs 2>&1 | sed -n "s/^note: native-static-libs: //p" | tail -1)"
+          hs_lib_dir="$(mktemp -d)"
+          cp "$artifact" "$hs_lib_dir/"
+          cd secretspec-hs
+          cabal update
+          # --write-ghc-environment-files lets the codegen test compile the
+          # quicktype-generated module; SECRETSPEC_BIN lets it run the CLI.
+          # All -optl flags go in ONE --ghc-options occurrence: cabal reverses
+          # the order of repeated occurrences, which breaks `-framework X`
+          # pairs on macOS.
+          cabal test --extra-lib-dirs="$hs_lib_dir" \
+            --ghc-options="-optl${native_libs// / -optl}" \
+            --write-ghc-environment-files=always --test-show-details=streaming
+          ffi_prefix="$(mktemp -d)"
+          bash ../libsecretspec/scripts/cinstall.sh "$ffi_prefix" static
+          PKG_CONFIG_PATH="$ffi_prefix/lib/pkgconfig" \
+            pkg-config --print-errors --exists libsecretspec
+          PKG_CONFIG_PATH="$ffi_prefix/lib/pkgconfig" cabal test -f use-pkg-config \
+            --write-ghc-environment-files=always --test-show-details=streaming
+          SCRIPT
+          )"
 
   build-windows:
     name: build (windows)
