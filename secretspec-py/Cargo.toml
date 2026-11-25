@@ -1,6 +1,9 @@
 [package]
 name = "secretspec-py-native"
-version.workspace = true
+# maturin requires a PEP 440 version. The workspace uses SemVer pre-release
+# identifiers such as 0.21.1-sudo.7, which PEP 440 rejects. Keep this in
+# lockstep with pyproject.toml (scripts/sync-sdk-versions.sh writes both).
+version = "0.21.1"
 edition.workspace = true
 repository = "https://github.com/cachix/secretspec"
 description = "pyo3 extension for the Python SDK"

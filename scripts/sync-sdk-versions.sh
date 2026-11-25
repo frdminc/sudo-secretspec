@@ -32,6 +32,41 @@ if [[ ! "$workspace_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9
   exit 1
 fi
 
+# maturin (and PEP 440) reject SemVer pre-release identifiers the workspace
+# uses, such as 0.21.1-sudo.7. Map those to a local version (0.21.1+sudo.7).
+# Well-known PEP 440 pre-release labels are normalized instead of being
+# treated as local versions.
+pep440_version() {
+  local ver="$1"
+  local base pre build
+  build=""
+  if [[ "$ver" == *+* ]]; then
+    build="+${ver#*+}"
+    ver="${ver%%+*}"
+  fi
+  if [[ "$ver" != *-* ]]; then
+    printf '%s%s\n' "$ver" "$build"
+    return
+  fi
+  base="${ver%%-*}"
+  pre="${ver#*-}"
+  case "$pre" in
+    a[0-9]*|a.*|b[0-9]*|b.*|c[0-9]*|c.*|rc*|dev*|alpha*|beta*|preview*|pre[0-9]*|pre.*)
+      # 0.13.0-rc.1 -> 0.13.0rc1
+      pre="$(printf '%s' "$pre" | tr -d .)"
+      printf '%s%s%s\n' "$base" "$pre" "$build"
+      ;;
+    *)
+      # 0.21.1-sudo.7 -> 0.21.1+sudo.7; keep any existing build tag as +foo.bar
+      if [[ -n "$build" ]]; then
+        printf '%s+%s.%s\n' "$base" "$pre" "${build#+}"
+      else
+        printf '%s+%s\n' "$base" "$pre"
+      fi
+      ;;
+  esac
+}
+
 tag_version=""
 if [[ "${GITHUB_REF_TYPE:-}" == "tag" && -n "${GITHUB_REF_NAME:-}" ]]; then
   tag_version="${GITHUB_REF_NAME#v}"
@@ -53,10 +88,25 @@ update_file() {
 
   case "$kind" in
     pyproject)
-      awk -v version="$workspace_version" '
+      awk -v version="$pep440_version" '
         /^\[project\][[:space:]]*$/ { in_project = 1 }
         /^\[/ && $0 !~ /^\[project\][[:space:]]*$/ { in_project = 0 }
         in_project && /^[[:space:]]*version[[:space:]]*=/ {
+          print "version = \"" version "\""
+          changed = 1
+          next
+        }
+        { print }
+        END { if (!changed) exit 1 }
+      ' "$file" > "$tmp"
+      ;;
+    cargo-package)
+      # The pyo3 crate's version must be PEP 440; it cannot inherit the
+      # workspace SemVer pre-release (maturin parses Cargo.toml directly).
+      awk -v version="$pep440_version" '
+        /^\[package\][[:space:]]*$/ { in_package = 1 }
+        /^\[/ && $0 !~ /^\[package\][[:space:]]*$/ { in_package = 0 }
+        in_package && /^[[:space:]]*version[[:space:]]*=/ {
           print "version = \"" version "\""
           changed = 1
           next
@@ -155,7 +205,13 @@ update_file() {
   mv "$tmp" "$file"
 }
 
+pep440_version="$(pep440_version "$workspace_version")"
+if [[ "$pep440_version" != "$workspace_version" ]]; then
+  echo "mapping workspace version to PEP 440 for Python: $workspace_version -> $pep440_version" >&2
+fi
+
 update_file secretspec-py/pyproject.toml pyproject
+update_file secretspec-py/Cargo.toml cargo-package
 update_file secretspec-rb/secretspec.gemspec gemspec
 update_file secretspec-hs/secretspec.cabal cabal
 update_file secretspec-node/package.json package-json
