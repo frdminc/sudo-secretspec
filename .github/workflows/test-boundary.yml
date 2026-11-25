@@ -26,10 +26,23 @@ jobs:
           persist-credentials: false
       - name: Build the test-boundary binary
         run: cargo build --release --locked -p sudo-secretspec-cli --features test-boundary
+      # install(1) refuses a cargo build tree: it expects distribution media
+      # (libexec/sudo-secretspec plus the share/ guidance files). Stage the
+      # same layout the Linux artifact and debian smoke test use, then run
+      # the broker from that media so source_root is inferred correctly.
+      - name: Stage installer media
+        run: |
+          set -euo pipefail
+          media="$PWD/target/test-boundary-media"
+          install -d "$media/libexec" "$media/share/sudo-secretspec"
+          install -m755 "$PWD/target/release/sudo-secretspec" "$media/libexec/sudo-secretspec"
+          install -m644 "$PWD/sudo-secretspec/AI-GUIDANCE.md" "$media/share/sudo-secretspec/AI-GUIDANCE.md"
+          install -m644 "$PWD/sudo-secretspec/sudo-secretspec-retired.toml" \
+            "$media/share/sudo-secretspec/sudo-secretspec-retired.toml"
       - name: Run the lifecycle
         run: |
           set -euo pipefail
-          bin="$PWD/target/release/sudo-secretspec"
+          bin="$PWD/target/test-boundary-media/libexec/sudo-secretspec"
           prefix=/opt/sudo-secretspec-test
           spec="$(mktemp -d)/secretspec.toml"
           printf '%s\n' '[secrets]' 'TEST_TOKEN = { description = "synthetic" }' > "$spec"
