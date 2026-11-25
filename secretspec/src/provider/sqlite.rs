@@ -174,12 +174,13 @@ impl SqliteProvider {
         // 30s covers contended history-schema opens on slower disks (notably
         // Windows CI), where a 5s timeout still surfaced SQLITE_BUSY under the
         // concurrent-open test. BEGIN IMMEDIATE waits this long.
-        conn.busy_timeout(Duration::from_secs(30)).map_err(|error| {
-            operation_error(format!(
-                "failed to configure sqlite database '{}': {error}",
-                self.config.path.display()
-            ))
-        })?;
+        conn.busy_timeout(Duration::from_secs(30))
+            .map_err(|error| {
+                operation_error(format!(
+                    "failed to configure sqlite database '{}': {error}",
+                    self.config.path.display()
+                ))
+            })?;
         let mut init_sql = String::from(
             // `foreign_keys` is off by default and is a *per-connection* setting,
             // so without this the REFERENCES clauses on `captured_values` below
