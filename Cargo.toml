@@ -68,7 +68,6 @@ azure_identity = "1.0.0"
 azure_security_keyvault_secrets = "1.0.0"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
-secretspec-derive = { version = "0.21.1-sudo.7", path = "./secretspec-derive" }
 secretspec = { version = "0.21.1-sudo.7", path = "./secretspec" }
 secretspec-core = { package = "secretspec", version = "0.21.1-sudo.7", path = "./secretspec", default-features = false }
 rand = "0.10"
@@ -95,7 +94,6 @@ json-patch = "4.2.0"
 async-trait = "0.1"
 futures-util = "0.3"
 tokio-util = { version = "0.7", features = ["rt"] }
-zeroize = { version = "1.8", features = ["derive"] }
 secretspec-ipc = { version = "0.21.1-sudo.7", path = "./secretspec-ipc" }
 aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys"] }
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }

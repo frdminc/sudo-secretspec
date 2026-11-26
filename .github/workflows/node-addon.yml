@@ -6,12 +6,16 @@ name: "Node addon"
 # optionalDependencies) using @napi-rs/cli, authenticated via npm Trusted
 # Publishing (OIDC) -- no NPM_TOKEN stored in CI.
 #
-# The glibc Linux builds run inside manylinux_2_28 containers (AlmaLinux 8,
-# glibc 2.28), so the published addon loads on any distro with glibc >= 2.28
-# (RHEL 8/9, Amazon Linux 2023, Debian 10+, Ubuntu 18.10+). Building on the bare
-# runner instead links the runner's glibc (2.39 on ubuntu-24.04), which broke
-# RHEL 9-family distros (issue #136). A post-build step fails the job if the
-# addon's glibc floor or NEEDED libraries regress.
+# The glibc Linux builds run in manylinux_2_28 images (AlmaLinux 8, glibc
+# 2.28) via `docker run`, so the published addon loads on any distro with
+# glibc >= 2.28 (RHEL 8/9, Amazon Linux 2023, Debian 10+, Ubuntu 18.10+).
+# Building on the bare runner instead links the runner's glibc (2.39 on
+# ubuntu-24.04), which broke RHEL 9-family distros (issue #136). A GitHub
+# Actions job container still mounts the runner tool cache and can leave
+# rustup's $HOME pointing at /github/home while the process is root, so
+# the linker may record GLIBC_2.29 from the host libm; docker run keeps
+# the toolchain and the 2.28 sysroot together. A post-build step fails the
+# job if the addon's glibc floor or NEEDED libraries regress.
 #
 # The musl builds live in a separate `musl` job, because an Alpine job container
 # cannot run JavaScript actions on an ARM runner. npm keeps the two libc variants
@@ -63,7 +67,6 @@ jobs:
       github.event_name != 'pull_request' ||
       !startsWith(github.event.pull_request.title, 'Release ')
     runs-on: ${{ matrix.runner }}
-    container: ${{ matrix.container || null }}
     strategy:
       fail-fast: false
       matrix:
@@ -74,11 +77,11 @@ jobs:
           - target: linux-x64
             platform: linux-x64-gnu
             runner: ubuntu-latest
-            container: quay.io/pypa/manylinux_2_28_x86_64:2026.08.05-1@sha256:e0b40ace8e818e96026eb47714b01998cbca022a6995797d0905474ce3e82ae8
+            image: quay.io/pypa/manylinux_2_28_x86_64:2026.08.05-1@sha256:e0b40ace8e818e96026eb47714b01998cbca022a6995797d0905474ce3e82ae8
           - target: linux-arm64
             platform: linux-arm64-gnu
             runner: ubuntu-24.04-arm
-            container: quay.io/pypa/manylinux_2_28_aarch64:2026.08.05-1@sha256:f766b402889e40f439e7a3ee5788eef1aa3ef399d0110107d27419fa2ba9d905
+            image: quay.io/pypa/manylinux_2_28_aarch64:2026.08.05-1@sha256:f766b402889e40f439e7a3ee5788eef1aa3ef399d0110107d27419fa2ba9d905
           - { target: darwin-arm64, platform: darwin-arm64, runner: macos-latest }
           - { target: win32-x64, platform: win32-x64-msvc, runner: windows-latest }
 
@@ -89,29 +92,95 @@ jobs:
       - name: Sync SDK package versions
         run: bash scripts/sync-sdk-versions.sh
 
-      - name: Install verified rustup (the manylinux container ships none)
-        if: matrix.container
+      - name: Install SQLite (the CLI links the system sqlite)
+        if: runner.os == 'Windows'
+        shell: pwsh
         run: |
-          bash scripts/install-rustup.sh
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          # Link SQLite statically so the published artifact does not need a
+          # sqlite3.dll next to it. The static-md triplet keeps the dynamic C
+          # runtime that Rust's MSVC target uses.
+          vcpkg install sqlite3:x64-windows-static-md
+          $prefix = Join-Path $env:VCPKG_INSTALLATION_ROOT "installed\x64-windows-static-md"
+          echo "SQLITE3_LIB_DIR=$prefix\lib" >> $env:GITHUB_ENV
+          echo "SQLITE3_INCLUDE_DIR=$prefix\include" >> $env:GITHUB_ENV
+          echo "SQLITE3_STATIC=1" >> $env:GITHUB_ENV
 
       - name: Install Rust (pinned by rust-toolchain.toml)
+        if: ${{ !matrix.image }}
         run: rustup toolchain install
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: ${{ !matrix.image }}
         with:
           node-version: "22"
       - name: Install napi CLI
+        if: ${{ !matrix.image }}
         run: npm ci
         working-directory: secretspec-node
 
       - name: Build the addon and run the SDK tests
+        if: ${{ !matrix.image }}
         shell: bash
         run: |
           bash secretspec-node/scripts/build-addon.sh
           ( cd secretspec-node && node --test )
 
+      - name: Build the addon and run the SDK tests (manylinux)
+        if: ${{ matrix.image }}
+        shell: bash
+        run: |
+          # Job containers still expose the runner tool cache and set
+          # HOME=/github/home while the process is root, which has produced
+          # addons that require GLIBC_2.29 even though this image is 2.28.
+          # docker run keeps rustc and the 2.28 sysroot isolated, the same
+          # shape the musl jobs already use.
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE:/workspace" \
+            --workdir /workspace \
+            --env HOME=/root \
+            "${{ matrix.image }}" \
+            bash -c '
+              set -euo pipefail
+              bash scripts/install-rustup.sh
+              export PATH="$HOME/.cargo/bin:$PATH"
+              rustup toolchain install
+              # The addon links system sqlite (rusqlite is not bundled).
+              # Prefer a static archive so the .node does not need libsqlite3
+              # at load time; fall back to the shared library if no .a is
+              # in the image.
+              yum install -y sqlite-devel
+              yum install -y sqlite-static || true
+              # SQLITE3_STATIC alone is not enough: libsqlite3-sys asks
+              # pkg-config first, even with SQLITE3_LIB_DIR set, and
+              # pkg-config links system-directory libraries dynamically.
+              # SQLITE3_NO_PKG_CONFIG skips that probe so the archive in
+              # SQLITE3_LIB_DIR is linked statically.
+              for d in /usr/lib64 /usr/lib; do
+                if [ -f "$d/libsqlite3.a" ]; then
+                  export SQLITE3_STATIC=1 SQLITE3_NO_PKG_CONFIG=1 \
+                    SQLITE3_LIB_DIR="$d" SQLITE3_INCLUDE_DIR=/usr/include
+                  break
+                fi
+              done
+              case "$(uname -m)" in
+                x86_64) nodearch=x64 ;;
+                aarch64) nodearch=arm64 ;;
+                *) echo "unsupported arch $(uname -m)" >&2; exit 1 ;;
+              esac
+              # Pin matches the Node 22 line setup-node currently installs.
+              node_ver=22.23.5
+              curl -fsSL "https://nodejs.org/dist/v${node_ver}/node-v${node_ver}-linux-${nodearch}.tar.xz" \
+                | tar -xJ -C /usr/local --strip-components=1
+              # Omit optionalDependencies: package.json still pins published
+              # 0.12.2 platform packages, which can mask a local load error
+              # with their own glibc floor.
+              ( cd secretspec-node && npm ci --omit=optional )
+              bash secretspec-node/scripts/build-addon.sh
+              bash scripts/check-linux-portability.sh secretspec-node/secretspec.node
+              ( cd secretspec-node && node --test )
+            '
+
       - name: Verify addon portability (glibc <= 2.28, no libdbus)
-        if: matrix.container
+        if: ${{ matrix.image }}
         shell: bash
         run: bash scripts/check-linux-portability.sh secretspec-node/secretspec.node
 
@@ -172,22 +241,41 @@ jobs:
             --workdir /workspace \
             --env CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=gcc \
             --env CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=gcc \
+            --env SQLITE3_STATIC=1 \
+            --env SQLITE3_LIB_DIR=/usr/lib \
+            --env SQLITE3_NO_PKG_CONFIG=1 \
+            --env SQLITE3_INCLUDE_DIR=/usr/include \
             "${{ matrix.image }}" \
             bash -c '
               set -euo pipefail
               # setup-node serves glibc builds, so Node comes from Alpine.
-              apk add --no-cache nodejs npm
+              # The addon links the system sqlite (rusqlite is not bundled).
+              # SQLITE3_STATIC plus sqlite-static embeds libsqlite3.a so the
+              # later node:alpine smoke test can load the addon without a
+              # distro libsqlite3 package. SQLITE3_LIB_DIR plus
+              # SQLITE3_NO_PKG_CONFIG are needed because pkg-config links
+              # libraries in /usr/lib dynamically even when SQLITE3_STATIC
+              # is set. One SDK test also builds the
+              # secretspec CLI, which links statically on musl and needs
+              # the static zlib archive.
+              apk add --no-cache nodejs npm sqlite-dev sqlite-static zlib-dev zlib-static
               bash scripts/install-rustup.sh
               export PATH="$HOME/.cargo/bin:$PATH"
               rustup toolchain install
-              ( cd secretspec-node && npm ci )
+              ( cd secretspec-node && npm ci --omit=optional )
               bash secretspec-node/scripts/build-addon.sh
               ( cd secretspec-node && node --test )
             '
 
       - name: Verify addon portability (musl libc, no libdbus)
         shell: bash
-        run: bash scripts/check-musl-portability.sh secretspec-node/secretspec.node
+        run: |
+          bash scripts/check-musl-portability.sh secretspec-node/secretspec.node
+          # SQLite must be linked in, not loaded from the distro at runtime.
+          if readelf -d secretspec-node/secretspec.node | grep -q 'libsqlite3'; then
+            echo "secretspec.node still needs a shared libsqlite3" >&2
+            exit 1
+          fi
 
       - name: Load the addon on node:alpine
         shell: bash

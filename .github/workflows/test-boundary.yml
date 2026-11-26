@@ -1,10 +1,10 @@
 name: "Test boundary lifecycle"
 
 # Exercises the privileged boundary end to end on a throwaway macOS runner:
-# install, declare, set, get, drift, rollback, uninstall, purge. A fresh runner
-# is the only place the destructive paths can run honestly; the operational
-# boundary on a development machine is shared infrastructure and never a test
-# target. Synthetic secrets only.
+# install, declare, set, get, template-check (drift), reinstall, rollback,
+# uninstall, purge. A fresh runner is the only place the destructive paths can
+# run honestly; the operational boundary on a development machine is shared
+# infrastructure and never a test target. Synthetic secrets only.
 
 on:
   workflow_dispatch:
@@ -26,22 +26,67 @@ jobs:
           persist-credentials: false
       - name: Build the test-boundary binary
         run: cargo build --release --locked -p sudo-secretspec-cli --features test-boundary
+      # install(1) refuses a cargo build tree: it expects distribution media
+      # (libexec/sudo-secretspec plus the share/ guidance files). Stage the
+      # same layout the Linux artifact and debian smoke test use, then run
+      # the broker from that media so source_root is inferred correctly.
+      - name: Stage installer media
+        run: |
+          set -euo pipefail
+          media="$PWD/target/test-boundary-media"
+          install -d "$media/libexec" "$media/share/sudo-secretspec"
+          install -m755 "$PWD/target/release/sudo-secretspec" "$media/libexec/sudo-secretspec"
+          install -m644 "$PWD/sudo-secretspec/AI-GUIDANCE.md" "$media/share/sudo-secretspec/AI-GUIDANCE.md"
+          install -m644 "$PWD/sudo-secretspec/sudo-secretspec-retired.toml" \
+            "$media/share/sudo-secretspec/sudo-secretspec-retired.toml"
       - name: Run the lifecycle
         run: |
           set -euo pipefail
-          bin="$PWD/target/release/sudo-secretspec"
+          bin="$PWD/target/test-boundary-media/libexec/sudo-secretspec"
           prefix=/opt/sudo-secretspec-test
           spec="$(mktemp -d)/secretspec.toml"
-          printf '%s\n' '[secrets]' 'TEST_TOKEN = { description = "synthetic" }' > "$spec"
+          # A secretspec.toml requires [project] and lists secrets under
+          # [profiles.default], not a top-level [secrets] table.
+          printf '%s\n' \
+            '[project]' \
+            'name = "lifecycle-test"' \
+            'revision = "1.0"' \
+            '' \
+            '[profiles.default]' \
+            'TEST_TOKEN = { description = "synthetic" }' > "$spec"
           sudo "$bin" install --non-interactive --declarations "$spec" \
             --operator "$USER" --profile default
-          sudo "$bin" set TEST_TOKEN --value synthetic-value --reason "lifecycle test"
+          # set reads the secret from stdin (there is no --value flag).
+          printf '%s\n' 'synthetic-value' | sudo "$bin" set TEST_TOKEN --reason "lifecycle test"
           got="$(sudo "$bin" get TEST_TOKEN --reason "lifecycle test")"
           test "$got" = "synthetic-value"
-          sudo "$bin" drift
-          sudo "$bin" rollback --dry-run
+          # Drift is reported by template-check; it needs a reason like get.
+          sudo "$bin" template-check --reason "lifecycle test"
+          # rollback has no dry-run mode and a first install leaves only an
+          # empty (unrestorable) snapshot. Reinstall over the boundary so the
+          # first install's artifacts are captured, then roll back to that
+          # snapshot, which restores the same bytes.
+          sleep 1
+          sudo "$bin" install --non-interactive --declarations "$spec" \
+            --operator "$USER" --profile default --adopt-existing
+          # Snapshot names end in a Unix timestamp, so the newest one sorts
+          # last and is the one the reinstall just captured.
+          snap="$(sudo find "$prefix/libexec" -maxdepth 1 -name 'sudo-secretspec-rollback-*' \
+            | sort | tail -n 1)"
+          test -n "$snap"
+          sudo "$bin" rollback "$snap"
+          got="$(sudo "$bin" get TEST_TOKEN --reason "lifecycle test")"
+          test "$got" = "synthetic-value"
           sudo "$bin" uninstall --purge-vault --remove-service-user
-          test ! -e "$prefix"
+          # uninstall removes the files it installed and the vault, but leaves
+          # the empty prefix directories behind (it only deletes what it owns).
+          # Fail if anything other than an empty directory is left.
+          leftover="$(sudo find "$prefix" -mindepth 1 ! -type d 2>/dev/null || true)"
+          if [ -n "$leftover" ]; then
+            printf 'left behind under %s:\n%s\n' "$prefix" "$leftover" >&2
+            exit 1
+          fi
+          test ! -e "$prefix/sudo-secretspec"
           # The operational boundary must not exist on this runner, and the test
           # policy must be gone with the uninstall.
           test ! -e /usr/local/libexec/sudo-secretspec

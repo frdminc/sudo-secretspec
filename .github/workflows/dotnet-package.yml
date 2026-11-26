@@ -111,9 +111,12 @@ jobs:
       - name: Install Rust
         run: rustup toolchain install
 
+      # Pin the patched 8.0.428 SDK (runtime 8.0.34) so NativeAOT restore
+      # does not pull an unpatched Microsoft.DotNet.ILCompiler (NU1903 /
+      # GHSA-p3jp-9v83-76w9). 8.0.x on some runners was still 8.0.29 or 8.0.30.
       - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
-          dotnet-version: "8.0.x"
+          dotnet-version: "8.0.428"
 
       - name: Build native resolver
         shell: bash
@@ -269,7 +272,7 @@ jobs:
         run: bash scripts/sync-sdk-versions.sh
       - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
-          dotnet-version: "8.0.x"
+          dotnet-version: "8.0.428"
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: dotnet-native-*
@@ -351,7 +354,13 @@ jobs:
       - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         if: matrix.musl == false
         with:
-          dotnet-version: "8.0.x"
+          # 8.0.428 ships runtime and ILCompiler 8.0.34, which are patched
+          # for GHSA-p3jp-9v83-76w9. 8.0.427 (runtime 8.0.33) still restored
+          # a vulnerable 8.0.30 compiler on macos-15-intel, and the older
+          # 8.0-alpine image used for musl restored 8.0.29. The smoke
+          # project also pins both packs to 8.0.34 so those restores cannot
+          # drift. 8.0.428's installer works on windows-11-arm, unlike 8.0.427.
+          dotnet-version: "8.0.428"
       - name: Install Linux NativeAOT toolchain
         if: runner.os == 'Linux' && matrix.musl == false
         run: |
@@ -376,7 +385,7 @@ jobs:
           # RID restore then adds NuGet.org for Microsoft runtime/AOT packs
           # without any chance of selecting the already-published bootstrap.
           dotnet restore "$project" --source "$package_source" \
-            -p:Version="$version"
+            -p:Version="$version" -p:SecretSpecArtifactOnlyRestore=true
           dotnet restore "$project" --runtime "${{ matrix.rid }}" \
             --source "$package_source" \
             --source https://api.nuget.org/v3/index.json \
@@ -425,7 +434,8 @@ jobs:
           # Prime an isolated package cache from the artifact-only source. The
           # RID/AOT restore then uses the runner's standard NuGet configuration
           # for Microsoft runtime packs without selecting a published SDK copy.
-          dotnet restore $project --source $packageSource "-p:Version=$version"
+          dotnet restore $project --source $packageSource "-p:Version=$version" `
+            "-p:SecretSpecArtifactOnlyRestore=true"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           dotnet restore $project --runtime "${{ matrix.rid }}" `
             "-p:PublishAot=true" "-p:Version=$version"
@@ -466,7 +476,7 @@ jobs:
             --volume "$GITHUB_WORKSPACE:/workspace" \
             --volume "$RUNNER_TEMP:/runner" \
             --workdir /runner \
-            mcr.microsoft.com/dotnet/sdk:8.0-alpine@sha256:5f12aa62868b69dcb41de9cd7f8759822f7d1f56c3b31908048ad65df0981e67 \
+            mcr.microsoft.com/dotnet/sdk:8.0.428-alpine3.24@sha256:4f4992f8f302150e4adb5e78c324731e968493a30c0638985ba29cb42a858cd6 \
             sh -c '
               set -eu
               apk add --no-cache build-base clang zlib-dev
@@ -483,7 +493,7 @@ jobs:
               # Prime the isolated cache from the just-built package before
               # NuGet.org is enabled for Microsoft runtime/AOT packs.
               dotnet restore "$project" --source "$package_source" \
-                -p:Version="$version"
+                -p:Version="$version" -p:SecretSpecArtifactOnlyRestore=true
               dotnet restore "$project" --runtime "${{ matrix.rid }}" \
                 --source "$package_source" \
                 --source https://api.nuget.org/v3/index.json \
@@ -519,7 +529,7 @@ jobs:
     steps:
       - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
-          dotnet-version: "8.0.x"
+          dotnet-version: "8.0.428"
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: dotnet-nuget

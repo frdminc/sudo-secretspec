@@ -256,6 +256,19 @@ jobs:
     - name: Install yyjson
       shell: bash
       run: bash scripts/install-yyjson.sh
+    # The default features of `secretspec` include the sqlite provider
+    # (rusqlite is not `bundled`). This runner has no pkg-config, so give
+    # libsqlite3-sys an MSVC import library the same way haskell-build.yml does.
+    # The vcpkg bin dir is on PATH so tests that spawn the CLI can load
+    # sqlite3.dll at runtime.
+    - name: Install SQLite (the CLI links the system sqlite)
+      shell: pwsh
+      run: |
+        vcpkg install sqlite3:x64-windows
+        $prefix = Join-Path $env:VCPKG_INSTALLATION_ROOT "installed\x64-windows"
+        echo "SQLITE3_LIB_DIR=$prefix\lib" >> $env:GITHUB_ENV
+        echo "SQLITE3_INCLUDE_DIR=$prefix\include" >> $env:GITHUB_ENV
+        echo "$prefix\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
     - name: cargo test
       # Exclude secretspec-php-native: it is an ext-php-rs extension that needs a
       # PHP dev toolchain (php-config/headers) this bare runner does not have, and

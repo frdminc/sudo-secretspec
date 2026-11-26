@@ -537,16 +537,27 @@ def watch_run(run_id: int, failure: str, *, timeout_s: float = CI_WATCH_SECONDS)
     """Wait through one bounded recovery window; only green opens the gate."""
     url = f"https://github.com/{FORK_REPO}/actions/runs/{run_id}"
     log(f"CI: {url}")
-    argv = ["gh", "run", "watch", str(run_id), "-R", FORK_REPO,
-            "--exit-status", "--interval", str(CI_JOB_POLL_SECONDS)]
+    argv = [
+        "gh",
+        "run",
+        "watch",
+        str(run_id),
+        "-R",
+        FORK_REPO,
+        "--exit-status",
+        "--interval",
+        str(CI_JOB_POLL_SECONDS),
+    ]
     reason = "non-green verdict"
     try:
         if run(argv, capture=False, check=False, timeout=timeout_s).returncode == 0:
             return url
     except subprocess.TimeoutExpired:
         reason = f"no verdict after {timeout_s / 60:.0f} minutes (queued or stuck)"
-    log(f"{reason}: {url}; waiting up to {CI_RECOVERY_SECONDS / 60:.0f} "
-        "more minutes for recovery; no run will be cancelled")
+    log(
+        f"{reason}: {url}; waiting up to {CI_RECOVERY_SECONDS / 60:.0f} "
+        "more minutes for recovery; no run will be cancelled"
+    )
     deadline = time.monotonic() + CI_RECOVERY_SECONDS
     while time.monotonic() < deadline:
         # A completed red run returns immediately. Pace rechecks so a manual
@@ -561,8 +572,10 @@ def watch_run(run_id: int, failure: str, *, timeout_s: float = CI_WATCH_SECONDS)
             reason = "non-green verdict"
         except subprocess.TimeoutExpired:
             break
-    raise ReleaseError(f"{failure}: {reason}; recovery wait exhausted: {url}. "
-                       + wait_next_action(run_id))
+    raise ReleaseError(
+        f"{failure}: {reason}; recovery wait exhausted: {url}. "
+        + wait_next_action(run_id)
+    )
 
 
 def watch_jobs(
@@ -610,14 +623,19 @@ def watch_jobs(
             if not recovering:
                 recovering = True
                 deadline = now + CI_RECOVERY_SECONDS
-                log(f"Required jobs not green: {url}; waiting up to "
-                    f"{CI_RECOVERY_SECONDS / 60:.0f} more minutes for recovery")
+                log(
+                    f"Required jobs not green: {url}; waiting up to "
+                    f"{CI_RECOVERY_SECONDS / 60:.0f} more minutes for recovery"
+                )
             elif now >= deadline:
                 break
         time.sleep(min(CI_JOB_POLL_SECONDS, max(0, deadline - now)))
     guidance = wait_next_action(run_id)
     for name in jobs:
-        _require(name in conclusions, f"{failure}: job {name!r} not in the run: {url}. {guidance}")
+        _require(
+            name in conclusions,
+            f"{failure}: job {name!r} not in the run: {url}. {guidance}",
+        )
 
     def severity(name: str) -> int:
         # A job that actually failed is the cause; one still running only

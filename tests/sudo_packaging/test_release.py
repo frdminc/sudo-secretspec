@@ -687,6 +687,19 @@ PUSHED = (
 )
 
 
+def fake_clock(monkeypatch, release):
+    """Advance monotonic with sleep so watch_run's recovery loop does not spin."""
+    clock = [0.0]
+
+    def sleep(seconds):
+        clock[0] += seconds
+
+    monkeypatch.setattr(
+        release, "time", types.SimpleNamespace(sleep=sleep, monotonic=lambda: clock[0])
+    )
+    return clock
+
+
 def fake_ci(monkeypatch, release, *, runs, watch_rc=0, refs=None):
     """Script `github-ci-run`, `gh run list` (one reply per lookup) and `gh run watch`.
 
@@ -711,7 +724,7 @@ def fake_ci(monkeypatch, release, *, runs, watch_rc=0, refs=None):
         return completed(argv)
 
     monkeypatch.setattr(release, "run", fake_run)
-    monkeypatch.setattr(release.time, "sleep", lambda _s: None)
+    fake_clock(monkeypatch, release)
     return calls
 
 
@@ -1427,7 +1440,7 @@ def test_watch_run_extends_a_stuck_run_then_suggests_alternatives(monkeypatch, r
     # only after about a day. Without this deadline the bottle watch would block
     # with the tag and Release already public (adversary F1.3, 2026-10-20).
     seen = {}
-    monkeypatch.setattr(release.time, "sleep", lambda _: None)
+    fake_clock(monkeypatch, release)
 
     def fake_run(argv, **kwargs):
         seen["argv"] = argv
@@ -1521,7 +1534,9 @@ def test_watch_jobs_keeps_polling_until_its_own_jobs_conclude(monkeypatch, relea
     assert sleeps == [release.CI_JOB_POLL_SECONDS] * 2
 
 
-def test_watch_jobs_waits_before_reporting_the_first_red_job_it_needs(monkeypatch, release):
+def test_watch_jobs_waits_before_reporting_the_first_red_job_it_needs(
+    monkeypatch, release
+):
     # `packaging` is listed first and still running; the error must name the
     # job that failed, not the one we merely stopped waiting for (the first
     # live run named 'packaging' concluded '' when linux-artifact was red).
@@ -1596,7 +1611,7 @@ def test_watch_jobs_gives_up_on_jobs_that_never_conclude(monkeypatch, release):
 def test_the_bottle_watch_waits_longer_and_names_its_deadline(monkeypatch, release):
     # The bottle job's own cap is 90 minutes against the gate jobs' 60, so its
     # watch has to outlast the gate's or a legitimate build would be cut off.
-    monkeypatch.setattr(release.time, "sleep", lambda _: None)
+    fake_clock(monkeypatch, release)
     assert release.BOTTLE_WATCH_SECONDS > release.CI_WATCH_SECONDS
 
     def fake_run(argv, **kwargs):
@@ -1781,7 +1796,7 @@ def fake_bottle_run(
         return completed(argv)
 
     monkeypatch.setattr(release, "run", fake_run)
-    monkeypatch.setattr(release.time, "sleep", lambda _s: None)
+    fake_clock(monkeypatch, release)
     return calls
 
 
@@ -3503,6 +3518,7 @@ def fake_linux_run(
     monkeypatch.setattr(release, "run", run)
     monkeypatch.setattr(release, "find_run", lambda *a, **k: 123)
     monkeypatch.setattr(release, "verify_attestation", attest)
+    fake_clock(monkeypatch, release)
     return tarball, checksum, attestations, calls
 
 
@@ -3749,10 +3765,14 @@ def test_the_sudo_tag_exclusion_check_sees_a_workflow_that_lacks_it():
 def test_watch_run_recovers_without_dropping_the_gate(monkeypatch, release, first):
     calls = []
     clock = [0.0]
+
     def sleep(seconds):
         clock[0] += seconds
-    monkeypatch.setattr(release, "time", types.SimpleNamespace(
-        sleep=sleep, monotonic=lambda: clock[0]))
+
+    monkeypatch.setattr(
+        release, "time", types.SimpleNamespace(sleep=sleep, monotonic=lambda: clock[0])
+    )
+
     def fake_run(argv, **kwargs):
         calls.append(kwargs["timeout"])
         if len(calls) == 1:
@@ -3760,6 +3780,7 @@ def test_watch_run_recovers_without_dropping_the_gate(monkeypatch, release, firs
                 raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
             return subprocess.CompletedProcess(argv, 1)
         return completed(argv)
+
     monkeypatch.setattr(release, "run", fake_run)
     assert release.watch_run(5, "CI did not pass").endswith("/5")
     assert len(calls) == 2
@@ -3767,13 +3788,18 @@ def test_watch_run_recovers_without_dropping_the_gate(monkeypatch, release, firs
 
 
 @pytest.mark.parametrize("watch", ["run", "jobs"])
-def test_wait_timeout_compares_build_paths_without_starting_them(monkeypatch, release, watch):
-    seen, sleeps = fake_jobs_run(monkeypatch, release,
-        run_view_json({"packaging": None}, status="queued"))
+def test_wait_timeout_compares_build_paths_without_starting_them(
+    monkeypatch, release, watch
+):
+    seen, sleeps = fake_jobs_run(
+        monkeypatch, release, run_view_json({"packaging": None}, status="queued")
+    )
     if watch == "run":
+
         def timeout(argv, **kwargs):
             seen.append(argv)
             raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
         monkeypatch.setattr(release, "run", timeout)
     with pytest.raises(release.ReleaseError) as raised:
         if watch == "run":
@@ -3781,8 +3807,15 @@ def test_wait_timeout_compares_build_paths_without_starting_them(monkeypatch, re
         else:
             release.watch_jobs(5, release.LINUX_JOBS, "no good", timeout_s=100)
     message = str(raised.value)
-    for expected in ("Next action", "warp-macos-26-arm64-6x", "bg", "RESUME RULES",
-                     "bottle/linkage", "No fallback has been started", "/actions/runs/5"):
+    for expected in (
+        "Next action",
+        "warp-macos-26-arm64-6x",
+        "bg",
+        "RESUME RULES",
+        "bottle/linkage",
+        "No fallback has been started",
+        "/actions/runs/5",
+    ):
         assert expected in message
     assert sleeps
     assert all(argv[:2] == ["gh", "run"] for argv in seen)
@@ -3790,10 +3823,15 @@ def test_wait_timeout_compares_build_paths_without_starting_them(monkeypatch, re
 
 def test_watch_jobs_can_recover_during_extra_wait(monkeypatch, release):
     monkeypatch.setattr(release, "CI_RECOVERY_SECONDS", 120)
-    seen, sleeps = fake_jobs_run(monkeypatch, release,
+    seen, sleeps = fake_jobs_run(
+        monkeypatch,
+        release,
         run_view_json({"packaging": None}, status="queued"),
         run_view_json({"packaging": None}, status="queued"),
-        run_view_json())
-    assert release.watch_jobs(5, release.LINUX_JOBS, "no good", timeout_s=30).endswith("/5")
+        run_view_json(),
+    )
+    assert release.watch_jobs(5, release.LINUX_JOBS, "no good", timeout_s=30).endswith(
+        "/5"
+    )
     assert sum(sleeps) > 30
     assert len(seen) == 3

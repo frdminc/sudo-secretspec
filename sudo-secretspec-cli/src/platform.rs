@@ -106,8 +106,8 @@ pub const SUDO: &str = pick(option_env!("SUDO_SECRETSPEC_SUDO"), os::SUDO);
 #[cfg(not(feature = "test-boundary"))]
 mod layout {
     pub use super::os::{
-        BROKER_PATH, CONFIG_PATH, DEFAULT_GROUP, DEFAULT_USER, DEFAULT_VAULT, PREFIX,
-        SUDOERS_DIR, SUDOERS_FILE, VAULT_PARENT, VAULT_REAL_PARENT,
+        BROKER_PATH, CONFIG_PATH, DEFAULT_GROUP, DEFAULT_USER, DEFAULT_VAULT, PREFIX, SUDOERS_DIR,
+        SUDOERS_FILE, VAULT_PARENT, VAULT_REAL_PARENT,
     };
 }
 
@@ -419,7 +419,12 @@ mod tests {
         // be disjoint: broker, config, vault and sudoers policy. The sudoers
         // *directory* is shared by design — provenance, not path, separates the
         // policies (uninstall.rs removes a policy only on a manifest hash match).
-        let production = [os::BROKER_PATH, os::CONFIG_PATH, os::DEFAULT_VAULT, os::SUDOERS_FILE];
+        let production = [
+            os::BROKER_PATH,
+            os::CONFIG_PATH,
+            os::DEFAULT_VAULT,
+            os::SUDOERS_FILE,
+        ];
         let test_boundary = [
             "/opt/sudo-secretspec-test/libexec/sudo-secretspec",
             "/opt/sudo-secretspec-test/etc/sudo-secretspec.toml",
@@ -430,7 +435,11 @@ mod tests {
             assert_ne!(prod, &test, "layouts collide at {prod}");
         }
         let active = [BROKER_PATH, CONFIG_PATH, DEFAULT_VAULT, SUDOERS_FILE];
-        let expected = if cfg!(feature = "test-boundary") { test_boundary } else { production };
+        let expected = if cfg!(feature = "test-boundary") {
+            test_boundary
+        } else {
+            production
+        };
         for (got, want) in active.iter().zip(expected) {
             assert_eq!(got, &want);
         }

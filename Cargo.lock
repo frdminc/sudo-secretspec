@@ -6504,7 +6504,7 @@ dependencies = [
 
 [[package]]
 name = "secretspec-py-native"
-version = "0.21.1-sudo.7"
+version = "0.21.1+sudo.7"
 dependencies = [
  "pyo3",
  "secretspec",

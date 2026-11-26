@@ -6,7 +6,7 @@ defmodule SecretSpec.MixProject do
   def project do
     [
       app: :secretspec,
-      version: "0.21.0",
+      version: "0.21.1-sudo.7",
       elixir: "~> 1.19",
       start_permanent: Mix.env() == :prod,
       description: "Elixir SDK for SecretSpec",
