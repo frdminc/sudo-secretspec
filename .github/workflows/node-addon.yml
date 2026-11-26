@@ -149,9 +149,15 @@ jobs:
               # in the image.
               yum install -y sqlite-devel
               yum install -y sqlite-static || true
-              if [ -f /usr/lib64/libsqlite3.a ] || [ -f /usr/lib/libsqlite3.a ]; then
-                export SQLITE3_STATIC=1
-              fi
+              # SQLITE3_STATIC alone is not enough: libsqlite3-sys asks
+              # pkg-config, which links system-directory libraries
+              # dynamically. Point SQLITE3_LIB_DIR at the archive instead.
+              for d in /usr/lib64 /usr/lib; do
+                if [ -f "$d/libsqlite3.a" ]; then
+                  export SQLITE3_STATIC=1 SQLITE3_LIB_DIR="$d" SQLITE3_INCLUDE_DIR=/usr/include
+                  break
+                fi
+              done
               case "$(uname -m)" in
                 x86_64) nodearch=x64 ;;
                 aarch64) nodearch=arm64 ;;
@@ -233,6 +239,8 @@ jobs:
             --env CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=gcc \
             --env CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=gcc \
             --env SQLITE3_STATIC=1 \
+            --env SQLITE3_LIB_DIR=/usr/lib \
+            --env SQLITE3_INCLUDE_DIR=/usr/include \
             "${{ matrix.image }}" \
             bash -c '
               set -euo pipefail
@@ -240,7 +248,9 @@ jobs:
               # The addon links the system sqlite (rusqlite is not bundled).
               # SQLITE3_STATIC plus sqlite-static embeds libsqlite3.a so the
               # later node:alpine smoke test can load the addon without a
-              # distro libsqlite3 package. One SDK test also builds the
+              # distro libsqlite3 package. SQLITE3_LIB_DIR is needed because
+              # pkg-config links libraries in /usr/lib dynamically even when
+              # SQLITE3_STATIC is set. One SDK test also builds the
               # secretspec CLI, which links statically on musl and needs
               # the static zlib archive.
               apk add --no-cache nodejs npm sqlite-dev sqlite-static zlib-dev zlib-static
@@ -254,7 +264,13 @@ jobs:
 
       - name: Verify addon portability (musl libc, no libdbus)
         shell: bash
-        run: bash scripts/check-musl-portability.sh secretspec-node/secretspec.node
+        run: |
+          bash scripts/check-musl-portability.sh secretspec-node/secretspec.node
+          # SQLite must be linked in, not loaded from the distro at runtime.
+          if readelf -d secretspec-node/secretspec.node | grep -q 'libsqlite3'; then
+            echo "secretspec.node still needs a shared libsqlite3" >&2
+            exit 1
+          fi
 
       - name: Load the addon on node:alpine
         shell: bash
