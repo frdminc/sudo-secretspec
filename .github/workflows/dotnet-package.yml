@@ -383,7 +383,7 @@ jobs:
           # RID restore then adds NuGet.org for Microsoft runtime/AOT packs
           # without any chance of selecting the already-published bootstrap.
           dotnet restore "$project" --source "$package_source" \
-            -p:Version="$version"
+            -p:Version="$version" -p:SecretSpecArtifactOnlyRestore=true
           dotnet restore "$project" --runtime "${{ matrix.rid }}" \
             --source "$package_source" \
             --source https://api.nuget.org/v3/index.json \
@@ -432,7 +432,8 @@ jobs:
           # Prime an isolated package cache from the artifact-only source. The
           # RID/AOT restore then uses the runner's standard NuGet configuration
           # for Microsoft runtime packs without selecting a published SDK copy.
-          dotnet restore $project --source $packageSource "-p:Version=$version"
+          dotnet restore $project --source $packageSource "-p:Version=$version" `
+            "-p:SecretSpecArtifactOnlyRestore=true"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           dotnet restore $project --runtime "${{ matrix.rid }}" `
             "-p:PublishAot=true" "-p:Version=$version"
@@ -490,7 +491,7 @@ jobs:
               # Prime the isolated cache from the just-built package before
               # NuGet.org is enabled for Microsoft runtime/AOT packs.
               dotnet restore "$project" --source "$package_source" \
-                -p:Version="$version"
+                -p:Version="$version" -p:SecretSpecArtifactOnlyRestore=true
               dotnet restore "$project" --runtime "${{ matrix.rid }}" \
                 --source "$package_source" \
                 --source https://api.nuget.org/v3/index.json \
