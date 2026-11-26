@@ -1,10 +1,10 @@
 name: "Test boundary lifecycle"
 
 # Exercises the privileged boundary end to end on a throwaway macOS runner:
-# install, declare, set, get, drift, rollback, uninstall, purge. A fresh runner
-# is the only place the destructive paths can run honestly; the operational
-# boundary on a development machine is shared infrastructure and never a test
-# target. Synthetic secrets only.
+# install, declare, set, get, template-check (drift), reinstall, rollback,
+# uninstall, purge. A fresh runner is the only place the destructive paths can
+# run honestly; the operational boundary on a development machine is shared
+# infrastructure and never a test target. Synthetic secrets only.
 
 on:
   workflow_dispatch:
@@ -60,8 +60,23 @@ jobs:
           printf '%s\n' 'synthetic-value' | sudo "$bin" set TEST_TOKEN --reason "lifecycle test"
           got="$(sudo "$bin" get TEST_TOKEN --reason "lifecycle test")"
           test "$got" = "synthetic-value"
-          sudo "$bin" drift
-          sudo "$bin" rollback --dry-run
+          # Drift is reported by template-check; it needs a reason like get.
+          sudo "$bin" template-check --reason "lifecycle test"
+          # rollback has no dry-run mode and a first install leaves only an
+          # empty (unrestorable) snapshot. Reinstall over the boundary so the
+          # first install's artifacts are captured, then roll back to that
+          # snapshot, which restores the same bytes.
+          sleep 1
+          sudo "$bin" install --non-interactive --declarations "$spec" \
+            --operator "$USER" --profile default --adopt-existing
+          # Snapshot names end in a Unix timestamp, so the newest one sorts
+          # last and is the one the reinstall just captured.
+          snap="$(sudo find "$prefix/libexec" -maxdepth 1 -name 'sudo-secretspec-rollback-*' \
+            | sort | tail -n 1)"
+          test -n "$snap"
+          sudo "$bin" rollback "$snap"
+          got="$(sudo "$bin" get TEST_TOKEN --reason "lifecycle test")"
+          test "$got" = "synthetic-value"
           sudo "$bin" uninstall --purge-vault --remove-service-user
           test ! -e "$prefix"
           # The operational boundary must not exist on this runner, and the test
