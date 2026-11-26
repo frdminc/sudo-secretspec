@@ -45,7 +45,15 @@ jobs:
           bin="$PWD/target/test-boundary-media/libexec/sudo-secretspec"
           prefix=/opt/sudo-secretspec-test
           spec="$(mktemp -d)/secretspec.toml"
-          printf '%s\n' '[secrets]' 'TEST_TOKEN = { description = "synthetic" }' > "$spec"
+          # A secretspec.toml requires [project] and lists secrets under
+          # [profiles.default], not a top-level [secrets] table.
+          printf '%s\n' \
+            '[project]' \
+            'name = "lifecycle-test"' \
+            'revision = "1.0"' \
+            '' \
+            '[profiles.default]' \
+            'TEST_TOKEN = { description = "synthetic" }' > "$spec"
           sudo "$bin" install --non-interactive --declarations "$spec" \
             --operator "$USER" --profile default
           # set reads the secret from stdin (there is no --value flag).
