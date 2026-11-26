@@ -69,7 +69,8 @@ function loadNative() {
     } catch (pkgErr) {
       throw new Error(
         `failed to load the secretspec native addon for ${key} (tried ./secretspec.node ` +
-          `and the '${pkg}' package). Underlying error: ${pkgErr.message}`,
+          `and the '${pkg}' package). Local error: ${localErr.message}. ` +
+          `Package error: ${pkgErr.message}`,
       );
     }
   }

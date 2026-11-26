@@ -140,6 +140,15 @@ jobs:
               bash scripts/install-rustup.sh
               export PATH="$HOME/.cargo/bin:$PATH"
               rustup toolchain install
+              # The addon links system sqlite (rusqlite is not bundled).
+              # Prefer a static archive so the .node does not need libsqlite3
+              # at load time; fall back to the shared library if no .a is
+              # in the image.
+              yum install -y sqlite-devel
+              yum install -y sqlite-static || true
+              if [ -f /usr/lib64/libsqlite3.a ] || [ -f /usr/lib/libsqlite3.a ]; then
+                export SQLITE3_STATIC=1
+              fi
               case "$(uname -m)" in
                 x86_64) nodearch=x64 ;;
                 aarch64) nodearch=arm64 ;;
@@ -149,8 +158,12 @@ jobs:
               node_ver=22.23.5
               curl -fsSL "https://nodejs.org/dist/v${node_ver}/node-v${node_ver}-linux-${nodearch}.tar.xz" \
                 | tar -xJ -C /usr/local --strip-components=1
-              ( cd secretspec-node && npm ci )
+              # Omit optionalDependencies: package.json still pins published
+              # 0.12.2 platform packages, which can mask a local load error
+              # with their own glibc floor.
+              ( cd secretspec-node && npm ci --omit=optional )
               bash secretspec-node/scripts/build-addon.sh
+              bash scripts/check-linux-portability.sh secretspec-node/secretspec.node
               ( cd secretspec-node && node --test )
             '
 
@@ -229,7 +242,7 @@ jobs:
               bash scripts/install-rustup.sh
               export PATH="$HOME/.cargo/bin:$PATH"
               rustup toolchain install
-              ( cd secretspec-node && npm ci )
+              ( cd secretspec-node && npm ci --omit=optional )
               bash secretspec-node/scripts/build-addon.sh
               ( cd secretspec-node && node --test )
             '
