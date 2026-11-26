@@ -122,11 +122,14 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          vcpkg install sqlite3:x64-windows
-          $prefix = Join-Path $env:VCPKG_INSTALLATION_ROOT "installed\x64-windows"
+          # Link SQLite statically so the published artifact does not need a
+          # sqlite3.dll next to it. The static-md triplet keeps the dynamic C
+          # runtime that Rust's MSVC target uses.
+          vcpkg install sqlite3:x64-windows-static-md
+          $prefix = Join-Path $env:VCPKG_INSTALLATION_ROOT "installed\x64-windows-static-md"
           echo "SQLITE3_LIB_DIR=$prefix\lib" >> $env:GITHUB_ENV
           echo "SQLITE3_INCLUDE_DIR=$prefix\include" >> $env:GITHUB_ENV
-          echo "$prefix\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          echo "SQLITE3_STATIC=1" >> $env:GITHUB_ENV
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         id: python
         with:
