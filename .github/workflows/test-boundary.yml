@@ -78,7 +78,15 @@ jobs:
           got="$(sudo "$bin" get TEST_TOKEN --reason "lifecycle test")"
           test "$got" = "synthetic-value"
           sudo "$bin" uninstall --purge-vault --remove-service-user
-          test ! -e "$prefix"
+          # uninstall removes the files it installed and the vault, but leaves
+          # the empty prefix directories behind (it only deletes what it owns).
+          # Fail if anything other than an empty directory is left.
+          leftover="$(sudo find "$prefix" -mindepth 1 ! -type d 2>/dev/null || true)"
+          if [ -n "$leftover" ]; then
+            printf 'left behind under %s:\n%s\n' "$prefix" "$leftover" >&2
+            exit 1
+          fi
+          test ! -e "$prefix/sudo-secretspec"
           # The operational boundary must not exist on this runner, and the test
           # policy must be gone with the uninstall.
           test ! -e /usr/local/libexec/sudo-secretspec
