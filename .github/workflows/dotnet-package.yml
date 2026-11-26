@@ -356,8 +356,11 @@ jobs:
         with:
           # 8.0.427 is the patched 8.0 SDK, but its installer currently
           # crashes on windows-11-arm (CLR 0x80131506). That RID uses
-          # 8.0.x; SecretSpec.PackageSmoke pins ILCompiler 8.0.33 so
-          # NativeAOT restore still avoids GHSA-p3jp-9v83-76w9.
+          # 8.0.x, which setup-dotnet resolves to the newest 8.0 SDK, so
+          # its implicit ILCompiler is patched for GHSA-p3jp-9v83-76w9 too.
+          # Do not pin ILCompiler in the smoke project: self-contained AOT
+          # publish uses the newest runtime patch, and a pinned compiler
+          # that lags it fails with "Overriding System.Private.CoreLib.dll".
           dotnet-version: ${{ matrix.rid == 'win-arm64' && '8.0.x' || '8.0.427' }}
       - name: Install Linux NativeAOT toolchain
         if: runner.os == 'Linux' && matrix.musl == false
@@ -383,7 +386,7 @@ jobs:
           # RID restore then adds NuGet.org for Microsoft runtime/AOT packs
           # without any chance of selecting the already-published bootstrap.
           dotnet restore "$project" --source "$package_source" \
-            -p:Version="$version" -p:SecretSpecArtifactOnlyRestore=true
+            -p:Version="$version"
           dotnet restore "$project" --runtime "${{ matrix.rid }}" \
             --source "$package_source" \
             --source https://api.nuget.org/v3/index.json \
@@ -432,8 +435,7 @@ jobs:
           # Prime an isolated package cache from the artifact-only source. The
           # RID/AOT restore then uses the runner's standard NuGet configuration
           # for Microsoft runtime packs without selecting a published SDK copy.
-          dotnet restore $project --source $packageSource "-p:Version=$version" `
-            "-p:SecretSpecArtifactOnlyRestore=true"
+          dotnet restore $project --source $packageSource "-p:Version=$version"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           dotnet restore $project --runtime "${{ matrix.rid }}" `
             "-p:PublishAot=true" "-p:Version=$version"
@@ -491,7 +493,7 @@ jobs:
               # Prime the isolated cache from the just-built package before
               # NuGet.org is enabled for Microsoft runtime/AOT packs.
               dotnet restore "$project" --source "$package_source" \
-                -p:Version="$version" -p:SecretSpecArtifactOnlyRestore=true
+                -p:Version="$version"
               dotnet restore "$project" --runtime "${{ matrix.rid }}" \
                 --source "$package_source" \
                 --source https://api.nuget.org/v3/index.json \
