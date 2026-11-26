@@ -237,8 +237,10 @@ jobs:
               # The addon links the system sqlite (rusqlite is not bundled).
               # SQLITE3_STATIC plus sqlite-static embeds libsqlite3.a so the
               # later node:alpine smoke test can load the addon without a
-              # distro libsqlite3 package.
-              apk add --no-cache nodejs npm sqlite-dev sqlite-static
+              # distro libsqlite3 package. One SDK test also builds the
+              # secretspec CLI, which links statically on musl and needs
+              # the static zlib archive.
+              apk add --no-cache nodejs npm sqlite-dev sqlite-static zlib-dev zlib-static
               bash scripts/install-rustup.sh
               export PATH="$HOME/.cargo/bin:$PATH"
               rustup toolchain install
